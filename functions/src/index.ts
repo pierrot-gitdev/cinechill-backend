@@ -480,6 +480,7 @@ const GENRE_DRAMA = 18;
 const GENRE_DOCUMENTARY = 99;
 const GENRE_HISTORY = 36;
 const GENRE_WAR = 10752;
+const GENRE_ANIMATION = 16;
 
 const POOL_HEALTHY_TARGET = 60;
 const POOL_HARD_FLOOR = 20;
@@ -490,6 +491,7 @@ const HISTORY_WINDOW_DAYS = 30;
 const HISTORY_RUNS_CONSIDERED = 5;
 
 interface QuestionnaireAnswersPayload {
+  contentFormat: string;
   genres: string[];
   platformIds: string[];
   watchRegion: string;
@@ -522,6 +524,7 @@ interface EnrichedCandidate extends DiscoverRow {
   belongsToCollection: boolean;
   castPopularities: number[];
   providerIds: number[];
+  trailerKey: string | null;
   finalScore: number;
   reasons: string[];
 }
@@ -542,6 +545,7 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
     typeof v === 'string' && v.length > 0 ? v : fallback;
 
   return {
+    contentFormat: strOrDefault(b.contentFormat, 'liveAction'),
     genres: strArray(b.genres),
     platformIds: strArray(b.platformIds),
     watchRegion: strOrDefault(b.watchRegion, 'FR'),
@@ -572,6 +576,23 @@ function genreIdsFor(genreSlugs: string[]): number[] {
 }
 
 /**
+ * Filtre dur "dessin animé vs film" (Q1), jamais assoupli. Le sens "liveAction"
+ * est déjà exclu au niveau de la requête TMDB (without_genres) ; celui-ci
+ * couvre le sens "animated", qui nécessite une vraie contrainte ET avec les
+ * genres choisis par ailleurs (impossible à exprimer dans un seul with_genres
+ * TMDB) — appliqué ici sur les genre_ids déjà présents dans le pool.
+ * @param {DiscoverRow[]} rows Candidats à filtrer.
+ * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @return {DiscoverRow[]} Candidats respectant le format demandé.
+ */
+function filterByContentFormat(
+    rows: DiscoverRow[], answers: QuestionnaireAnswersPayload,
+): DiscoverRow[] {
+  if (answers.contentFormat !== 'animated') return rows;
+  return rows.filter((row) => (row.genre_ids ?? []).includes(GENRE_ANIMATION));
+}
+
+/**
  * Discover query params shared by every sort strategy — the hard filters.
  * @param {QuestionnaireAnswersPayload} answers Parsed questionnaire answers.
  * @param {Object} relax Which optional hard filters to drop (fallback).
@@ -598,6 +619,13 @@ function baseDiscoverParams(
   const withoutGenres = new Set<number>();
   if (answers.audience === 'family') {
     withoutGenres.add(GENRE_HORROR);
+  }
+  if (answers.contentFormat === 'liveAction') {
+    // "Dessin animé" vs "Film" (Q1) — filtre dur, jamais assoupli. Le sens
+    // "animated" est appliqué en aval sur genre_ids (voir getRecommendations),
+    // TMDB ne permettant pas de combiner un with_genres en ET avec l'OR déjà
+    // utilisé pour les genres choisis par l'utilisateur.
+    withoutGenres.add(GENRE_ANIMATION);
   }
   if (!relax.dealbreaker && answers.dealbreaker === 'heavyMood') {
     if (!genreIds.includes(GENRE_WAR)) withoutGenres.add(GENRE_WAR);
@@ -956,7 +984,7 @@ async function enrichCandidate(
   try {
     const detail = await tmdbGET(`/movie/${row.id}`, {
       language: DEFAULT_LANGUAGE,
-      append_to_response: 'credits,watch/providers',
+      append_to_response: 'credits,videos,watch/providers',
     }, token);
 
     const creditsCast = (detail.credits as {cast?: unknown} | undefined)?.cast;
@@ -974,6 +1002,12 @@ async function enrichCandidate(
         .map((p) => p.provider_id)
         .filter((id): id is number => typeof id === 'number');
 
+    const videos = Array.isArray((detail.videos as {results?: unknown} | undefined)?.results) ?
+      (detail.videos as {results: {type?: string; site?: string; key?: string}[]}).results : [];
+    const trailer = videos.find((v) => v.type === 'Trailer' && v.site === 'YouTube') ??
+      videos.find((v) => v.site === 'YouTube');
+    const trailerKey = trailer?.key ?? null;
+
     return {
       ...row,
       runtimeMinutes: typeof detail.runtime === 'number' ? detail.runtime : null,
@@ -981,6 +1015,7 @@ async function enrichCandidate(
         detail.belongs_to_collection !== undefined,
       castPopularities,
       providerIds,
+      trailerKey,
       finalScore: 0,
       reasons: [],
     };
@@ -1080,21 +1115,27 @@ export const getRecommendations = onRequest(
           ),
         ]);
 
-        let pool = rawPool.filter((row) => !exclusionSet.has(row.id));
+        let pool = filterByContentFormat(
+            rawPool.filter((row) => !exclusionSet.has(row.id)), answers,
+        );
         let notice: string | null = null;
 
         if (pool.length < POOL_HARD_FLOOR && answers.dealbreaker) {
           const relaxed = await fetchCandidatePool(
               answers, {dealbreaker: true, platforms: false}, tmdbApiKey.value(),
           );
-          pool = relaxed.filter((row) => !exclusionSet.has(row.id));
+          pool = filterByContentFormat(
+              relaxed.filter((row) => !exclusionSet.has(row.id)), answers,
+          );
           notice = 'Critère "décrocheur" assoupli pour élargir les résultats.';
         }
         if (pool.length < POOL_HARD_FLOOR && answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
               answers, {dealbreaker: true, platforms: true}, tmdbApiKey.value(),
           );
-          pool = relaxed.filter((row) => !exclusionSet.has(row.id));
+          pool = filterByContentFormat(
+              relaxed.filter((row) => !exclusionSet.has(row.id)), answers,
+          );
           notice = 'Résultats élargis hors de vos plateformes habituelles.';
         }
         if (!notice && pool.length < POOL_HEALTHY_TARGET) {
@@ -1179,6 +1220,8 @@ export const getRecommendations = onRequest(
             release_date: c.release_date ?? null,
             match_score: c.finalScore,
             reasons: c.reasons,
+            trailer_key: c.trailerKey,
+            provider_ids: c.providerIds,
           })),
           notice,
         });
