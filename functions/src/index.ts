@@ -484,7 +484,7 @@ const GENRE_ANIMATION = 16;
 
 const POOL_HEALTHY_TARGET = 60;
 const POOL_HARD_FLOOR = 20;
-const SHORTLIST_SIZE = 20;
+const ENRICH_BATCH_MAX = 60;
 const RESULT_COUNT = 3;
 const SOFTMAX_TEMPERATURE = 9;
 const HISTORY_WINDOW_DAYS = 30;
@@ -504,6 +504,9 @@ interface QuestionnaireAnswersPayload {
   cast: string;
   runtime: string;
   era: string;
+  surpriseIntensity: number;
+  preferredGenreIds: number[];
+  avoidedGenreIds: number[];
 }
 
 interface DiscoverRow {
@@ -543,6 +546,10 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
     typeof v === 'string' && v.length > 0 ? v : null;
   const strOrDefault = (v: unknown, fallback: string): string =>
     typeof v === 'string' && v.length > 0 ? v : fallback;
+  const numArray = (v: unknown): number[] =>
+    Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number') : [];
+  const numOrDefault = (v: unknown, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : fallback;
 
   return {
     contentFormat: strOrDefault(b.contentFormat, 'liveAction'),
@@ -558,6 +565,9 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
     cast: strOrDefault(b.cast, 'any'),
     runtime: strOrDefault(b.runtime, 'any'),
     era: strOrDefault(b.era, 'any'),
+    surpriseIntensity: numOrDefault(b.surpriseIntensity, 0.5),
+    preferredGenreIds: numArray(b.preferredGenreIds),
+    avoidedGenreIds: numArray(b.avoidedGenreIds),
   };
 }
 
@@ -762,16 +772,34 @@ function bandScore(
 }
 
 /**
- * Ambiance (Q4) — recouvrement entre les genres du film et les genres
- * associés à l'ambiance choisie. Poids : 30.
+ * Ambiance — recouvrement entre les genres du film et les genres associés à
+ * l'ambiance choisie, affiné par les comparaisons directes entre affiches
+ * (`preferredGenreIds`/`avoidedGenreIds`, alimentées par `PairwiseComparisonView`
+ * côté client) plutôt qu'un critère séparé. Poids : 30.
  * @param {number[]} genreIds Genres TMDB du film.
  * @param {string | null} mood Ambiance choisie.
+ * @param {number[]} preferredGenreIds Genres des films choisis en comparaison directe.
+ * @param {number[]} avoidedGenreIds Genres des films écartés en comparaison directe.
  * @return {number} Score 0..1.
  */
-function ambianceScore(genreIds: number[], mood: string | null): number {
-  if (!mood) return 0.5;
-  const moodGenres = MOOD_GENRES[mood] ?? [];
-  return genreIds.some((id) => moodGenres.includes(id)) ? 1 : 0.3;
+function ambianceScore(
+    genreIds: number[],
+    mood: string | null,
+    preferredGenreIds: number[],
+    avoidedGenreIds: number[],
+): number {
+  let score = 0.5;
+  if (mood) {
+    const moodGenres = MOOD_GENRES[mood] ?? [];
+    score = genreIds.some((id) => moodGenres.includes(id)) ? 1 : 0.3;
+  }
+  if (preferredGenreIds.some((id) => genreIds.includes(id))) {
+    score = Math.min(1, score + 0.2);
+  }
+  if (avoidedGenreIds.some((id) => genreIds.includes(id))) {
+    score = Math.max(0, score - 0.2);
+  }
+  return score;
 }
 
 /**
@@ -907,6 +935,25 @@ function castScore(castPopularities: number[], preference: string): number {
 }
 
 /**
+ * Curseur "intensité de surprise" (question adaptative indépendante de `mindset`) — ajuste
+ * `mindsetSub` autour de sa valeur neutre. Le curseur au centre (0.5, valeur par défaut si jamais
+ * posée) laisse `base` inchangé — comportement identique à avant l'introduction du curseur. Plus
+ * l'intensité voulue est haute, plus la pénalité franchise se creuse ; en dessous de 0.5, elle
+ * s'adoucit. Effet modeste (±0.15 maxi) car secondaire à `mindset`, la source de vérité.
+ * @param {number} base Sous-score état d'esprit avant ajustement.
+ * @param {boolean} belongsToCollection Si le film appartient à une franchise/collection.
+ * @param {number} intensity Intensité de surprise voulue, 0..1 (0.5 = neutre).
+ * @return {number} Sous-score ajusté, borné 0..1.
+ */
+function applySurpriseIntensity(
+    base: number, belongsToCollection: boolean, intensity: number,
+): number {
+  const delta = intensity - 0.5;
+  const adjustment = belongsToCollection ? -delta * 0.3 : delta * 0.1;
+  return Math.max(0, Math.min(1, base + adjustment));
+}
+
+/**
  * Combine les 7 critères pondérés (section 04 de la spec) en un score final
  * sur 100, en excluant le "état d'esprit = surprise" des franchises.
  * @param {EnrichedCandidate} c Candidat enrichi (détail TMDB inclus).
@@ -917,12 +964,18 @@ function finalWeightedScore(
     c: EnrichedCandidate, answers: QuestionnaireAnswersPayload,
 ): number {
   const mindset = answers.mindset;
-  const mindsetSub = mindset === 'beSurprised' ?
-    (c.belongsToCollection ? 0.15 : 1) :
-    coarseMindsetScore(c.genre_ids ?? [], c.popularity ?? null, mindset);
+  const mindsetSub = applySurpriseIntensity(
+      mindset === 'beSurprised' ?
+        (c.belongsToCollection ? 0.15 : 1) :
+        coarseMindsetScore(c.genre_ids ?? [], c.popularity ?? null, mindset),
+      c.belongsToCollection,
+      answers.surpriseIntensity,
+  );
 
   const weighted =
-    0.30 * ambianceScore(c.genre_ids ?? [], answers.mood) +
+    0.30 * ambianceScore(
+        c.genre_ids ?? [], answers.mood, answers.preferredGenreIds, answers.avoidedGenreIds,
+    ) +
     0.15 * mindsetSub +
     0.15 * qualityScore(c.vote_average ?? null, c.vote_count ?? null, c.popularity ?? null, answers.popularity) +
     0.10 * originScore(c.origin_country, answers.origin) +
@@ -1080,7 +1133,54 @@ function softmaxPick<T extends {adjustedScore: number}>(items: T[]): T {
   return items[items.length - 1];
 }
 
-export const getRecommendations = onRequest(
+/**
+ * Verify the Firebase bearer token on a request, sending the appropriate
+ * error response and returning null if it's missing/invalid.
+ * @param {Request} req Incoming request.
+ * @param {Response} res Response to write an error to on failure.
+ * @return {Promise<string | null>} The authenticated uid, or null.
+ */
+async function verifyAuth(req: Request, res: Response): Promise<string | null> {
+  const authHeader = req.headers.authorization ?? '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!token) {
+    res.status(401).json({error: 'missing_token'});
+    return null;
+  }
+  try {
+    const a = getAdmin();
+    return (await a.auth().verifyIdToken(token)).uid;
+  } catch {
+    res.status(401).json({error: 'invalid_token'});
+    return null;
+  }
+}
+
+/** JSON shape of a `DiscoverRow` as sent to/echoed back by the client. */
+function discoverRowToJSON(row: DiscoverRow) {
+  return {
+    id: row.id,
+    title: row.title ?? null,
+    overview: row.overview ?? null,
+    poster_path: row.poster_path ?? null,
+    vote_average: row.vote_average ?? null,
+    vote_count: row.vote_count ?? null,
+    popularity: row.popularity ?? null,
+    genre_ids: row.genre_ids ?? [],
+    release_date: row.release_date ?? null,
+    origin_country: row.origin_country ?? [],
+  };
+}
+
+/**
+ * Phase A (voir la spec "moteur de préférence actif") — filtres durs du
+ * socle (T1-T4) uniquement : contentFormat, genres, plateformes, audience.
+ * Le décrocheur (dealbreaker) n'existe pas encore à ce stade, il est posé
+ * plus tard côté client — `parseAnswers` le laisse simplement à `null`, ce
+ * qui désactive naturellement les branches qui en dépendent dans
+ * `baseDiscoverParams`.
+ */
+export const getCandidatePool = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
     async (req: Request, res: Response) => {
       try {
@@ -1088,21 +1188,8 @@ export const getRecommendations = onRequest(
           res.status(405).json({error: 'method_not_allowed'});
           return;
         }
-
-        const authHeader = req.headers.authorization ?? '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-        if (!token) {
-          res.status(401).json({error: 'missing_token'});
-          return;
-        }
-        let uid: string;
-        try {
-          const a = getAdmin();
-          uid = (await a.auth().verifyIdToken(token)).uid;
-        } catch {
-          res.status(401).json({error: 'invalid_token'});
-          return;
-        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
 
         const answers = parseAnswers(req.body);
         const a = getAdmin();
@@ -1110,9 +1197,7 @@ export const getRecommendations = onRequest(
 
         const [exclusionSet, rawPool] = await Promise.all([
           fetchExclusionSet(db, uid),
-          fetchCandidatePool(
-              answers, {dealbreaker: false, platforms: false}, tmdbApiKey.value(),
-          ),
+          fetchCandidatePool(answers, {dealbreaker: true, platforms: false}, tmdbApiKey.value()),
         ]);
 
         let pool = filterByContentFormat(
@@ -1120,15 +1205,6 @@ export const getRecommendations = onRequest(
         );
         let notice: string | null = null;
 
-        if (pool.length < POOL_HARD_FLOOR && answers.dealbreaker) {
-          const relaxed = await fetchCandidatePool(
-              answers, {dealbreaker: true, platforms: false}, tmdbApiKey.value(),
-          );
-          pool = filterByContentFormat(
-              relaxed.filter((row) => !exclusionSet.has(row.id)), answers,
-          );
-          notice = 'Critère "décrocheur" assoupli pour élargir les résultats.';
-        }
         if (pool.length < POOL_HARD_FLOOR && answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
               answers, {dealbreaker: true, platforms: true}, tmdbApiKey.value(),
@@ -1139,48 +1215,141 @@ export const getRecommendations = onRequest(
           notice = 'Résultats élargis hors de vos plateformes habituelles.';
         }
         if (!notice && pool.length < POOL_HEALTHY_TARGET) {
-          logger.info('getRecommendations: below healthy pool target', {
+          logger.info('getCandidatePool: below healthy pool target', {
             uid, poolSize: pool.length, target: POOL_HEALTHY_TARGET,
           });
         }
 
-        if (pool.length === 0) {
-          res.status(200).json({
-            results: [],
-            notice: 'Aucun film ne correspond à ces critères pour le moment.',
-          });
+        res.status(200).json({
+          candidates: pool.map(discoverRowToJSON),
+          notice,
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCandidatePool failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Phase B — enrichit un lot de candidats (déjà réduit côté client, voir la
+ * spec) avec les champs indisponibles sur les endpoints de liste TMDB :
+ * durée, casting, franchise, bande-annonce, plateformes.
+ */
+export const enrichCandidates = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const rawCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+        const rows: DiscoverRow[] = rawCandidates
+            .filter((c): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+            .map((c) => ({
+              id: Number(c.id),
+              title: typeof c.title === 'string' ? c.title : undefined,
+              overview: typeof c.overview === 'string' ? c.overview : null,
+              poster_path: typeof c.poster_path === 'string' ? c.poster_path : null,
+              vote_average: typeof c.vote_average === 'number' ? c.vote_average : null,
+              vote_count: typeof c.vote_count === 'number' ? c.vote_count : null,
+              popularity: typeof c.popularity === 'number' ? c.popularity : null,
+              genre_ids: Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
+              release_date: typeof c.release_date === 'string' ? c.release_date : null,
+              origin_country: Array.isArray(c.origin_country) ? c.origin_country as string[] : [],
+            }))
+            .filter((row) => Number.isFinite(row.id));
+
+        if (rows.length === 0) {
+          res.status(400).json({error: 'no_candidates'});
+          return;
+        }
+        if (rows.length > ENRICH_BATCH_MAX) {
+          res.status(400).json({error: 'too_many_candidates', max: ENRICH_BATCH_MAX});
           return;
         }
 
-        // Score "grossier" (sans détail TMDB) pour ne raffiner que le
-        // meilleur sous-ensemble — évite un appel /movie/{id} par candidat.
-        const coarseRanked = pool
-            .map((row) => ({
-              row,
-              coarse:
-                0.30 * ambianceScore(row.genre_ids ?? [], answers.mood) +
-                0.15 * coarseMindsetScore(
-                    row.genre_ids ?? [], row.popularity ?? null, answers.mindset,
-                ) +
-                0.15 * qualityScore(
-                    row.vote_average ?? null, row.vote_count ?? null,
-                    row.popularity ?? null, answers.popularity,
-                ) +
-                0.10 * originScore(row.origin_country, answers.origin) +
-                0.10 * eraScore(row.release_date, answers.era, row.vote_count ?? null),
-            }))
-            .sort((a, b) => b.coarse - a.coarse)
-            .slice(0, SHORTLIST_SIZE)
-            .map((entry) => entry.row);
-
         const enrichedResults = await Promise.allSettled(
-            coarseRanked.map((row) => enrichCandidate(row, tmdbApiKey.value())),
+            rows.map((row) => enrichCandidate(row, tmdbApiKey.value())),
         );
-        let shortlist = enrichedResults
+        const enriched = enrichedResults
             .filter((r): r is PromiseFulfilledResult<EnrichedCandidate | null> =>
               r.status === 'fulfilled')
             .map((r) => r.value)
             .filter((c): c is EnrichedCandidate => c !== null);
+
+        res.status(200).json({
+          candidates: enriched.map((c) => ({
+            ...discoverRowToJSON(c),
+            runtime_minutes: c.runtimeMinutes,
+            belongs_to_collection: c.belongsToCollection,
+            cast_popularities: c.castPopularities,
+            provider_ids: c.providerIds,
+            trailer_key: c.trailerKey,
+          })),
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('enrichCandidates failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Phase D — reçoit le pool déjà enrichi et réduit côté client (fin du
+ * parcours, par confiance ou par choix de l'utilisateur) avec l'ensemble des
+ * réponses collectées, applique le scoring pondéré final, la diversité (MMR)
+ * et l'exploration (softmax), persiste l'historique, renvoie le top 3.
+ */
+export const finalizeRecommendations = onRequest(
+    {invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const answers = parseAnswers(body.answers);
+        const rawCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+
+        let shortlist: EnrichedCandidate[] = rawCandidates
+            .filter((c): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+            .map((c) => ({
+              id: Number(c.id),
+              title: typeof c.title === 'string' ? c.title : undefined,
+              overview: typeof c.overview === 'string' ? c.overview : null,
+              poster_path: typeof c.poster_path === 'string' ? c.poster_path : null,
+              vote_average: typeof c.vote_average === 'number' ? c.vote_average : null,
+              vote_count: typeof c.vote_count === 'number' ? c.vote_count : null,
+              popularity: typeof c.popularity === 'number' ? c.popularity : null,
+              genre_ids: Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
+              release_date: typeof c.release_date === 'string' ? c.release_date : null,
+              origin_country: Array.isArray(c.origin_country) ? c.origin_country as string[] : [],
+              runtimeMinutes: typeof c.runtime_minutes === 'number' ? c.runtime_minutes : null,
+              belongsToCollection: c.belongs_to_collection === true,
+              castPopularities: Array.isArray(c.cast_popularities) ? c.cast_popularities as number[] : [],
+              providerIds: Array.isArray(c.provider_ids) ? c.provider_ids as number[] : [],
+              trailerKey: typeof c.trailer_key === 'string' ? c.trailer_key : null,
+              finalScore: 0,
+              reasons: [],
+            }))
+            .filter((row) => Number.isFinite(row.id));
+
+        if (shortlist.length === 0) {
+          res.status(400).json({error: 'no_candidates'});
+          return;
+        }
 
         // "predictablePlot" est un filtre dur : on retire les suites/sagas,
         // sauf si ça viderait la shortlist (jamais de résultat vide).
@@ -1202,7 +1371,8 @@ export const getRecommendations = onRequest(
             .sort((a, b) => b.finalScore - a.finalScore)
             .map((c) => ({...c, reasons: buildReasons(c, answers)}));
 
-        await db.collection('users').doc(uid)
+        const a = getAdmin();
+        await a.firestore().collection('users').doc(uid)
             .collection('recommendationHistory').add({
               createdAt: a.firestore.Timestamp.now(),
               tmdbIds: selected.map((c) => c.id),
@@ -1223,13 +1393,9 @@ export const getRecommendations = onRequest(
             trailer_key: c.trailerKey,
             provider_ids: c.providerIds,
           })),
-          notice,
         });
       } catch (error) {
-        if (sendTMDBError(error, res)) {
-          return;
-        }
-        logger.error('getRecommendations failed', {error});
+        logger.error('finalizeRecommendations failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
