@@ -259,9 +259,15 @@ export const getMovieDetails = onRequest(
           title: data.title ?? null,
           name: data.name ?? null,
           overview: data.overview ?? null,
+          // TMDB les renvoie déjà dans la même réponse — les transmettre ne
+          // coûte aucun appel supplémentaire.
+          tagline: typeof data.tagline === 'string' && data.tagline ?
+            data.tagline : null,
           poster_path: data.poster_path ?? null,
           backdrop_path: data.backdrop_path ?? null,
           vote_average: data.vote_average ?? null,
+          vote_count: data.vote_count ?? null,
+          runtime: typeof data.runtime === 'number' ? data.runtime : null,
           release_date: data.release_date ?? null,
           first_air_date: data.first_air_date ?? null,
           director,
@@ -1195,23 +1201,26 @@ export const getCandidatePool = onRequest(
         const a = getAdmin();
         const db = a.firestore();
 
-        const [exclusionSet, rawPool] = await Promise.all([
+        const [exclusionSet, declared, rawPool] = await Promise.all([
           fetchExclusionSet(db, uid),
+          fetchDeclaredProfile(db, uid),
           fetchCandidatePool(answers, {dealbreaker: true, platforms: false}, tmdbApiKey.value()),
         ]);
 
-        let pool = filterByContentFormat(
-            rawPool.filter((row) => !exclusionSet.has(row.id)), answers,
-        );
+        // Les genres bannis dans les réglages ne sont jamais assouplis, même
+        // quand le vivier est trop maigre : c'est le sens de « jamais ».
+        const keep = (row: DiscoverRow): boolean =>
+          !exclusionSet.has(row.id) &&
+          !(row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id));
+
+        let pool = filterByContentFormat(rawPool.filter(keep), answers);
         let notice: string | null = null;
 
         if (pool.length < POOL_HARD_FLOOR && answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
               answers, {dealbreaker: true, platforms: true}, tmdbApiKey.value(),
           );
-          pool = filterByContentFormat(
-              relaxed.filter((row) => !exclusionSet.has(row.id)), answers,
-          );
+          pool = filterByContentFormat(relaxed.filter(keep), answers);
           notice = 'Résultats élargis hors de vos plateformes habituelles.';
         }
         if (!notice && pool.length < POOL_HEALTHY_TARGET) {
@@ -1476,6 +1485,8 @@ interface TasteProfile {
   genreLikeRatio: Map<number, number>;
   /** Ratio lissé vu/(vu+écarté) par décennie — module la probabilité de vu. */
   decadeSeenRatio: Map<number, number>;
+  /** Ce que l'utilisateur a déclaré dans les réglages. */
+  declared: DeclaredProfile;
 }
 
 /** Compteurs agrégés persistés dans `preferences/swipeProfile`. */
@@ -1485,6 +1496,75 @@ interface SwipeCounters {
   genreSkipped: Record<string, number>;
   decadeSeen: Record<string, number>;
   decadeSkipped: Record<string, number>;
+}
+
+/**
+ * Ce que l'utilisateur a déclaré lui-même dans les réglages, par opposition à
+ * ce que l'app déduit de ses swipes. Lu côté serveur plutôt que transmis par le
+ * client : une règle « jamais d'horreur » ne doit pas pouvoir être contournée
+ * selon l'écran d'où part la requête.
+ */
+interface DeclaredProfile {
+  bannedGenreIDs: Set<number>;
+  /** Décennie de naissance (1970, 1980, …), ou null si non renseignée. */
+  birthDecade: number | null;
+}
+
+const EMPTY_DECLARED_PROFILE: DeclaredProfile = {
+  bannedGenreIDs: new Set<number>(),
+  birthDecade: null,
+};
+
+/**
+ * Lit `users/{uid}/preferences/profile`, en tolérant son absence — la grande
+ * majorité des comptes n'aura jamais ouvert les réglages.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Utilisateur authentifié.
+ * @return {Promise<DeclaredProfile>} Profil déclaré, vide par défaut.
+ */
+async function fetchDeclaredProfile(
+    db: admin.firestore.Firestore,
+    uid: string,
+): Promise<DeclaredProfile> {
+  const snap = await db.collection('users').doc(uid)
+      .collection('preferences').doc('profile').get();
+  if (!snap.exists) return EMPTY_DECLARED_PROFILE;
+
+  const rawGenres = snap.get('bannedGenreIds');
+  const bannedGenreIDs = new Set<number>();
+  if (Array.isArray(rawGenres)) {
+    for (const value of rawGenres) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        bannedGenreIDs.add(Math.floor(value));
+      }
+    }
+  }
+
+  const rawDecade = snap.get('birthDecade');
+  const birthDecade = typeof rawDecade === 'number' && rawDecade >= 1930 &&
+    rawDecade <= 2020 ? Math.floor(rawDecade / 10) * 10 : null;
+
+  return {bannedGenreIDs, birthDecade};
+}
+
+/**
+ * Pondère la probabilité d'avoir vu un film selon l'âge de l'utilisateur.
+ *
+ * Asymétrique à dessein : tout ce qui sort après votre naissance vous reste
+ * accessible en salle, à la télé ou en streaming, alors qu'un film antérieur
+ * demande une démarche. À 25 ans, on n'a pas la même probabilité d'avoir vu un
+ * film de 1975 qu'à 55 ans.
+ * @param {?number} decade Décennie du film.
+ * @param {?number} birthDecade Décennie de naissance déclarée.
+ * @return {number} Multiplicateur entre 0.45 et 1.
+ */
+function generationFactor(
+    decade: number | null, birthDecade: number | null,
+): number {
+  if (decade === null || birthDecade === null) return 1;
+  if (decade >= birthDecade) return 1;
+  const decadesBefore = (birthDecade - decade) / 10;
+  return Math.max(0.45, 1 - 0.14 * decadesBefore);
 }
 
 /**
@@ -1567,6 +1647,7 @@ function parseSwipeCounters(
 function buildTasteProfile(
     galleryDocs: admin.firestore.QueryDocumentSnapshot[],
     counters: SwipeCounters,
+    declared: DeclaredProfile,
 ): TasteProfile {
   const entries = galleryDocs
       .map((doc) => ({
@@ -1651,6 +1732,7 @@ function buildTasteProfile(
     seedIds: pickSeedIds(entries.map((entry) => entry.tmdbId as number)),
     genreLikeRatio,
     decadeSeenRatio,
+    declared,
   };
 }
 
@@ -1923,11 +2005,15 @@ async function fetchSwipePool(
     ['pillars', pillars],
   ];
 
+  const banned = profile.declared.bannedGenreIDs;
   const pool = new Map<number, SwipeCandidate>();
   for (const [source, rows] of groups) {
     for (const row of rows) {
       if (typeof row.id !== 'number' || pool.has(row.id)) continue;
       if (!row.poster_path) continue;
+      // « Jamais de… » est un filtre dur : contrairement aux rejets appris au
+      // swipe, ce n'est pas une préférence à sous-pondérer mais une règle.
+      if ((row.genre_ids ?? []).some((id) => banned.has(id))) continue;
       pool.set(row.id, {...row, source, score: 0});
     }
   }
@@ -1957,7 +2043,11 @@ function seenLikelihood(row: SwipeCandidate, profile: TasteProfile): number {
     profile.decadeSeenRatio.get(decade) ?? 0.5;
   const decadeAffinity = 0.5 * decadeWeight + 0.5 * decadeRatio;
 
-  return clamp01(0.65 * notoriety + 0.35 * decadeAffinity);
+  // La génération déclarée calibre dès le premier lot ce que les compteurs de
+  // swipe mettraient des dizaines de cartes à découvrir.
+  const generation = generationFactor(decade, profile.declared.birthDecade);
+
+  return clamp01((0.65 * notoriety + 0.35 * decadeAffinity) * generation);
 }
 
 /**
@@ -2224,14 +2314,15 @@ export const getSwipeFeed = onRequest(
             (req.body as Record<string, unknown> | undefined)?.excludeIds,
         );
 
-        const [exclusions, countersSnap] = await Promise.all([
+        const [exclusions, countersSnap, declared] = await Promise.all([
           fetchSwipeExclusions(db, uid),
           db.collection('users').doc(uid)
               .collection('preferences').doc('swipeProfile').get(),
+          fetchDeclaredProfile(db, uid),
         ]);
 
         const profile = buildTasteProfile(
-            exclusions.galleryDocs, parseSwipeCounters(countersSnap),
+            exclusions.galleryDocs, parseSwipeCounters(countersSnap), declared,
         );
 
         const pool = await fetchSwipePool(profile, tmdbApiKey.value());
@@ -2453,6 +2544,279 @@ export const recordSwipes = onRequest(
         res.status(200).json({ok: true, recorded: decisions.length});
       } catch (error) {
         logger.error('recordSwipes failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ===========================================================================
+// Compte — resetSwipeSkips / deleteAccount
+// ===========================================================================
+
+/** Documents supprimés par lot, sous la limite de 500 d'un batch Firestore. */
+const DELETE_BATCH_SIZE = 400;
+
+/**
+ * Supprime tous les documents d'une collection, par lots.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {admin.firestore.CollectionReference} ref Collection à vider.
+ * @return {Promise<number>} Nombre de documents supprimés.
+ */
+async function deleteCollection(
+    db: admin.firestore.Firestore,
+    ref: admin.firestore.CollectionReference,
+): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    const snap = await ref.limit(DELETE_BATCH_SIZE).get();
+    if (snap.empty) return deleted;
+
+    const batch = db.batch();
+    for (const doc of snap.docs) batch.delete(doc.ref);
+    await batch.commit();
+    deleted += snap.size;
+
+    if (snap.size < DELETE_BATCH_SIZE) return deleted;
+  }
+}
+
+/**
+ * Remet en jeu tous les films écartés au swipe.
+ *
+ * Le cooldown peut enterrer un film jusqu'à 180 jours et rien, côté client, ne
+ * permettait de revenir dessus — un aller sans retour qu'on ne peut pas
+ * laisser sans issue.
+ */
+export const resetSwipeSkips = onRequest(
+    {invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const deleted = await deleteCollection(
+            db, db.collection('users').doc(uid).collection('swipeSkips'),
+        );
+
+        res.status(200).json({ok: true, deleted});
+      } catch (error) {
+        logger.error('resetSwipeSkips failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Efface le compte et tout ce qui s'y rattache.
+ *
+ * Obligation App Store pour toute app permettant de créer un compte. L'ordre
+ * compte : les données d'abord, le compte Auth en dernier — l'inverse
+ * laisserait des documents orphelins qu'aucun jeton ne permettrait plus
+ * d'atteindre.
+ */
+export const deleteAccount = onRequest(
+    {invoker: 'public', timeoutSeconds: 120},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+
+        // `recursiveDelete` descend dans toutes les sous-collections, y compris
+        // celles ajoutées plus tard : rien à maintenir ici quand le schéma
+        // évolue.
+        await db.recursiveDelete(userRef);
+        await a.auth().deleteUser(uid);
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('deleteAccount failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ===========================================================================
+// Accueil — getHomeRows
+//
+// Les trois rangées personnalisées de l'accueil en un seul appel authentifié :
+// le serveur a déjà la galerie et le profil déclaré en main, les découper en
+// trois requêtes ferait payer trois fois la même lecture Firestore.
+// ===========================================================================
+
+/** Fenêtre considérée comme « encore à l'affiche », en jours. */
+const THEATERS_WINDOW_DAYS = 56;
+/** Films renvoyés par rangée. */
+const HOME_ROW_SIZE = 20;
+
+/** Date au format `YYYY-MM-DD` attendu par TMDB. */
+function isoDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * Les films sortis en salle en France sur la fenêtre récente.
+ *
+ * `/discover` plutôt que `/movie/now_playing` : la fenêtre, le tri et le
+ * filtrage restent sous contrôle, ce qui permet ensuite de classer selon les
+ * goûts — impossible avec `now_playing`, qui renvoie une liste figée.
+ * @param {string} token Jeton TMDB.
+ * @return {Promise<DiscoverRow[]>} Films à l'affiche.
+ */
+async function fetchInTheaters(token: string): Promise<DiscoverRow[]> {
+  const now = new Date();
+  const from = new Date(now.getTime() - THEATERS_WINDOW_DAYS * 24 * 3600 * 1000);
+
+  const requests = [1, 2].map((page) => tmdbGET('/discover/movie', {
+    language: DEFAULT_LANGUAGE,
+    region: DEFAULT_REGION,
+    include_adult: 'false',
+    include_video: 'false',
+    // 3 = sortie en salle, 2 = première limitée.
+    with_release_type: '3|2',
+    'primary_release_date.gte': isoDate(from),
+    'primary_release_date.lte': isoDate(now),
+    sort_by: 'popularity.desc',
+    page: String(page),
+  }, token));
+
+  const settled = await Promise.allSettled(requests);
+  return settled.flatMap((result) => rowsFrom(result, 'results'));
+}
+
+/**
+ * Les films en mouvement cette semaine. Distinct de « populaire », qui est un
+ * score glissant bougeant à peine d'un jour sur l'autre.
+ * @param {string} token Jeton TMDB.
+ * @return {Promise<DiscoverRow[]>} Films en tendance.
+ */
+async function fetchTrending(token: string): Promise<DiscoverRow[]> {
+  const settled = await Promise.allSettled([
+    tmdbGET('/trending/movie/week', {language: DEFAULT_LANGUAGE}, token),
+  ]);
+  return settled.flatMap((result) => rowsFrom(result, 'results'));
+}
+
+/**
+ * Assainit une rangée : affiche obligatoire, genres bannis écartés, doublons
+ * et identifiants exclus retirés, taille plafonnée.
+ * @param {DiscoverRow[]} rows Lignes brutes.
+ * @param {DeclaredProfile} declared Profil déclaré.
+ * @param {Set<number>} excluded Identifiants à retirer.
+ * @return {DiscoverRow[]} Rangée propre.
+ */
+function cleanHomeRow(
+    rows: DiscoverRow[],
+    declared: DeclaredProfile,
+    excluded: Set<number>,
+): DiscoverRow[] {
+  const seen = new Set<number>();
+  const out: DiscoverRow[] = [];
+  for (const row of rows) {
+    if (typeof row.id !== 'number' || seen.has(row.id)) continue;
+    if (!row.poster_path) continue;
+    if (excluded.has(row.id)) continue;
+    if ((row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id))) continue;
+    seen.add(row.id);
+    out.push(row);
+    if (out.length >= HOME_ROW_SIZE) break;
+  }
+  return out;
+}
+
+/**
+ * Renvoie les rangées personnalisées de l'accueil : à l'affiche, semée par la
+ * galerie, et tendances.
+ */
+export const getHomeRows = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+
+        const [gallerySnap, countersSnap, declared] = await Promise.all([
+          userRef.collection('gallery').get(),
+          userRef.collection('preferences').doc('swipeProfile').get(),
+          fetchDeclaredProfile(db, uid),
+        ]);
+
+        const profile = buildTasteProfile(
+            gallerySnap.docs, parseSwipeCounters(countersSnap), declared,
+        );
+
+        const titleById = new Map<number, string>();
+        for (const doc of gallerySnap.docs) {
+          const id = doc.get('tmdbId');
+          const title = doc.get('title');
+          if (typeof id === 'number' && typeof title === 'string') {
+            titleById.set(id, title);
+          }
+        }
+
+        const seedId = profile.seedIds[0] ?? null;
+        const [theaters, trending, seededRaw] = await Promise.all([
+          fetchInTheaters(tmdbApiKey.value()),
+          fetchTrending(tmdbApiKey.value()),
+          seedId === null ? Promise.resolve([]) :
+            tmdbGET(`/movie/${seedId}/recommendations`, {
+              language: DEFAULT_LANGUAGE, page: '1',
+            }, tmdbApiKey.value())
+                .then((data) => Array.isArray(data.results) ?
+                  data.results as DiscoverRow[] : [])
+                .catch(() => [] as DiscoverRow[]),
+        ]);
+
+        // Le classement par correspondance est ce qui distingue « au cinéma »
+        // de « pour vous au cinéma ». La popularité ne sert qu'à départager :
+        // en tête de tri elle ramènerait les mêmes blockbusters en permanence.
+        const rankedTheaters = [...theaters].sort((left, right) => {
+          const leftScore = tasteMatch({...left, source: 'profile', score: 0}, profile);
+          const rightScore = tasteMatch({...right, source: 'profile', score: 0}, profile);
+          if (Math.abs(leftScore - rightScore) > 0.02) return rightScore - leftScore;
+          return (right.popularity ?? 0) - (left.popularity ?? 0);
+        });
+
+        const noExclusion = new Set<number>();
+        const seededExclusion = seedId === null ?
+          noExclusion : new Set<number>([seedId]);
+
+        res.status(200).json({
+          in_theaters: cleanHomeRow(rankedTheaters, declared, noExclusion)
+              .map(discoverRowToJSON),
+          trending: cleanHomeRow(trending, declared, noExclusion)
+              .map(discoverRowToJSON),
+          because_you_watched: seedId === null ? null : {
+            seed_id: seedId,
+            seed_title: titleById.get(seedId) ?? null,
+            items: cleanHomeRow(seededRaw, declared, seededExclusion)
+                .map(discoverRowToJSON),
+          },
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getHomeRows failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
