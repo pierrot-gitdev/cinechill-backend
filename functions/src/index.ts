@@ -244,6 +244,23 @@ export const getMovieDetails = onRequest(
             typeof g.name === 'string' ? g.name : ''
           ).filter(Boolean) : [];
 
+        // La saga alimente le badge « L'Intégrale ». Le second appel n'a lieu
+        // que pour les films qui appartiennent effectivement à une collection,
+        // soit une minorité — le détail d'un film isolé ne coûte rien de plus.
+        const collection = data.belongs_to_collection as {id?: number} | null;
+        let collectionID: number | null = null;
+        let collectionCount: number | null = null;
+        if (collection && typeof collection.id === 'number') {
+          collectionID = collection.id;
+          try {
+            const parts = await tmdbGET(`/collection/${collection.id}`,
+                {language: DEFAULT_LANGUAGE}, tmdbApiKey.value());
+            if (Array.isArray(parts.parts)) collectionCount = parts.parts.length;
+          } catch {
+            collectionCount = null;
+          }
+        }
+
         const frFlatrate = data['watch/providers']?.results?.FR?.flatrate;
         const watchProvidersFR = Array.isArray(frFlatrate) ?
           frFlatrate.map((p: {
@@ -273,6 +290,8 @@ export const getMovieDetails = onRequest(
           director,
           trailer_key: trailerKey,
           genre_names: genreNames,
+          collection_id: collectionID,
+          collection_count: collectionCount,
           credits: {cast},
           watch_providers_fr: watchProvidersFR,
         });
@@ -345,6 +364,11 @@ interface MediaItemPayload {
   posterPath?: string;
   overview?: string;
   voteAverage?: number;
+  /** Renseignés depuis la fiche film, qui seule les connaît. Alimentent les
+   * badges « Signature » et « L'Intégrale » ; absents ailleurs, sans gravité. */
+  director?: string;
+  collectionId?: number;
+  collectionTotal?: number;
   genreIds: number[];
   releaseDate?: string;
 }
@@ -407,6 +431,9 @@ export const setMediaStatus = onRequest(
           posterPath: item.posterPath ?? null,
           overview: item.overview ?? null,
           voteAverage: item.voteAverage ?? null,
+          director: item.director ?? null,
+          collectionId: item.collectionId ?? null,
+          collectionTotal: item.collectionTotal ?? null,
           genreIds: item.genreIds ?? [],
           releaseDate: item.releaseDate ?? null,
           addedAt: now,
@@ -2536,7 +2563,14 @@ export const recordSwipes = onRequest(
 
         batch.set(
             userRef.collection('preferences').doc('swipeProfile'),
-            {...counters, updatedAt: now},
+            {
+              ...counters,
+              // Total exact des cartes tranchées : les compteurs par genre
+              // sur-comptent (un film porte plusieurs genres) et ceux par
+              // décennie ratent les mises en watchlist.
+              totalDecisions: a.firestore.FieldValue.increment(decisions.length),
+              updatedAt: now,
+            },
             {merge: true},
         );
 
@@ -2817,6 +2851,337 @@ export const getHomeRows = onRequest(
       } catch (error) {
         if (sendTMDBError(error, res)) return;
         logger.error('getHomeRows failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ===========================================================================
+// Badges — evaluateBadges
+//
+// Évalué côté serveur, jamais côté client : un badge qu'on peut s'attribuer
+// soi-même ne vaut rien. La fonction renvoie l'état des quinze badges avec
+// leur progression, et persiste ceux qui viennent d'être obtenus — une fois
+// débloqué, un badge le reste, même si la galerie rétrécit ensuite.
+// ===========================================================================
+
+/** Fuseau de référence pour les séries de jours et les heures nocturnes. */
+const BADGE_TIMEZONE = 'Europe/Paris';
+
+/** Genres TMDB utilisés par les badges de genre. */
+const GENRE_ACTION = 28;
+
+interface BadgeState {
+  id: string;
+  unlocked: boolean;
+  unlockedAt: string | null;
+  current: number;
+  target: number;
+  /** Détail lisible de ce qui manque, quand on peut le dire précisément. */
+  detail: string | null;
+}
+
+interface GalleryFact {
+  tmdbId: number;
+  genreIds: number[];
+  year: number | null;
+  decade: number | null;
+  director: string | null;
+  collectionId: number | null;
+  collectionTotal: number | null;
+  addedAt: Date | null;
+}
+
+/**
+ * Jour civil `YYYY-MM-DD` dans le fuseau de référence — et non en UTC : un
+ * ajout à 1 h du matin appartient à la nuit précédente pour l'utilisateur.
+ * @param {Date} date Instant à convertir.
+ * @return {string} Jour civil.
+ */
+function parisDay(date: Date): string {
+  return date.toLocaleDateString('en-CA', {timeZone: BADGE_TIMEZONE});
+}
+
+/**
+ * Heure locale (0-23) dans le fuseau de référence.
+ * @param {Date} date Instant à convertir.
+ * @return {number} Heure locale.
+ */
+function parisHour(date: Date): number {
+  const raw = date.toLocaleString('en-GB', {
+    timeZone: BADGE_TIMEZONE, hour: '2-digit', hour12: false,
+  });
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Plus longue série de jours consécutifs ayant reçu au moins un ajout.
+ *
+ * On mesure la plus longue série *jamais* atteinte, pas celle en cours : un
+ * accomplissement ne se reperd pas parce qu'on a sauté un jour.
+ * @param {string[]} days Jours civils, doublons autorisés.
+ * @return {number} Longueur de la plus longue série.
+ */
+function longestDayStreak(days: string[]): number {
+  const unique = Array.from(new Set(days)).sort();
+  if (unique.length === 0) return 0;
+
+  let best = 1;
+  let run = 1;
+  for (let i = 1; i < unique.length; i++) {
+    const previous = new Date(`${unique[i - 1]}T00:00:00Z`).getTime();
+    const current = new Date(`${unique[i]}T00:00:00Z`).getTime();
+    const gapDays = Math.round((current - previous) / 86400000);
+    run = gapDays === 1 ? run + 1 : 1;
+    if (run > best) best = run;
+  }
+  return best;
+}
+
+/**
+ * Transforme les documents de galerie en faits exploitables par les règles.
+ * @param {admin.firestore.QueryDocumentSnapshot[]} docs Documents de galerie.
+ * @return {GalleryFact[]} Faits normalisés.
+ */
+function toGalleryFacts(
+    docs: admin.firestore.QueryDocumentSnapshot[],
+): GalleryFact[] {
+  return docs.map((doc) => {
+    const releaseDate = doc.get('releaseDate');
+    const year = typeof releaseDate === 'string' && releaseDate.length >= 4 ?
+      Number(releaseDate.slice(0, 4)) : null;
+    const addedAt = doc.get('addedAt');
+
+    return {
+      tmdbId: typeof doc.get('tmdbId') === 'number' ? doc.get('tmdbId') : 0,
+      genreIds: Array.isArray(doc.get('genreIds')) ? doc.get('genreIds') : [],
+      year: year !== null && Number.isFinite(year) ? year : null,
+      decade: year !== null && Number.isFinite(year) ?
+        Math.floor(year / 10) * 10 : null,
+      director: typeof doc.get('director') === 'string' ? doc.get('director') : null,
+      collectionId: typeof doc.get('collectionId') === 'number' ?
+        doc.get('collectionId') : null,
+      collectionTotal: typeof doc.get('collectionTotal') === 'number' ?
+        doc.get('collectionTotal') : null,
+      addedAt: addedAt instanceof admin.firestore.Timestamp ?
+        addedAt.toDate() : null,
+    };
+  });
+}
+
+/** Compte les valeurs distinctes d'une clé, en ignorant les nulls. */
+function countBy<T>(items: T[], key: (item: T) => string | null): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const k = key(item);
+    if (k === null) continue;
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Applique les quinze règles.
+ * @param {GalleryFact[]} facts Galerie normalisée.
+ * @param {number} watchlistSize Taille actuelle de la watchlist.
+ * @param {number} watchlistPeak Plus grande taille jamais atteinte.
+ * @param {number} totalDecisions Nombre de cartes tranchées au swipe.
+ * @param {Map<string, string>} genreNames Noms de genres, pour les détails.
+ * @return {BadgeState[]} État des quinze badges, sans les dates d'obtention.
+ */
+function computeBadgeStates(
+    facts: GalleryFact[],
+    watchlistSize: number,
+    watchlistPeak: number,
+    totalDecisions: number,
+    genreNames: Map<string, string>,
+): BadgeState[] {
+  const size = facts.length;
+
+  const decades = new Set<number>();
+  for (const fact of facts) if (fact.decade !== null) decades.add(fact.decade);
+
+  const genreCounts = new Map<number, number>();
+  for (const fact of facts) {
+    for (const genreId of fact.genreIds) {
+      genreCounts.set(genreId, (genreCounts.get(genreId) ?? 0) + 1);
+    }
+  }
+  const genresWithTen = Array.from(genreCounts.values())
+      .filter((n) => n >= 10).length;
+
+  const streak = longestDayStreak(
+      facts.map((f) => f.addedAt).filter((d): d is Date => d !== null).map(parisDay),
+  );
+
+  const directorCounts = countBy(facts, (f) => f.director);
+  const topDirector = Math.max(0, ...Array.from(directorCounts.values()));
+
+  // Une saga est complète quand le nombre d'épisodes possédés atteint le
+  // nombre total d'épisodes que TMDB lui connaît.
+  const collectionOwned = new Map<number, number>();
+  const collectionTotal = new Map<number, number>();
+  for (const fact of facts) {
+    if (fact.collectionId === null) continue;
+    collectionOwned.set(fact.collectionId, (collectionOwned.get(fact.collectionId) ?? 0) + 1);
+    if (fact.collectionTotal !== null) {
+      collectionTotal.set(fact.collectionId, fact.collectionTotal);
+    }
+  }
+  let bestCollectionRatio = 0;
+  let completedCollections = 0;
+  for (const [id, owned] of collectionOwned) {
+    const total = collectionTotal.get(id);
+    if (!total || total < 2) continue;
+    if (owned >= total) completedCollections++;
+    bestCollectionRatio = Math.max(bestCollectionRatio, owned / total);
+  }
+
+  const nightAdds = facts.filter((f) => {
+    if (f.addedAt === null) return false;
+    const hour = parisHour(f.addedAt);
+    return hour >= 2 && hour < 5;
+  }).length;
+
+  const preSeventies = facts.filter((f) => f.year !== null && f.year < 1970).length;
+
+  const missingDecades = [1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020]
+      .filter((d) => !decades.has(d));
+
+  const actionName = genreNames.get(String(GENRE_ACTION)) ?? 'action';
+
+  const rule = (
+    id: string, current: number, target: number, detail: string | null = null,
+  ): BadgeState => ({
+    id,
+    unlocked: current >= target,
+    unlockedAt: null,
+    current: Math.min(current, target),
+    target,
+    detail,
+  });
+
+  return [
+    rule('first_reel', size, 1),
+    rule('centenary', size, 100),
+    rule('cinematheque', size, 500),
+    rule('archaeologist', preSeventies, 25),
+    rule('traveler', decades.size, 8,
+      missingDecades.length > 0 && decades.size < 8 ?
+        `Il vous manque les années ${missingDecades.slice(0, 3).join(', ')}.` : null),
+    rule('steel_heart', genreCounts.get(GENRE_ACTION) ?? 0, 75,
+      `Films d'${actionName.toLowerCase()} dans votre galerie.`),
+    rule('sleepless', genreCounts.get(27) ?? 0, 40),
+    rule('panoramic', genresWithTen, 8,
+      `${genresWithTen} genres comptent déjà au moins 10 films.`),
+    rule('marathon', streak, 7),
+    rule('ritual', streak, 60),
+    rule('clean_list',
+      watchlistPeak >= 15 && watchlistSize === 0 ? 1 : 0, 1,
+      watchlistPeak < 15 ?
+        `Votre watchlist doit d'abord atteindre 15 films (record : ${watchlistPeak}).` :
+        `Il reste ${watchlistSize} film${watchlistSize > 1 ? 's' : ''} à voir.`),
+    rule('sorter', totalDecisions, 500),
+    rule('signature', topDirector, 8),
+    rule('integral', completedCollections > 0 ? 1 : 0, 1,
+      bestCollectionRatio > 0 ?
+        `Votre saga la plus avancée est complétée à ${Math.round(bestCollectionRatio * 100)} %.` : null),
+    rule('night_owl', nightAdds, 15),
+  ];
+}
+
+/**
+ * Renvoie l'état complet des badges et persiste les nouvelles obtentions.
+ */
+export const evaluateBadges = onRequest(
+    {invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+
+        const [gallerySnap, watchlistSnap, swipeSnap, badgesSnap, stateSnap] =
+          await Promise.all([
+            userRef.collection('gallery').get(),
+            userRef.collection('watchlist').get(),
+            userRef.collection('preferences').doc('swipeProfile').get(),
+            userRef.collection('badges').get(),
+            userRef.collection('preferences').doc('badgeState').get(),
+          ]);
+
+        const counters = parseSwipeCounters(swipeSnap);
+        const sumValues = (record: Record<string, number>): number =>
+          Object.values(record).reduce((total, n) => total + n, 0);
+        // `totalDecisions` n'existe que pour les comptes récents : on retombe
+        // sur les compteurs par décennie, qui valent un par film tranché.
+        const storedTotal = swipeSnap.get('totalDecisions');
+        const totalDecisions = typeof storedTotal === 'number' ? storedTotal :
+          sumValues(counters.decadeSeen) + sumValues(counters.decadeSkipped);
+
+        const previousPeak = stateSnap.get('watchlistPeak');
+        const watchlistPeak = Math.max(
+            typeof previousPeak === 'number' ? previousPeak : 0,
+            watchlistSnap.size,
+        );
+
+        const genreNames = new Map<string, string>();
+        const states = computeBadgeStates(
+            toGalleryFacts(gallerySnap.docs),
+            watchlistSnap.size,
+            watchlistPeak,
+            totalDecisions,
+            genreNames,
+        );
+
+        const alreadyUnlocked = new Map<string, admin.firestore.Timestamp>();
+        for (const doc of badgesSnap.docs) {
+          const at = doc.get('unlockedAt');
+          if (at instanceof admin.firestore.Timestamp) alreadyUnlocked.set(doc.id, at);
+        }
+
+        const now = a.firestore.Timestamp.now();
+        const batch = db.batch();
+        let writes = 0;
+
+        const payload = states.map((state) => {
+          const existing = alreadyUnlocked.get(state.id);
+          if (existing) {
+            // Déjà obtenu : il le reste, quoi qu'il arrive à la galerie.
+            return {...state, unlocked: true, unlockedAt: existing.toDate().toISOString(),
+              current: state.target};
+          }
+          if (state.unlocked) {
+            batch.set(userRef.collection('badges').doc(state.id), {
+              id: state.id, unlockedAt: now,
+            });
+            writes++;
+            return {...state, unlockedAt: now.toDate().toISOString()};
+          }
+          return state;
+        });
+
+        if (watchlistPeak !== previousPeak) {
+          batch.set(
+              userRef.collection('preferences').doc('badgeState'),
+              {watchlistPeak, updatedAt: now},
+              {merge: true},
+          );
+          writes++;
+        }
+        if (writes > 0) await batch.commit();
+
+        res.status(200).json({badges: payload});
+      } catch (error) {
+        logger.error('evaluateBadges failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
