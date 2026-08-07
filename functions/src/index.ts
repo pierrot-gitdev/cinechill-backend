@@ -162,6 +162,11 @@ export const getPopularMovies = onRequest(
           if (providerIDs.length > 0) {
             query.watch_region = watchRegion;
             query.with_watch_providers = providerIDs.join('|');
+            // Sans ce filtre, TMDB matche n'importe quel type d'offre de la
+            // plateforme — y compris location/achat à l'unité. Un film encore
+            // en salle mais déjà disponible à la location passerait le filtre
+            // alors qu'il n'est pas inclus dans l'abonnement de l'utilisateur.
+            query.with_watch_monetization_types = 'flatrate|free|ads';
           }
         }
 
@@ -688,6 +693,9 @@ function baseDiscoverParams(
   if (!relax.platforms && answers.platformIds.length > 0) {
     query.watch_region = answers.watchRegion ?? 'FR';
     query.with_watch_providers = answers.platformIds.join('|');
+    // Même correctif que getPopularMovies : exclure location/achat pour ne
+    // garder que ce que l'abonnement couvre réellement.
+    query.with_watch_monetization_types = 'flatrate|free|ads';
   }
 
   return query;
@@ -2731,17 +2739,58 @@ async function fetchInTheaters(token: string): Promise<DiscoverRow[]> {
   return settled.flatMap((result) => rowsFrom(result, 'results'));
 }
 
+/** Nombre de tendances garanties après filtrage — jamais moins. */
+const TRENDING_MIN_SIZE = 10;
+/** Pages initiales, récupérées en parallèle. */
+const TRENDING_INITIAL_PAGES = 3;
+/** Plafond de pages en cas de repli : borne le pire cas en latence. */
+const TRENDING_MAX_PAGES = 6;
+
 /**
- * Les films en mouvement cette semaine. Distinct de « populaire », qui est un
- * score glissant bougeant à peine d'un jour sur l'autre.
+ * Un lot de pages de `/trending/movie/week`, récupérées en parallèle.
+ * @param {number[]} pages Pages à récupérer.
  * @param {string} token Jeton TMDB.
- * @return {Promise<DiscoverRow[]>} Films en tendance.
+ * @return {Promise<DiscoverRow[]>} Lignes brutes, non filtrées.
  */
-async function fetchTrending(token: string): Promise<DiscoverRow[]> {
-  const settled = await Promise.allSettled([
-    tmdbGET('/trending/movie/week', {language: DEFAULT_LANGUAGE}, token),
-  ]);
+async function fetchTrendingPages(pages: number[], token: string): Promise<DiscoverRow[]> {
+  const settled = await Promise.allSettled(pages.map((page) => tmdbGET(
+      '/trending/movie/week', {language: DEFAULT_LANGUAGE, page: String(page)}, token,
+  )));
   return settled.flatMap((result) => rowsFrom(result, 'results'));
+}
+
+/**
+ * Complète une liste de tendances jusqu'au plancher garanti, si besoin.
+ *
+ * Les plus gros cartons du box-office trustent souvent le haut du classement
+ * brut — exactement ceux qu'exclut `theatricalExclusion`. Le chargement
+ * initial (3 pages) suffit presque toujours après ce filtrage ; cette boucle
+ * ne paie le coût d'un aller-retour de plus que dans le cas contraire, plutôt
+ * que d'espérer que 3 pages suffisent toujours.
+ * @param {DiscoverRow[]} initial Lignes déjà récupérées.
+ * @param {DeclaredProfile} declared Profil déclaré, pour le même filtrage
+ *   que la réponse finale.
+ * @param {Set<number>} theatricalExclusion Films encore à l'affiche.
+ * @param {string} token Jeton TMDB.
+ * @return {Promise<DiscoverRow[]>} Lignes brutes, assez nombreuses pour
+ *   couvrir `TRENDING_MIN_SIZE` une fois nettoyées par l'appelant.
+ */
+async function backfillTrending(
+    initial: DiscoverRow[],
+    declared: DeclaredProfile,
+    theatricalExclusion: Set<number>,
+    token: string,
+): Promise<DiscoverRow[]> {
+  let rows = initial;
+  let nextPage = TRENDING_INITIAL_PAGES + 1;
+  while (
+    cleanHomeRow(rows, declared, theatricalExclusion).length < TRENDING_MIN_SIZE &&
+    nextPage <= TRENDING_MAX_PAGES
+  ) {
+    rows = rows.concat(await fetchTrendingPages([nextPage], token));
+    nextPage++;
+  }
+  return rows;
 }
 
 /**
@@ -2810,9 +2859,12 @@ export const getHomeRows = onRequest(
         }
 
         const seedId = profile.seedIds[0] ?? null;
-        const [theaters, trending, seededRaw] = await Promise.all([
+        const [theaters, trendingInitial, seededRaw] = await Promise.all([
           fetchInTheaters(tmdbApiKey.value()),
-          fetchTrending(tmdbApiKey.value()),
+          fetchTrendingPages(
+              Array.from({length: TRENDING_INITIAL_PAGES}, (_, i) => i + 1),
+              tmdbApiKey.value(),
+          ),
           seedId === null ? Promise.resolve([]) :
             tmdbGET(`/movie/${seedId}/recommendations`, {
               language: DEFAULT_LANGUAGE, page: '1',
@@ -2835,11 +2887,20 @@ export const getHomeRows = onRequest(
         const noExclusion = new Set<number>();
         const seededExclusion = seedId === null ?
           noExclusion : new Set<number>([seedId]);
+        // Un film encore en salle a déjà sa rangée dédiée : le retrouver aussi
+        // dans les tendances ferait doublon et brouillerait la distinction
+        // entre « au cinéma » et « disponible ailleurs en ce moment ».
+        const theatricalExclusion = new Set(
+            theaters.filter((row) => typeof row.id === 'number').map((row) => row.id),
+        );
+        const trending = await backfillTrending(
+            trendingInitial, declared, theatricalExclusion, tmdbApiKey.value(),
+        );
 
         res.status(200).json({
           in_theaters: cleanHomeRow(rankedTheaters, declared, noExclusion)
               .map(discoverRowToJSON),
-          trending: cleanHomeRow(trending, declared, noExclusion)
+          trending: cleanHomeRow(trending, declared, theatricalExclusion)
               .map(discoverRowToJSON),
           because_you_watched: seedId === null ? null : {
             seed_id: seedId,
