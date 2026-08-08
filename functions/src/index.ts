@@ -557,6 +557,14 @@ interface QuestionnaireAnswersPayload {
   surpriseIntensity: number;
   preferredGenreIds: number[];
   avoidedGenreIds: number[];
+  /** Les réponses de goût durable. Elles ne pèsent pas dans le score du soir —
+   * la croyance envoyée par le client les porte déjà — mais elles doivent
+   * atteindre l'historique pour nourrir le trait d'une séance à l'autre. */
+  cognitiveMode: string | null;
+  storyOrigin: string | null;
+  attachment: string | null;
+  creditsMoment: string | null;
+  lastingTrace: string | null;
 }
 
 interface DiscoverRow {
@@ -631,6 +639,11 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
     surpriseIntensity: numOrDefault(b.surpriseIntensity, 0.5),
     preferredGenreIds: numArray(b.preferredGenreIds),
     avoidedGenreIds: numArray(b.avoidedGenreIds),
+    cognitiveMode: strOrNull(b.cognitiveMode),
+    storyOrigin: strOrNull(b.storyOrigin),
+    attachment: strOrNull(b.attachment),
+    creditsMoment: strOrNull(b.creditsMoment),
+    lastingTrace: strOrNull(b.lastingTrace),
   };
 }
 
@@ -663,6 +676,29 @@ function filterByContentFormat(
 ): DiscoverRow[] {
   if (answers.contentFormat !== 'animated') return rows;
   return rows.filter((row) => (row.genre_ids ?? []).includes(GENRE_ANIMATION));
+}
+
+/**
+ * Le genre demandé est un filtre dur, jamais assoupli.
+ *
+ * `with_genres` le fait déjà appliquer par TMDB à la requête, mais la garantie
+ * ne peut pas reposer sur ça seul : le vivier traverse le client, revient à la
+ * finalisation, et rien n'oblige ce qui revient à être ce qui était parti. Le
+ * filtre est donc réappliqué au dernier moment, là où le trio se décide.
+ *
+ * Aucun genre choisi vaut « ouvert à tout » — la question est facultative — et
+ * ne filtre alors rien du tout.
+ *
+ * @param {number[] | undefined} genreIds Genres TMDB du film.
+ * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @return {boolean} Vrai si le film relève d'au moins un genre demandé.
+ */
+function matchesRequestedGenres(
+    genreIds: number[] | undefined, answers: QuestionnaireAnswersPayload,
+): boolean {
+  const wanted = genreIdsFor(answers.genres);
+  if (wanted.length === 0) return true;
+  return (genreIds ?? []).some((id) => wanted.includes(id));
 }
 
 /**
@@ -762,6 +798,26 @@ async function fetchCandidatePool(
       }
       requests.push(tmdbGET('/discover/movie', query, token));
     }
+  }
+
+  // Il y avait ici une tranche qui retirait `with_genres` pour élargir le vivier
+  // au-delà des genres demandés. Elle se justifiait quand les genres étaient
+  // *déduits* d'un trajet d'humeur : une déduction fausse enfermait la recherche
+  // sans recours. Les genres sont maintenant choisis explicitement, et un choix
+  // explicite ne se contourne pas — élargir au-delà reviendrait à proposer autre
+  // chose que ce qui a été demandé.
+
+  // La tranche basse notoriété : bien notés mais peu vus. Sans elle, un vivier
+  // trié par popularité rend « familiarité : inconnu » structurellement
+  // insatisfiable — le film « confidentiel » du lot resterait un film connu.
+  for (let page = 1; page <= pagesPerSort; page++) {
+    requests.push(tmdbGET('/discover/movie', {
+      ...base,
+      'sort_by': 'vote_average.desc',
+      'vote_count.gte': '100',
+      'vote_count.lte': '2000',
+      'page': String(page),
+    }, token));
   }
 
   const responses = await Promise.allSettled(requests);
@@ -1489,12 +1545,66 @@ interface TraitVerdict {
 }
 
 /** La force d'un verdict. « Resté avec moi » est l'indice le plus fort qu'on
- * puisse recueillir — plus qu'une déclaration, plus qu'un film simplement vu. */
+ * puisse recueillir — plus qu'une déclaration, plus qu'un film simplement vu.
+ * « Il a passé le temps » pèse quasi zéro : la tiédeur n'est pas une
+ * préférence, et la faire tirer le profil vers le film transformait chaque
+ * soirée moyenne en engrais pour d'autres soirées moyennes. */
 const VERDICT_WEIGHT: Record<VerdictValue, number> = {
   stayed: 1.2,
-  passed: 0.4,
+  passed: 0.05,
   unfinished: 0.8,
 };
+
+/** Une réponse durable donnée en séance. Déclarative (0,6 côté client) et
+ * potentiellement contredite par la soirée suivante — d'où un poids modeste,
+ * qui s'accumule si la personne répond pareil de séance en séance. */
+const TRAIT_WEIGHT_SESSION_ANSWER = 0.3;
+/** Un trio explicitement refusé (« Aucun ne me tente »). */
+const TRAIT_WEIGHT_REJECTED_TRIO = 0.3;
+/** Un trio jamais lancé, sans refus explicite : le signal le plus ambigu du
+ * système — la soirée a pu simplement s'arrêter là. */
+const TRAIT_WEIGHT_IGNORED_TRIO = 0.1;
+/** Au-delà, un trio resté sans lancement compte comme décliné en silence. */
+const IGNORED_TRIO_AFTER_DAYS = 7;
+
+/**
+ * Ce que chaque réponse de goût durable dépose dans le trait — le miroir
+ * serveur des cibles d'`AnswerObservations` côté iOS, restreint aux dimensions
+ * qui parlent du goût et non de la soirée. Les deux tables doivent rester
+ * d'accord, sans quoi la séance apprendrait une chose et le trait une autre.
+ */
+const DURABLE_ANSWER_AXES:
+  Record<string, Record<string, [AxisKey, number][]>> = {
+    storyOrigin: {
+      trueStory: [['an', -0.9], ['ch', 0.3]],
+      onlyInCinema: [['an', 0.9]],
+    },
+    attachment: {
+      character: [['ec', -0.8], ['an', -0.4]],
+      world: [['ec', 0.8], ['an', 0.6]],
+    },
+    cognitiveMode: {
+      understand: [['de', 0.8], ['to', -0.3]],
+      feel: [['de', -0.4], ['to', 0.6]],
+    },
+    lastingTrace: {
+      weight: [['ch', 0.9], ['to', -0.2]],
+      smile: [['to', 0.9], ['ch', -0.4]],
+      questions: [['de', 0.9], ['fa', 0.4]],
+      wantMore: [['fa', -0.6], ['ec', 0.5]],
+    },
+  };
+
+/** Une séance, telle que l'historique la raconte au trait : ce qui a été
+ * déclaré de durable, et ce qu'est devenu le trio proposé. */
+interface SessionSignal {
+  answers: Record<string, unknown>;
+  /** Position moyenne du trio, axes sans donnée omis. */
+  trioAxes: Partial<AxisVector>;
+  rejected: boolean;
+  launched: boolean;
+  atMillis: number;
+}
 
 /**
  * Positionne un film de la bibliothèque sur les axes que ses seules métadonnées
@@ -1547,6 +1657,8 @@ function traitWeight(base: number, ageDays: number, sameDayCount: number): numbe
  * @param {TraitEntry[]} gallery Films vus.
  * @param {TraitEntry[]} watchlist Films prévus.
  * @param {Partial<AxisVector>} corrections Corrections posées sur la Fiche.
+ * @param {TraitVerdict[]} verdicts Ce que les films lancés ont laissé.
+ * @param {SessionSignal[]} signals Ce que chaque séance a déclaré et donné.
  * @return {TraitProfile} Le trait.
  */
 function buildTraitProfile(
@@ -1554,6 +1666,7 @@ function buildTraitProfile(
     watchlist: TraitEntry[],
     corrections: Partial<AxisVector>,
     verdicts: TraitVerdict[] = [],
+    signals: SessionSignal[] = [],
 ): TraitProfile {
   const mu = {} as AxisVector;
   const tau = {} as AxisVector;
@@ -1611,6 +1724,40 @@ function buildTraitProfile(
       // qu'au goût, d'où un poids inférieur à celui de « resté avec moi ».
       const target = entry.verdict === 'unfinished' ? -0.4 * value : value;
       observe(axis, Math.max(-1, Math.min(1, target)), weight);
+    }
+  }
+
+  // Les séances, ensuite. C'était la fuite principale du système : les réponses
+  // de goût durable étaient posées, exploitées un soir, puis jetées — dix
+  // séances sans Galerie n'apprenaient rien l'une à l'autre. Elles s'accumulent
+  // désormais ici, avec la même demi-vie que le reste.
+  for (const signal of signals) {
+    const ageDays = (now - signal.atMillis) / (24 * 3600 * 1000);
+
+    for (const [field, options] of Object.entries(DURABLE_ANSWER_AXES)) {
+      const value = signal.answers[field];
+      if (typeof value !== 'string') continue;
+      const targets = options[value];
+      if (!targets) continue;
+      const weight = traitWeight(TRAIT_WEIGHT_SESSION_ANSWER, ageDays, 1);
+      for (const [axis, target] of targets) observe(axis, target, weight);
+    }
+
+    // Le refus, enfin visible : un trio écarté (« Aucun ne me tente ») — ou
+    // resté sans lancement au bout d'une semaine — est une preuve *contre* sa
+    // position. Même convention que « pas fini » : une cible atténuée du côté
+    // opposé, seulement sur les axes où le trio se situait franchement.
+    const negativeBase = signal.rejected ?
+      TRAIT_WEIGHT_REJECTED_TRIO :
+      (!signal.launched && ageDays > IGNORED_TRIO_AFTER_DAYS ?
+        TRAIT_WEIGHT_IGNORED_TRIO : 0);
+    if (negativeBase > 0) {
+      const weight = traitWeight(negativeBase, ageDays, 1);
+      for (const axis of AXIS_KEYS) {
+        const value = signal.trioAxes[axis];
+        if (typeof value !== 'number' || Math.abs(value) < 0.25) continue;
+        observe(axis, Math.max(-1, Math.min(1, -0.4 * value)), weight);
+      }
     }
   }
 
@@ -1672,21 +1819,69 @@ const VERDICT_DELAY_HOURS = 8;
 const VERDICT_EXPIRY_DAYS = 14;
 
 /**
- * Relit l'historique des séances : les verdicts déjà donnés, et celui qu'on
- * pourrait encore demander.
+ * Position moyenne d'un trio dans l'espace commun, axe par axe.
+ * @param {unknown[]} films Bloc `films` d'un document d'historique.
+ * @return {Partial<AxisVector>} Moyenne par axe, axes sans donnée omis.
+ */
+function meanFilmAxes(films: unknown[]): Partial<AxisVector> {
+  const sums = new Map<AxisKey, {total: number; count: number}>();
+  for (const film of films) {
+    if (typeof film !== 'object' || film === null) continue;
+    const axes = (film as Record<string, unknown>).axes;
+    if (typeof axes !== 'object' || axes === null) continue;
+    const record = axes as Record<string, unknown>;
+    for (const axis of AXIS_KEYS) {
+      const value = record[axis];
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+      const entry = sums.get(axis) ?? {total: 0, count: 0};
+      entry.total += value;
+      entry.count += 1;
+      sums.set(axis, entry);
+    }
+  }
+  const out: Partial<AxisVector> = {};
+  for (const [axis, {total, count}] of sums) out[axis] = total / count;
+  return out;
+}
+
+/**
+ * Relit l'historique des séances : les verdicts déjà donnés, celui qu'on
+ * pourrait encore demander, et ce que chaque séance laisse au trait.
  * @param {admin.firestore.QuerySnapshot} snap Historique récent.
- * @return {{verdicts: TraitVerdict[]; pending: PendingVerdict | null}} Lecture.
+ * @return {{verdicts: TraitVerdict[]; pending: PendingVerdict | null;
+ *   signals: SessionSignal[]}} Lecture.
  */
 function readSessionOutcomes(
     snap: admin.firestore.QuerySnapshot,
-): {verdicts: TraitVerdict[]; pending: PendingVerdict | null} {
+): {
+  verdicts: TraitVerdict[];
+  pending: PendingVerdict | null;
+  signals: SessionSignal[];
+} {
   const verdicts: TraitVerdict[] = [];
+  const signals: SessionSignal[] = [];
   let pending: PendingVerdict | null = null;
   const now = Date.now();
 
   for (const doc of snap.docs) {
+    // Chaque séance parle au trait — y compris celles qui n'ont mené à aucun
+    // lancement : c'est même leur silence qui nous intéresse.
+    const createdAt = doc.get('createdAt');
+    const films = doc.get('films');
+    const answersRaw = doc.get('answers');
     const launched = doc.get('launched');
-    if (typeof launched !== 'object' || launched === null) continue;
+    const hasLaunch = typeof launched === 'object' && launched !== null;
+    signals.push({
+      answers: (typeof answersRaw === 'object' && answersRaw !== null) ?
+        answersRaw as Record<string, unknown> : {},
+      trioAxes: meanFilmAxes(Array.isArray(films) ? films : []),
+      rejected: doc.get('rejected') === true,
+      launched: hasLaunch,
+      atMillis: createdAt instanceof admin.firestore.Timestamp ?
+        createdAt.toMillis() : now,
+    });
+
+    if (!hasLaunch) continue;
     const record = launched as Record<string, unknown>;
     const tmdbId = Number(record.tmdbId);
     if (!Number.isFinite(tmdbId)) continue;
@@ -1716,7 +1911,7 @@ function readSessionOutcomes(
     }
   }
 
-  return {verdicts, pending};
+  return {verdicts, pending, signals};
 }
 
 /**
@@ -1969,6 +2164,7 @@ export const getTasteProfile = onRequest(
             traitEntriesFrom(watchlistSnap),
             corrections,
             outcomes.verdicts,
+            outcomes.signals,
         );
 
         res.status(200).json({
@@ -2008,7 +2204,7 @@ export const recordSessionOutcome = onRequest(
 
         const body = (req.body ?? {}) as Record<string, unknown>;
         const tmdbId = Number(body.tmdbId);
-        if (!Number.isFinite(tmdbId)) {
+        if (body.kind !== 'rejection' && !Number.isFinite(tmdbId)) {
           res.status(400).json({error: 'invalid_tmdb_id'});
           return;
         }
@@ -2016,6 +2212,34 @@ export const recordSessionOutcome = onRequest(
         const userRef = getAdmin().firestore().collection('users').doc(uid);
         const historySnap = await userRef.collection('recommendationHistory')
             .orderBy('createdAt', 'desc').limit(20).get();
+
+        if (body.kind === 'rejection') {
+          // « Aucun des trois ne me tente » — le cas le plus fréquent d'échec
+          // était jusqu'ici invisible. On marque la séance qui a proposé ce
+          // trio ; le trait en tirera une preuve contre sa position.
+          const ids = Array.isArray(body.tmdbIds) ?
+            body.tmdbIds.filter((x): x is number =>
+              typeof x === 'number' && Number.isFinite(x)) : [];
+          if (ids.length === 0) {
+            res.status(400).json({error: 'invalid_tmdb_ids'});
+            return;
+          }
+          const doc = historySnap.docs.find((d) => {
+            const stored = d.get('tmdbIds');
+            return Array.isArray(stored) &&
+              ids.every((id) => stored.includes(id));
+          });
+          if (!doc) {
+            res.status(404).json({error: 'session_not_found'});
+            return;
+          }
+          await doc.ref.set({
+            rejected: true,
+            rejectedAt: admin.firestore.Timestamp.now(),
+          }, {merge: true});
+          res.status(200).json({ok: true});
+          return;
+        }
 
         if (body.kind === 'launch') {
           // On retrouve la séance qui a proposé ce film pour y attacher sa
@@ -2154,10 +2378,13 @@ export const getCandidatePool = onRequest(
         ]);
 
         // Les genres bannis dans les réglages ne sont jamais assouplis, même
-        // quand le vivier est trop maigre : c'est le sens de « jamais ».
+        // quand le vivier est trop maigre : c'est le sens de « jamais ». Le
+        // genre demandé ce soir suit la même règle — c'est la réponse la plus
+        // explicite du parcours, elle prime sur la taille du vivier.
         const keep = (row: DiscoverRow): boolean =>
           !exclusionSet.has(row.id) &&
-          !(row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id));
+          !(row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id)) &&
+          matchesRequestedGenres(row.genre_ids, answers);
 
         let pool = filterByContentFormat(rawPool.filter(keep), answers);
         let notice: string | null = null;
@@ -2359,6 +2586,19 @@ export const finalizeRecommendations = onRequest(
 
         if (shortlist.length === 0) {
           res.status(400).json({error: 'no_candidates'});
+          return;
+        }
+
+        // Le genre demandé, réappliqué là où le trio se décide. Sans ce filtre,
+        // la garantie reposait entièrement sur le fait que le client renvoie le
+        // vivier qu'il avait reçu — une supposition, pas une garantie. Aucun
+        // repli ici : si plus rien ne correspond, mieux vaut le dire que
+        // proposer un film d'un genre qui n'a pas été demandé.
+        shortlist = shortlist.filter(
+            (c) => matchesRequestedGenres(c.genre_ids, answers),
+        );
+        if (shortlist.length === 0) {
+          res.status(409).json({error: 'no_candidates_in_requested_genres'});
           return;
         }
 
