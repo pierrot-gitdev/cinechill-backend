@@ -3507,6 +3507,52 @@ export const claimHandle = onRequest(
     },
 );
 
+/**
+ * Dit si un pseudo est libre, sans le réserver.
+ *
+ * Public et non authentifiée : à l'inscription, ce contrôle a lieu *avant*
+ * la création du compte, donc avant qu'un jeton Firebase n'existe. Le seul
+ * renseignement exposé est un booléen sur un format déjà normalisé — la
+ * collection `usernames` reste par ailleurs fermée en lecture
+ * (voir firestore.rules), et cette route ne l'ouvre pas davantage : elle ne
+ * renvoie jamais l'`uid` associé, seulement l'existence du document.
+ *
+ * `claimHandle` reste la seule source de vérité : un pseudo dit « libre »
+ * ici peut être pris entretemps par un autre compte, et c'est la réponse de
+ * `claimHandle` à l'inscription qui tranche pour de bon.
+ */
+export const handleAvailable = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'GET') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+
+        const raw = req.query.handle;
+        if (typeof raw !== 'string') {
+          res.status(400).json({error: 'invalid_handle'});
+          return;
+        }
+        const handleNormalized = normalizeHandle(raw);
+        if (!isValidHandle(handleNormalized)) {
+          res.status(400).json({error: 'invalid_handle'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const usernameRef = db.collection('usernames').doc(handleNormalized);
+        const snap = await usernameRef.get();
+
+        res.status(200).json({available: !snap.exists});
+      } catch (error) {
+        logger.error('handleAvailable failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
 // ---------------------------------------------------------------------------
 // Le graphe de suivi.
 //
