@@ -5,6 +5,11 @@ import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
 import * as admin from 'firebase-admin';
 
+/**
+ * Initialise l'Admin SDK une seule fois, quel que soit le nombre de fonctions
+ * qui l'utilisent dans cette invocation.
+ * @return {admin} L'Admin SDK, prêt à l'emploi.
+ */
 function getAdmin(): typeof admin {
   if (!admin.apps.length) admin.initializeApp();
   return admin;
@@ -223,12 +228,14 @@ export const getMovieDetails = onRequest(
 
         const data = await tmdbRes.json();
 
-        const videos = Array.isArray(data.videos?.results) ? data.videos.results : [];
+        const videos = Array.isArray(data.videos?.results) ?
+          data.videos.results : [];
         const trailer = videos.find(
             (v: {type?: string; site?: string}) =>
               v.type === 'Trailer' && v.site === 'YouTube'
-          ) ?? videos.find((v: {site?: string}) => v.site === 'YouTube');
-        const trailerKey: string | null = (trailer as {key?: string})?.key ?? null;
+        ) ?? videos.find((v: {site?: string}) => v.site === 'YouTube');
+        const trailerKey: string | null =
+          (trailer as {key?: string})?.key ?? null;
 
         const crew = Array.isArray(data.credits?.crew) ? data.credits.crew : [];
         const director: string | null =
@@ -241,7 +248,8 @@ export const getMovieDetails = onRequest(
           }) => ({
             name: typeof c.name === 'string' ? c.name : '',
             character: typeof c.character === 'string' ? c.character : null,
-            profile_path: typeof c.profile_path === 'string' ? c.profile_path : null,
+            profile_path:
+              typeof c.profile_path === 'string' ? c.profile_path : null,
           })) : [];
 
         const genreNames: string[] = Array.isArray(data.genres) ?
@@ -260,7 +268,9 @@ export const getMovieDetails = onRequest(
           try {
             const parts = await tmdbGET(`/collection/${collection.id}`,
                 {language: DEFAULT_LANGUAGE}, tmdbApiKey.value());
-            if (Array.isArray(parts.parts)) collectionCount = parts.parts.length;
+            if (Array.isArray(parts.parts)) {
+              collectionCount = parts.parts.length;
+            }
           } catch {
             collectionCount = null;
           }
@@ -370,7 +380,8 @@ interface MediaItemPayload {
   overview?: string;
   voteAverage?: number;
   /** Renseignés depuis la fiche film, qui seule les connaît. Alimentent les
-   * badges « Signature » et « L'Intégrale » ; absents ailleurs, sans gravité. */
+   * badges « Signature » et « L'Intégrale » ; absents ailleurs, sans
+   * gravité. */
   director?: string;
   collectionId?: number;
   collectionTotal?: number;
@@ -481,7 +492,8 @@ const GENRE_TMDB_IDS: Record<string, number[]> = {
   documentary: [99],
 };
 
-/** Genres TMDB associés à chaque ambiance (Q4), pour le score, pas le filtre. */
+/** Genres TMDB associés à chaque ambiance (Q4), pour le score, pas le
+ * filtre. */
 const MOOD_GENRES: Record<string, number[]> = {
   lightFun: [35],
   intense: [28, 53],
@@ -585,9 +597,11 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
   const strOrDefault = (v: unknown, fallback: string): string =>
     typeof v === 'string' && v.length > 0 ? v : fallback;
   const numArray = (v: unknown): number[] =>
-    Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number') : [];
+    Array.isArray(v) ?
+      v.filter((x): x is number => typeof x === 'number') : [];
   const numOrDefault = (v: unknown, fallback: number): number =>
-    typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : fallback;
+    typeof v === 'number' && Number.isFinite(v) ?
+      Math.max(0, Math.min(1, v)) : fallback;
 
   return {
     contentFormat: strOrDefault(b.contentFormat, 'liveAction'),
@@ -653,9 +667,9 @@ function baseDiscoverParams(
     relax: {dealbreaker: boolean; platforms: boolean},
 ): Record<string, string> {
   const query: Record<string, string> = {
-    language: DEFAULT_LANGUAGE,
-    include_adult: 'false',
-    include_video: 'false',
+    'language': DEFAULT_LANGUAGE,
+    'include_adult': 'false',
+    'include_video': 'false',
     'vote_count.gte': '20',
   };
 
@@ -719,7 +733,9 @@ async function fetchCandidatePool(
     token: string,
 ): Promise<DiscoverRow[]> {
   const base = baseDiscoverParams(answers, relax);
-  const sorts = ['popularity.desc', 'vote_average.desc', 'primary_release_date.desc'];
+  const sorts = [
+    'popularity.desc', 'vote_average.desc', 'primary_release_date.desc',
+  ];
   const pagesPerSort = 2;
 
   const requests: Promise<Record<string, unknown>>[] = [];
@@ -815,12 +831,15 @@ function bandScore(
 /**
  * Ambiance — recouvrement entre les genres du film et les genres associés à
  * l'ambiance choisie, affiné par les comparaisons directes entre affiches
- * (`preferredGenreIds`/`avoidedGenreIds`, alimentées par `PairwiseComparisonView`
- * côté client) plutôt qu'un critère séparé. Poids : 30.
+ * (`preferredGenreIds`/`avoidedGenreIds`, alimentées par
+ * `PairwiseComparisonView` côté client) plutôt qu'un critère séparé.
+ * Poids : 30.
  * @param {number[]} genreIds Genres TMDB du film.
  * @param {string | null} mood Ambiance choisie.
- * @param {number[]} preferredGenreIds Genres des films choisis en comparaison directe.
- * @param {number[]} avoidedGenreIds Genres des films écartés en comparaison directe.
+ * @param {number[]} preferredGenreIds Genres des films choisis en
+ *   comparaison directe.
+ * @param {number[]} avoidedGenreIds Genres des films écartés en comparaison
+ *   directe.
  * @return {number} Score 0..1.
  */
 function ambianceScore(
@@ -868,7 +887,8 @@ function qualityScore(
     case 'wellRatedKnown':
       return wellKnown ? quality : quality * 0.6;
     case 'hiddenGem':
-      return (voteCount ?? 0) >= 20 ? 0.7 * quality + 0.3 * (1 - popNorm) : quality * 0.5;
+      return (voteCount ?? 0) >= 20 ?
+        0.7 * quality + 0.3 * (1 - popNorm) : quality * 0.5;
     default:
       return quality;
   }
@@ -882,8 +902,12 @@ function qualityScore(
  * @param {string} origin Préférence exprimée (french/international/any).
  * @return {number} Score 0..1.
  */
-function originScore(originCountry: string[] | undefined, origin: string): number {
-  if (origin === 'any' || !originCountry || originCountry.length === 0) return 0.5;
+function originScore(
+    originCountry: string[] | undefined, origin: string,
+): number {
+  if (origin === 'any' || !originCountry || originCountry.length === 0) {
+    return 0.5;
+  }
   const isFrench = originCountry.includes('FR');
   if (origin === 'french') return isFrench ? 1 : 0.15;
   if (origin === 'international') return isFrench ? 0.15 : 1;
@@ -937,8 +961,8 @@ function coarseMindsetScore(
     case 'seeMyself':
       return genreIds.includes(GENRE_DRAMA) ? 0.8 : 0.3;
     case 'learnSomething':
-      return genreIds.includes(GENRE_DOCUMENTARY) || genreIds.includes(GENRE_HISTORY) ?
-        1 : 0.2;
+      return genreIds.includes(GENRE_DOCUMENTARY) ||
+        genreIds.includes(GENRE_HISTORY) ? 1 : 0.2;
     case 'beSurprised':
       return 0.5; // Raffiné une fois belongs_to_collection connu.
     default:
@@ -953,7 +977,9 @@ function coarseMindsetScore(
  * @param {string} preference Préférence de durée.
  * @return {number} Score 0..1.
  */
-function runtimeScore(runtimeMinutes: number | null, preference: string): number {
+function runtimeScore(
+    runtimeMinutes: number | null, preference: string,
+): number {
   if (runtimeMinutes === null || preference === 'any') return 0.5;
   if (preference === 'short') return bandScore(runtimeMinutes, 0, 95, 25);
   if (preference === 'medium') return bandScore(runtimeMinutes, 90, 125, 20);
@@ -970,19 +996,23 @@ function runtimeScore(runtimeMinutes: number | null, preference: string): number
  */
 function castScore(castPopularities: number[], preference: string): number {
   if (preference === 'any' || castPopularities.length === 0) return 0.5;
-  const avg = castPopularities.reduce((a, b) => a + b, 0) / castPopularities.length;
+  const avg =
+    castPopularities.reduce((a, b) => a + b, 0) / castPopularities.length;
   const norm = Math.max(0, Math.min(1, avg / 20));
   return preference === 'familiarFaces' ? norm : 1 - norm;
 }
 
 /**
- * Curseur "intensité de surprise" (question adaptative indépendante de `mindset`) — ajuste
- * `mindsetSub` autour de sa valeur neutre. Le curseur au centre (0.5, valeur par défaut si jamais
- * posée) laisse `base` inchangé — comportement identique à avant l'introduction du curseur. Plus
- * l'intensité voulue est haute, plus la pénalité franchise se creuse ; en dessous de 0.5, elle
- * s'adoucit. Effet modeste (±0.15 maxi) car secondaire à `mindset`, la source de vérité.
+ * Curseur "intensité de surprise" (question adaptative indépendante de
+ * `mindset`) — ajuste `mindsetSub` autour de sa valeur neutre. Le curseur au
+ * centre (0.5, valeur par défaut si jamais posée) laisse `base` inchangé —
+ * comportement identique à avant l'introduction du curseur. Plus l'intensité
+ * voulue est haute, plus la pénalité franchise se creuse ; en dessous de 0.5,
+ * elle s'adoucit. Effet modeste (±0.15 maxi) car secondaire à `mindset`, la
+ * source de vérité.
  * @param {number} base Sous-score état d'esprit avant ajustement.
- * @param {boolean} belongsToCollection Si le film appartient à une franchise/collection.
+ * @param {boolean} belongsToCollection Si le film appartient à une
+ *   franchise/collection.
  * @param {number} intensity Intensité de surprise voulue, 0..1 (0.5 = neutre).
  * @return {number} Sous-score ajusté, borné 0..1.
  */
@@ -1015,10 +1045,14 @@ function finalWeightedScore(
 
   const weighted =
     0.30 * ambianceScore(
-        c.genre_ids ?? [], answers.mood, answers.preferredGenreIds, answers.avoidedGenreIds,
+        c.genre_ids ?? [], answers.mood,
+        answers.preferredGenreIds, answers.avoidedGenreIds,
     ) +
     0.15 * mindsetSub +
-    0.15 * qualityScore(c.vote_average ?? null, c.vote_count ?? null, c.popularity ?? null, answers.popularity) +
+    0.15 * qualityScore(
+        c.vote_average ?? null, c.vote_count ?? null,
+        c.popularity ?? null, answers.popularity,
+    ) +
     0.10 * originScore(c.origin_country, answers.origin) +
     0.10 * castScore(c.castPopularities, answers.cast) +
     0.10 * eraScore(c.release_date, answers.era, c.vote_count ?? null) +
@@ -1096,15 +1130,19 @@ async function enrichCandidate(
         .map((p) => p.provider_id)
         .filter((id): id is number => typeof id === 'number');
 
-    const videos = Array.isArray((detail.videos as {results?: unknown} | undefined)?.results) ?
-      (detail.videos as {results: {type?: string; site?: string; key?: string}[]}).results : [];
-    const trailer = videos.find((v) => v.type === 'Trailer' && v.site === 'YouTube') ??
+    const videosResults =
+      (detail.videos as {results?: unknown} | undefined)?.results;
+    const videos = Array.isArray(videosResults) ?
+      (videosResults as {type?: string; site?: string; key?: string}[]) : [];
+    const trailer =
+      videos.find((v) => v.type === 'Trailer' && v.site === 'YouTube') ??
       videos.find((v) => v.site === 'YouTube');
     const trailerKey = trailer?.key ?? null;
 
     return {
       ...row,
-      runtimeMinutes: typeof detail.runtime === 'number' ? detail.runtime : null,
+      runtimeMinutes:
+        typeof detail.runtime === 'number' ? detail.runtime : null,
       belongsToCollection: detail.belongs_to_collection !== null &&
         detail.belongs_to_collection !== undefined,
       castPopularities,
@@ -1143,7 +1181,9 @@ function selectWithExplorationAndDiversity(
           Math.floor(Number(p.release_date.slice(0, 4)) / 10);
         return sum + (sharedGenres >= 2 ? 15 : 0) + (sameDecade ? 5 : 0);
       }, 0);
-      return {candidate, adjustedScore: Math.max(1, candidate.finalScore - penalty)};
+      return {
+        candidate, adjustedScore: Math.max(1, candidate.finalScore - penalty),
+      };
     });
 
     const chosen = softmaxPick(adjusted);
@@ -1164,7 +1204,8 @@ function selectWithExplorationAndDiversity(
  *   item.
  */
 function softmaxPick<T extends {adjustedScore: number}>(items: T[]): T {
-  const weights = items.map((i) => Math.exp(i.adjustedScore / SOFTMAX_TEMPERATURE));
+  const weights =
+    items.map((i) => Math.exp(i.adjustedScore / SOFTMAX_TEMPERATURE));
   const total = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
   for (let i = 0; i < items.length; i++) {
@@ -1197,7 +1238,11 @@ async function verifyAuth(req: Request, res: Response): Promise<string | null> {
   }
 }
 
-/** JSON shape of a `DiscoverRow` as sent to/echoed back by the client. */
+/**
+ * JSON shape of a `DiscoverRow` as sent to/echoed back by the client.
+ * @param {DiscoverRow} row Row to serialize.
+ * @return {Object} Plain object ready for `res.json`.
+ */
 function discoverRowToJSON(row: DiscoverRow) {
   return {
     id: row.id,
@@ -1239,7 +1284,11 @@ export const getCandidatePool = onRequest(
         const [exclusionSet, declared, rawPool] = await Promise.all([
           fetchExclusionSet(db, uid),
           fetchDeclaredProfile(db, uid),
-          fetchCandidatePool(answers, {dealbreaker: true, platforms: false}, tmdbApiKey.value()),
+          fetchCandidatePool(
+              answers,
+              {dealbreaker: true, platforms: false},
+              tmdbApiKey.value(),
+          ),
         ]);
 
         // Les genres bannis dans les réglages ne sont jamais assouplis, même
@@ -1293,20 +1342,29 @@ export const enrichCandidates = onRequest(
         if (!uid) return;
 
         const body = (req.body ?? {}) as Record<string, unknown>;
-        const rawCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+        const rawCandidates =
+          Array.isArray(body.candidates) ? body.candidates : [];
         const rows: DiscoverRow[] = rawCandidates
-            .filter((c): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+            .filter((c): c is Record<string, unknown> =>
+              typeof c === 'object' && c !== null)
             .map((c) => ({
               id: Number(c.id),
               title: typeof c.title === 'string' ? c.title : undefined,
               overview: typeof c.overview === 'string' ? c.overview : null,
-              poster_path: typeof c.poster_path === 'string' ? c.poster_path : null,
-              vote_average: typeof c.vote_average === 'number' ? c.vote_average : null,
-              vote_count: typeof c.vote_count === 'number' ? c.vote_count : null,
-              popularity: typeof c.popularity === 'number' ? c.popularity : null,
-              genre_ids: Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
-              release_date: typeof c.release_date === 'string' ? c.release_date : null,
-              origin_country: Array.isArray(c.origin_country) ? c.origin_country as string[] : [],
+              poster_path:
+                typeof c.poster_path === 'string' ? c.poster_path : null,
+              vote_average:
+                typeof c.vote_average === 'number' ? c.vote_average : null,
+              vote_count:
+                typeof c.vote_count === 'number' ? c.vote_count : null,
+              popularity:
+                typeof c.popularity === 'number' ? c.popularity : null,
+              genre_ids:
+                Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
+              release_date:
+                typeof c.release_date === 'string' ? c.release_date : null,
+              origin_country: Array.isArray(c.origin_country) ?
+                c.origin_country as string[] : [],
             }))
             .filter((row) => Number.isFinite(row.id));
 
@@ -1315,7 +1373,9 @@ export const enrichCandidates = onRequest(
           return;
         }
         if (rows.length > ENRICH_BATCH_MAX) {
-          res.status(400).json({error: 'too_many_candidates', max: ENRICH_BATCH_MAX});
+          res.status(400).json({
+            error: 'too_many_candidates', max: ENRICH_BATCH_MAX,
+          });
           return;
         }
 
@@ -1323,9 +1383,9 @@ export const enrichCandidates = onRequest(
             rows.map((row) => enrichCandidate(row, tmdbApiKey.value())),
         );
         const enriched = enrichedResults
-            .filter((r): r is PromiseFulfilledResult<EnrichedCandidate | null> =>
-              r.status === 'fulfilled')
-            .map((r) => r.value)
+            .filter((r) => r.status === 'fulfilled')
+            .map((r) =>
+              (r as PromiseFulfilledResult<EnrichedCandidate | null>).value)
             .filter((c): c is EnrichedCandidate => c !== null);
 
         res.status(200).json({
@@ -1365,26 +1425,39 @@ export const finalizeRecommendations = onRequest(
 
         const body = (req.body ?? {}) as Record<string, unknown>;
         const answers = parseAnswers(body.answers);
-        const rawCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+        const rawCandidates =
+          Array.isArray(body.candidates) ? body.candidates : [];
 
         let shortlist: EnrichedCandidate[] = rawCandidates
-            .filter((c): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+            .filter((c): c is Record<string, unknown> =>
+              typeof c === 'object' && c !== null)
             .map((c) => ({
               id: Number(c.id),
               title: typeof c.title === 'string' ? c.title : undefined,
               overview: typeof c.overview === 'string' ? c.overview : null,
-              poster_path: typeof c.poster_path === 'string' ? c.poster_path : null,
-              vote_average: typeof c.vote_average === 'number' ? c.vote_average : null,
-              vote_count: typeof c.vote_count === 'number' ? c.vote_count : null,
-              popularity: typeof c.popularity === 'number' ? c.popularity : null,
-              genre_ids: Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
-              release_date: typeof c.release_date === 'string' ? c.release_date : null,
-              origin_country: Array.isArray(c.origin_country) ? c.origin_country as string[] : [],
-              runtimeMinutes: typeof c.runtime_minutes === 'number' ? c.runtime_minutes : null,
+              poster_path:
+                typeof c.poster_path === 'string' ? c.poster_path : null,
+              vote_average:
+                typeof c.vote_average === 'number' ? c.vote_average : null,
+              vote_count:
+                typeof c.vote_count === 'number' ? c.vote_count : null,
+              popularity:
+                typeof c.popularity === 'number' ? c.popularity : null,
+              genre_ids:
+                Array.isArray(c.genre_ids) ? c.genre_ids as number[] : [],
+              release_date:
+                typeof c.release_date === 'string' ? c.release_date : null,
+              origin_country: Array.isArray(c.origin_country) ?
+                c.origin_country as string[] : [],
+              runtimeMinutes: typeof c.runtime_minutes === 'number' ?
+                c.runtime_minutes : null,
               belongsToCollection: c.belongs_to_collection === true,
-              castPopularities: Array.isArray(c.cast_popularities) ? c.cast_popularities as number[] : [],
-              providerIds: Array.isArray(c.provider_ids) ? c.provider_ids as number[] : [],
-              trailerKey: typeof c.trailer_key === 'string' ? c.trailer_key : null,
+              castPopularities: Array.isArray(c.cast_popularities) ?
+                c.cast_popularities as number[] : [],
+              providerIds: Array.isArray(c.provider_ids) ?
+                c.provider_ids as number[] : [],
+              trailerKey:
+                typeof c.trailer_key === 'string' ? c.trailer_key : null,
               finalScore: 0,
               reasons: [],
             }))
@@ -1398,7 +1471,8 @@ export const finalizeRecommendations = onRequest(
         // "predictablePlot" est un filtre dur : on retire les suites/sagas,
         // sauf si ça viderait la shortlist (jamais de résultat vide).
         if (answers.dealbreaker === 'predictablePlot') {
-          const withoutFranchises = shortlist.filter((c) => !c.belongsToCollection);
+          const withoutFranchises =
+            shortlist.filter((c) => !c.belongsToCollection);
           if (withoutFranchises.length >= RESULT_COUNT) {
             shortlist = withoutFranchises;
           }
@@ -1408,9 +1482,10 @@ export const finalizeRecommendations = onRequest(
             .map((c) => ({...c, finalScore: finalWeightedScore(c, answers)}))
             .sort((a, b) => b.finalScore - a.finalScore);
 
-        // L'exploration (softmax) choisit délibérément les 3 films dans un ordre
-        // non strictement trié — on re-trie par score pour l'affichage (#1/#2/#3)
-        // sans changer *lesquels* des 3 films ont été sélectionnés.
+        // L'exploration (softmax) choisit délibérément les 3 films dans un
+        // ordre non strictement trié — on re-trie par score pour l'affichage
+        // (#1/#2/#3) sans changer *lesquels* des 3 films ont été
+        // sélectionnés.
         const selected = selectWithExplorationAndDiversity(shortlist)
             .sort((a, b) => b.finalScore - a.finalScore)
             .map((c) => ({...c, reasons: buildReasons(c, answers)}));
@@ -1625,7 +1700,11 @@ function smoothedRatio(positive: number, negative: number): number {
   return (positive + 2) / (positive + negative + 4);
 }
 
-/** Borne une valeur dans [0, 1]. */
+/**
+ * Borne une valeur dans [0, 1].
+ * @param {number} value Valeur à borner.
+ * @return {number} Valeur bornée.
+ */
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
@@ -1677,6 +1756,7 @@ function parseSwipeCounters(
  * est en train d'explorer plutôt que la moyenne de toute sa vie de spectateur.
  * @param {admin.firestore.QueryDocumentSnapshot[]} galleryDocs Docs galerie.
  * @param {SwipeCounters} counters Compteurs de swipe agrégés.
+ * @param {DeclaredProfile} declared Préférences déclarées au questionnaire.
  * @return {TasteProfile} Profil prêt pour le scoring.
  */
 function buildTasteProfile(
@@ -1784,7 +1864,11 @@ function pickSeedIds(orderedIds: number[]): number[] {
   return shuffled([...recent, ...older]);
 }
 
-/** Copie mélangée (Fisher-Yates). */
+/**
+ * Copie mélangée (Fisher-Yates).
+ * @param {T[]} items Éléments à mélanger.
+ * @return {T[]} Copie mélangée, l'original n'est pas modifié.
+ */
 function shuffled<T>(items: T[]): T[] {
   const copy = [...items];
   for (let i = copy.length - 1; i > 0; i--) {
@@ -1889,16 +1973,16 @@ async function fetchProfiledCandidates(
 
   const decades = targetDecades(profile);
   const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    language: DEFAULT_LANGUAGE,
-    region: DEFAULT_REGION,
-    include_adult: 'false',
-    include_video: 'false',
-    with_genres: genreIds.join('|'),
+    'language': DEFAULT_LANGUAGE,
+    'region': DEFAULT_REGION,
+    'include_adult': 'false',
+    'include_video': 'false',
+    'with_genres': genreIds.join('|'),
     'primary_release_date.gte': `${decade}-01-01`,
     'primary_release_date.lte': `${decade + 9}-12-31`,
     'vote_count.gte': String(voteCountFloor),
-    sort_by: 'vote_count.desc',
-    page: String(1 + Math.floor(Math.random() * 3)),
+    'sort_by': 'vote_count.desc',
+    'page': String(1 + Math.floor(Math.random() * 3)),
   }, token));
 
   const settled = await Promise.allSettled(requests);
@@ -1921,15 +2005,15 @@ async function fetchPillarCandidates(
     shuffled([1990, 2000, 2010, 2020]);
 
   const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    language: DEFAULT_LANGUAGE,
-    region: DEFAULT_REGION,
-    include_adult: 'false',
-    include_video: 'false',
+    'language': DEFAULT_LANGUAGE,
+    'region': DEFAULT_REGION,
+    'include_adult': 'false',
+    'include_video': 'false',
     'primary_release_date.gte': `${decade}-01-01`,
     'primary_release_date.lte': `${decade + 9}-12-31`,
     'vote_count.gte': String(SWIPE_COLD_VOTE_COUNT_FLOOR),
-    sort_by: 'vote_count.desc',
-    page: String(1 + Math.floor(Math.random() * 3)),
+    'sort_by': 'vote_count.desc',
+    'page': String(1 + Math.floor(Math.random() * 3)),
   }, token));
 
   const settled = await Promise.allSettled(requests);
@@ -1994,13 +2078,13 @@ async function fetchFranchiseAndPeopleCandidates(
     Promise.allSettled(
         Array.from(personIds).slice(0, 2).map((id) =>
           tmdbGET('/discover/movie', {
-            language: DEFAULT_LANGUAGE,
-            include_adult: 'false',
-            include_video: 'false',
-            with_cast: String(id),
+            'language': DEFAULT_LANGUAGE,
+            'include_adult': 'false',
+            'include_video': 'false',
+            'with_cast': String(id),
             'vote_count.gte': String(SWIPE_VOTE_COUNT_FLOOR),
-            sort_by: 'vote_count.desc',
-            page: '1',
+            'sort_by': 'vote_count.desc',
+            'page': '1',
           }, token)),
     ),
   ]);
@@ -2317,7 +2401,11 @@ async function fetchSwipeExclusions(
   return {excluded, galleryDocs: gallerySnap.docs};
 }
 
-/** Ids déjà servis dans la session courante, envoyés par le client. */
+/**
+ * Ids déjà servis dans la session courante, envoyés par le client.
+ * @param {unknown} value Payload brut de la requête.
+ * @return {Set<number>} Ids valides, dédupliqués.
+ */
 function parseExcludeIds(value: unknown): Set<number> {
   const ids = new Set<number>();
   if (!Array.isArray(value)) return ids;
@@ -2419,8 +2507,11 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
     const decision = entry.decision;
     if (decision !== 'seen' && decision !== 'skipped' &&
       decision !== 'watchlist') continue;
-    const item = entry.item as SwipeDecisionPayload['item'] | undefined;
-    if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) continue;
+    const item =
+      entry.item as SwipeDecisionPayload['item'] | undefined;
+    if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
+      continue;
+    }
     decisions.push({decision, item});
   }
   return decisions;
@@ -2576,7 +2667,8 @@ export const recordSwipes = onRequest(
               // Total exact des cartes tranchées : les compteurs par genre
               // sur-comptent (un film porte plusieurs genres) et ceux par
               // décennie ratent les mises en watchlist.
-              totalDecisions: a.firestore.FieldValue.increment(decisions.length),
+              totalDecisions:
+                a.firestore.FieldValue.increment(decisions.length),
               updatedAt: now,
             },
             {merge: true},
@@ -2795,7 +2887,11 @@ const THEATERS_WINDOW_DAYS = 56;
 /** Films renvoyés par rangée. */
 const HOME_ROW_SIZE = 20;
 
-/** Date au format `YYYY-MM-DD` attendu par TMDB. */
+/**
+ * Date au format `YYYY-MM-DD` attendu par TMDB.
+ * @param {Date} date Date à formater.
+ * @return {string} Date au format `YYYY-MM-DD`.
+ */
 function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
@@ -2811,19 +2907,20 @@ function isoDate(date: Date): string {
  */
 async function fetchInTheaters(token: string): Promise<DiscoverRow[]> {
   const now = new Date();
-  const from = new Date(now.getTime() - THEATERS_WINDOW_DAYS * 24 * 3600 * 1000);
+  const from =
+    new Date(now.getTime() - THEATERS_WINDOW_DAYS * 24 * 3600 * 1000);
 
   const requests = [1, 2].map((page) => tmdbGET('/discover/movie', {
-    language: DEFAULT_LANGUAGE,
-    region: DEFAULT_REGION,
-    include_adult: 'false',
-    include_video: 'false',
+    'language': DEFAULT_LANGUAGE,
+    'region': DEFAULT_REGION,
+    'include_adult': 'false',
+    'include_video': 'false',
     // 3 = sortie en salle, 2 = première limitée.
-    with_release_type: '3|2',
+    'with_release_type': '3|2',
     'primary_release_date.gte': isoDate(from),
     'primary_release_date.lte': isoDate(now),
-    sort_by: 'popularity.desc',
-    page: String(page),
+    'sort_by': 'popularity.desc',
+    'page': String(page),
   }, token));
 
   const settled = await Promise.allSettled(requests);
@@ -2843,9 +2940,13 @@ const TRENDING_MAX_PAGES = 6;
  * @param {string} token Jeton TMDB.
  * @return {Promise<DiscoverRow[]>} Lignes brutes, non filtrées.
  */
-async function fetchTrendingPages(pages: number[], token: string): Promise<DiscoverRow[]> {
+async function fetchTrendingPages(
+    pages: number[], token: string,
+): Promise<DiscoverRow[]> {
   const settled = await Promise.allSettled(pages.map((page) => tmdbGET(
-      '/trending/movie/week', {language: DEFAULT_LANGUAGE, page: String(page)}, token,
+      '/trending/movie/week',
+      {language: DEFAULT_LANGUAGE, page: String(page)},
+      token,
   )));
   return settled.flatMap((result) => rowsFrom(result, 'results'));
 }
@@ -2875,7 +2976,8 @@ async function backfillTrending(
   let rows = initial;
   let nextPage = TRENDING_INITIAL_PAGES + 1;
   while (
-    cleanHomeRow(rows, declared, theatricalExclusion).length < TRENDING_MIN_SIZE &&
+    cleanHomeRow(rows, declared, theatricalExclusion).length <
+      TRENDING_MIN_SIZE &&
     nextPage <= TRENDING_MAX_PAGES
   ) {
     rows = rows.concat(await fetchTrendingPages([nextPage], token));
@@ -2903,7 +3005,9 @@ function cleanHomeRow(
     if (typeof row.id !== 'number' || seen.has(row.id)) continue;
     if (!row.poster_path) continue;
     if (excluded.has(row.id)) continue;
-    if ((row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id))) continue;
+    const isBanned =
+      (row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id));
+    if (isBanned) continue;
     seen.add(row.id);
     out.push(row);
     if (out.length >= HOME_ROW_SIZE) break;
@@ -2969,9 +3073,13 @@ export const getHomeRows = onRequest(
         // de « pour vous au cinéma ». La popularité ne sert qu'à départager :
         // en tête de tri elle ramènerait les mêmes blockbusters en permanence.
         const rankedTheaters = [...theaters].sort((left, right) => {
-          const leftScore = tasteMatch({...left, source: 'profile', score: 0}, profile);
-          const rightScore = tasteMatch({...right, source: 'profile', score: 0}, profile);
-          if (Math.abs(leftScore - rightScore) > 0.02) return rightScore - leftScore;
+          const leftScore =
+            tasteMatch({...left, source: 'profile', score: 0}, profile);
+          const rightScore =
+            tasteMatch({...right, source: 'profile', score: 0}, profile);
+          if (Math.abs(leftScore - rightScore) > 0.02) {
+            return rightScore - leftScore;
+          }
           return (right.popularity ?? 0) - (left.popularity ?? 0);
         });
 
@@ -2982,7 +3090,9 @@ export const getHomeRows = onRequest(
         // dans les tendances ferait doublon et brouillerait la distinction
         // entre « au cinéma » et « disponible ailleurs en ce moment ».
         const theatricalExclusion = new Set(
-            theaters.filter((row) => typeof row.id === 'number').map((row) => row.id),
+            theaters
+                .filter((row) => typeof row.id === 'number')
+                .map((row) => row.id),
         );
         const trending = await backfillTrending(
             trendingInitial, declared, theatricalExclusion, tmdbApiKey.value(),
@@ -3111,7 +3221,8 @@ function toGalleryFacts(
       year: year !== null && Number.isFinite(year) ? year : null,
       decade: year !== null && Number.isFinite(year) ?
         Math.floor(year / 10) * 10 : null,
-      director: typeof doc.get('director') === 'string' ? doc.get('director') : null,
+      director: typeof doc.get('director') === 'string' ?
+        doc.get('director') : null,
       collectionId: typeof doc.get('collectionId') === 'number' ?
         doc.get('collectionId') : null,
       collectionTotal: typeof doc.get('collectionTotal') === 'number' ?
@@ -3122,8 +3233,15 @@ function toGalleryFacts(
   });
 }
 
-/** Compte les valeurs distinctes d'une clé, en ignorant les nulls. */
-function countBy<T>(items: T[], key: (item: T) => string | null): Map<string, number> {
+/**
+ * Compte les valeurs distinctes d'une clé, en ignorant les nulls.
+ * @param {T[]} items Éléments à compter.
+ * @param {function(T): ?string} key Extrait la clé d'un élément.
+ * @return {Map<string, number>} Effectif par valeur de clé.
+ */
+function countBy<T>(
+    items: T[], key: (item: T) => string | null,
+): Map<string, number> {
   const counts = new Map<string, number>();
   for (const item of items) {
     const k = key(item);
@@ -3164,7 +3282,10 @@ function computeBadgeStates(
       .filter((n) => n >= 10).length;
 
   const streak = longestDayStreak(
-      facts.map((f) => f.addedAt).filter((d): d is Date => d !== null).map(parisDay),
+      facts
+          .map((f) => f.addedAt)
+          .filter((d): d is Date => d !== null)
+          .map(parisDay),
   );
 
   const directorCounts = countBy(facts, (f) => f.director);
@@ -3176,7 +3297,9 @@ function computeBadgeStates(
   const collectionTotal = new Map<number, number>();
   for (const fact of facts) {
     if (fact.collectionId === null) continue;
-    collectionOwned.set(fact.collectionId, (collectionOwned.get(fact.collectionId) ?? 0) + 1);
+    collectionOwned.set(
+        fact.collectionId, (collectionOwned.get(fact.collectionId) ?? 0) + 1,
+    );
     if (fact.collectionTotal !== null) {
       collectionTotal.set(fact.collectionId, fact.collectionTotal);
     }
@@ -3196,15 +3319,17 @@ function computeBadgeStates(
     return hour >= 2 && hour < 5;
   }).length;
 
-  const preSeventies = facts.filter((f) => f.year !== null && f.year < 1970).length;
+  const preSeventies =
+    facts.filter((f) => f.year !== null && f.year < 1970).length;
 
-  const missingDecades = [1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020]
-      .filter((d) => !decades.has(d));
+  const missingDecades = [
+    1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020,
+  ].filter((d) => !decades.has(d));
 
   const actionName = genreNames.get(String(GENRE_ACTION)) ?? 'action';
 
   const rule = (
-    id: string, current: number, target: number, detail: string | null = null,
+      id: string, current: number, target: number, detail: string | null = null,
   ): BadgeState => ({
     id,
     unlocked: current >= target,
@@ -3221,24 +3346,28 @@ function computeBadgeStates(
     rule('archaeologist', preSeventies, 25),
     rule('traveler', decades.size, 8,
       missingDecades.length > 0 && decades.size < 8 ?
-        `Il vous manque les années ${missingDecades.slice(0, 3).join(', ')}.` : null),
+        `Il vous manque les années ` +
+          `${missingDecades.slice(0, 3).join(', ')}.` : null),
     rule('steel_heart', genreCounts.get(GENRE_ACTION) ?? 0, 75,
-      `Films d'${actionName.toLowerCase()} dans votre galerie.`),
+        `Films d'${actionName.toLowerCase()} dans votre galerie.`),
     rule('sleepless', genreCounts.get(27) ?? 0, 40),
     rule('panoramic', genresWithTen, 8,
-      `${genresWithTen} genres comptent déjà au moins 10 films.`),
+        `${genresWithTen} genres comptent déjà au moins 10 films.`),
     rule('marathon', streak, 7),
     rule('ritual', streak, 60),
     rule('clean_list',
       watchlistPeak >= 15 && watchlistSize === 0 ? 1 : 0, 1,
       watchlistPeak < 15 ?
-        `Votre watchlist doit d'abord atteindre 15 films (record : ${watchlistPeak}).` :
-        `Il reste ${watchlistSize} film${watchlistSize > 1 ? 's' : ''} à voir.`),
+        `Votre watchlist doit d'abord atteindre 15 films ` +
+          `(record : ${watchlistPeak}).` :
+        `Il reste ${watchlistSize} film${
+          watchlistSize > 1 ? 's' : ''} à voir.`),
     rule('sorter', totalDecisions, 500),
     rule('signature', topDirector, 8),
     rule('integral', completedCollections > 0 ? 1 : 0, 1,
       bestCollectionRatio > 0 ?
-        `Votre saga la plus avancée est complétée à ${Math.round(bestCollectionRatio * 100)} %.` : null),
+        `Votre saga la plus avancée est complétée à ` +
+          `${Math.round(bestCollectionRatio * 100)} %.` : null),
     rule('night_owl', nightAdds, 15),
   ];
 }
@@ -3297,7 +3426,9 @@ export const evaluateBadges = onRequest(
         const alreadyUnlocked = new Map<string, admin.firestore.Timestamp>();
         for (const doc of badgesSnap.docs) {
           const at = doc.get('unlockedAt');
-          if (at instanceof admin.firestore.Timestamp) alreadyUnlocked.set(doc.id, at);
+          if (at instanceof admin.firestore.Timestamp) {
+            alreadyUnlocked.set(doc.id, at);
+          }
         }
 
         const now = a.firestore.Timestamp.now();
@@ -3308,8 +3439,12 @@ export const evaluateBadges = onRequest(
           const existing = alreadyUnlocked.get(state.id);
           if (existing) {
             // Déjà obtenu : il le reste, quoi qu'il arrive à la galerie.
-            return {...state, unlocked: true, unlockedAt: existing.toDate().toISOString(),
-              current: state.target};
+            return {
+              ...state,
+              unlocked: true,
+              unlockedAt: existing.toDate().toISOString(),
+              current: state.target,
+            };
           }
           if (state.unlocked) {
             batch.set(userRef.collection('badges').doc(state.id), {
