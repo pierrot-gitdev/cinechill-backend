@@ -2,7 +2,117 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // -----------------------------------------------------------------
+    // Compte — galerie, watchlist, préférences, cooldowns de swipe.
+    //
+    // gallery/watchlist/swipeSkips ne sont jamais écrits par le client :
+    // setMediaStatus, recordSwipes et resetSwipeSkips passent par l'Admin
+    // SDK côté Cloud Functions, qui ignore ces règles. Seul le read est
+    // ouvert au propriétaire, pour les listeners temps réel.
+    //
+    // preferences reste la seule écriture directe du client — c'est
+    // l'état existant (LibraryStore.writePreferences), pas une extension.
+    // -----------------------------------------------------------------
+    match /users/{uid} {
+      match /gallery/{entryId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+      match /watchlist/{entryId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+      match /preferences/{document} {
+        allow read, write: if isOwner(uid);
+      }
+      match /swipeSkips/{skipId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+
+      // -----------------------------------------------------------------
+      // Social — le graphe de suivi.
+      //
+      // « following » et « followers » sont deux vues du même lien, sur
+      // deux comptes différents : aucune règle scopée « if own uid » ne
+      // peut les écrire ensemble de façon cohérente. followUser /
+      // unfollowUser (Cloud Functions, Admin SDK) les tiennent en
+      // transaction, compteurs de publicProfiles inclus.
+      //
+      // Lecture ouverte à tout compte connecté : les listes abonnés /
+      // abonnements d'un profil sont publiques, comme le reste du profil.
+      // -----------------------------------------------------------------
+      match /following/{targetUid} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+      match /followers/{sourceUid} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      // -----------------------------------------------------------------
+      // Recommandations reçues — le contenu du centre de notifications.
+      //
+      // Entièrement fermées en écriture côté client : sendSuggestion
+      // vérifie côté serveur que l'expéditeur suit le destinataire, que
+      // le film est dans sa galerie, et que le destinataire ne l'a pas
+      // déjà vu — trois vérifications qu'aucune règle déclarative ne
+      // peut faire de façon fiable. respondToSuggestion écrit ensuite,
+      // toujours côté serveur, le statut ici et l'entrée de watchlist.
+      // -----------------------------------------------------------------
+      match /suggestions/{suggestionId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // Profils publics — ce qu'un abonné (ou la recherche) peut voir.
+    //
+    // Lecture ouverte à tout compte connecté. En écriture, le
+    // propriétaire ne peut toucher que son identité déclarative
+    // (displayName, avatarURL, badge affiché) — jamais les compteurs.
+    // followerCount / followingCount / galleryCount sont maintenus par
+    // les Cloud Functions (followUser/unfollowUser, setMediaStatus) ;
+    // les exclure ici est ce qui les rend dignes de confiance à
+    // l'affichage, sans document séparé à synchroniser.
+    // -----------------------------------------------------------------
+    match /publicProfiles/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly([
+             'handle', 'handleNormalized', 'displayName', 'displayNameNormalized',
+             'avatarURL', 'badgeSignature',
+           ])
+        && request.resource.data.handleNormalized == request.resource.data.handleNormalized.lower();
+      // displayNameNormalized est écrit par le client en même temps que
+      // displayName (voir SocialStore.syncDisplayName) : c'est ce qui
+      // permet à la recherche de trouver un profil par prénom/nom, pas
+      // seulement par pseudo.
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'displayNameNormalized', 'avatarURL', 'badgeSignature']);
+      allow delete: if false;
+    }
+
+    // -----------------------------------------------------------------
+    // Réservation des pseudos — garde-fou d'unicité, jamais lu par le
+    // client (la recherche interroge publicProfiles.handleNormalized,
+    // pas cette collection). Écrite uniquement par claimHandle, dans
+    // une transaction qui vérifie l'absence du document avant de le
+    // créer : c'est ça, et seulement ça, qui garantit l'unicité.
+    // -----------------------------------------------------------------
+    match /usernames/{handle} {
       allow read, write: if false;
     }
   }

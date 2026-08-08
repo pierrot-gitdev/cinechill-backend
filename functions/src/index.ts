@@ -2655,10 +2655,98 @@ export const resetSwipeSkips = onRequest(
 );
 
 /**
+ * Referme le lien de suivi des deux côtés avant la suppression d'un compte.
+ *
+ * `recursiveDelete` n'efface que l'arbre du compte supprimé : les entrées
+ * `following`/`followers` que d'autres comptes pointent vers lui — et leurs
+ * compteurs — resteraient sinon orphelines. Traité par lots de 200 entrées
+ * (deux écritures chacune) pour rester loin de la limite de 500 opérations
+ * d'un batch, même pour un compte à des milliers d'abonnés.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Compte sur le point d'être supprimé.
+ * @return {Promise<void>}
+ */
+async function detachFromFollowGraph(
+    db: admin.firestore.Firestore, uid: string,
+): Promise<void> {
+  const a = getAdmin();
+  const userRef = db.collection('users').doc(uid);
+
+  const [followersSnap, followingSnap] = await Promise.all([
+    userRef.collection('followers').get(),
+    userRef.collection('following').get(),
+  ]);
+
+  const writes: Array<(batch: admin.firestore.WriteBatch) => void> = [];
+
+  for (const doc of followersSnap.docs) {
+    // doc.id est quelqu'un qui suit le compte supprimé : chez lui,
+    // following/{uid} doit disparaître, et son compteur diminuer.
+    const followerUid = doc.id;
+    const linkRef = db.collection('users').doc(followerUid)
+        .collection('following').doc(uid);
+    const profileRef = db.collection('publicProfiles').doc(followerUid);
+    writes.push((batch) => {
+      batch.delete(linkRef);
+      batch.update(profileRef, {
+        followingCount: a.firestore.FieldValue.increment(-1),
+      });
+    });
+  }
+
+  for (const doc of followingSnap.docs) {
+    // doc.id est quelqu'un que le compte supprimé suivait : chez lui,
+    // followers/{uid} doit disparaître, et son compteur diminuer.
+    const targetUid = doc.id;
+    const linkRef = db.collection('users').doc(targetUid)
+        .collection('followers').doc(uid);
+    const profileRef = db.collection('publicProfiles').doc(targetUid);
+    writes.push((batch) => {
+      batch.delete(linkRef);
+      batch.update(profileRef, {
+        followerCount: a.firestore.FieldValue.increment(-1),
+      });
+    });
+  }
+
+  const CHUNK = 200;
+  for (let i = 0; i < writes.length; i += CHUNK) {
+    const batch = db.batch();
+    for (const write of writes.slice(i, i + CHUNK)) write(batch);
+    await batch.commit();
+  }
+}
+
+/**
+ * Libère le pseudo et efface le profil public d'un compte.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Compte sur le point d'être supprimé.
+ * @return {Promise<void>}
+ */
+async function deletePublicIdentity(
+    db: admin.firestore.Firestore, uid: string,
+): Promise<void> {
+  const profileRef = db.collection('publicProfiles').doc(uid);
+  const profileSnap = await profileRef.get();
+  if (!profileSnap.exists) return;
+
+  const batch = db.batch();
+  const handleNormalized = profileSnap.get('handleNormalized') as
+    string | undefined;
+  if (handleNormalized) {
+    batch.delete(db.collection('usernames').doc(handleNormalized));
+  }
+  batch.delete(profileRef);
+  await batch.commit();
+}
+
+/**
  * Efface le compte et tout ce qui s'y rattache.
  *
  * Obligation App Store pour toute app permettant de créer un compte. L'ordre
- * compte : les données d'abord, le compte Auth en dernier — l'inverse
+ * compte : le graphe social d'abord (il a besoin des sous-collections que
+ * `recursiveDelete` s'apprête à effacer), puis l'identité publique, puis les
+ * données propres au compte, le compte Auth en dernier — l'inverse
  * laisserait des documents orphelins qu'aucun jeton ne permettrait plus
  * d'atteindre.
  */
@@ -2676,6 +2764,9 @@ export const deleteAccount = onRequest(
         const a = getAdmin();
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
+
+        await detachFromFollowGraph(db, uid);
+        await deletePublicIdentity(db, uid);
 
         // `recursiveDelete` descend dans toutes les sous-collections, y compris
         // celles ajoutées plus tard : rien à maintenir ici quand le schéma
@@ -3243,6 +3334,773 @@ export const evaluateBadges = onRequest(
         res.status(200).json({badges: payload});
       } catch (error) {
         logger.error('evaluateBadges failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ===========================================================================
+// Le Hall — dimension sociale
+//
+// `claimHandle` est la brique de base : sans pseudo unique, ni la recherche
+// ni le profil public n'ont de quoi exister. `usernames/{handle}` sert
+// uniquement de garde-fou d'unicité — jamais lu par le client, voir
+// firestore.rules — et n'est modifié qu'à l'intérieur de la transaction
+// ci-dessous, seule façon d'empêcher deux comptes de réserver le même
+// pseudo en même temps.
+// ===========================================================================
+
+const HANDLE_MIN_LENGTH = 3;
+const HANDLE_MAX_LENGTH = 20;
+/**
+ * Minuscules, chiffres, point, tiret et tiret bas — rien d'ambigu à l'oral.
+ * Le tiret est en fin de classe : ailleurs, il y désignerait un intervalle.
+ */
+const HANDLE_PATTERN = /^[a-z0-9_.-]+$/;
+
+/**
+ * Normalise un pseudo pour comparaison/stockage : espaces retirés, minuscules.
+ * @param {string} raw Pseudo tel que saisi.
+ * @return {string} Pseudo normalisé.
+ */
+function normalizeHandle(raw: string): string {
+  return raw.trim().toLowerCase();
+}
+
+/**
+ * Normalise un nom pour la recherche par préfixe — mêmes règles que
+ * `SocialStore.normalize` côté client : « Léa » doit trouver « lea ».
+ * @param {string} raw Nom tel qu'affiché.
+ * @return {string} Nom normalisé, sans accents ni casse.
+ */
+function normalizeSearchText(raw: string): string {
+  return raw
+      .trim()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+}
+
+/**
+ * Un pseudo utilisable : longueur et alphabet, une fois normalisé.
+ * @param {string} normalized Pseudo déjà normalisé.
+ * @return {boolean} Vrai si le pseudo respecte le format attendu.
+ */
+function isValidHandle(normalized: string): boolean {
+  return (
+    normalized.length >= HANDLE_MIN_LENGTH &&
+    normalized.length <= HANDLE_MAX_LENGTH &&
+    HANDLE_PATTERN.test(normalized)
+  );
+}
+
+/**
+ * Réserve un pseudo pour l'utilisateur authentifié, et crée ou met à jour
+ * son profil public en conséquence.
+ *
+ * Un changement de pseudo est autorisé une fois : au-delà,
+ * `handle_change_limit`. Resoumettre le pseudo déjà actif est sans effet
+ * (`ok: true`, sans écriture).
+ */
+export const claimHandle = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const rawHandle = req.body?.handle;
+        if (typeof rawHandle !== 'string') {
+          res.status(400).json({error: 'invalid_handle'});
+          return;
+        }
+        const handleNormalized = normalizeHandle(rawHandle);
+        if (!isValidHandle(handleNormalized)) {
+          res.status(400).json({error: 'invalid_handle'});
+          return;
+        }
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const usernameRef = db.collection('usernames').doc(handleNormalized);
+        const profileRef = db.collection('publicProfiles').doc(uid);
+        // Lu une seule fois, hors transaction : une lecture Auth n'a rien à
+        // faire dans un bloc que Firestore peut rejouer plusieurs fois.
+        const authUser = await a.auth().getUser(uid);
+
+        const outcome = await db.runTransaction(async (tx) => {
+          const [usernameSnap, profileSnap] = await Promise.all([
+            tx.get(usernameRef),
+            tx.get(profileRef),
+          ]);
+
+          if (usernameSnap.exists && usernameSnap.get('uid') !== uid) {
+            return {status: 409 as const, error: 'handle_taken' as const};
+          }
+
+          const previousHandleNormalized =
+            profileSnap.get('handleNormalized') as string | undefined;
+          if (previousHandleNormalized === handleNormalized) {
+            // Même pseudo qu'aujourd'hui : idempotent, rien à écrire.
+            return {status: 200 as const};
+          }
+
+          const changeCount =
+            (profileSnap.get('handleChangeCount') as number | undefined) ?? 0;
+          if (profileSnap.exists && changeCount >= 1) {
+            return {
+              status: 409 as const,
+              error: 'handle_change_limit' as const,
+            };
+          }
+
+          const now = a.firestore.Timestamp.now();
+
+          if (profileSnap.exists && previousHandleNormalized) {
+            tx.delete(db.collection('usernames').doc(previousHandleNormalized));
+          }
+          tx.set(usernameRef, {uid, createdAt: now});
+
+          if (profileSnap.exists) {
+            tx.update(profileRef, {
+              handle: rawHandle.trim(),
+              handleNormalized,
+              handleChangeCount: a.firestore.FieldValue.increment(1),
+              updatedAt: now,
+            });
+          } else {
+            const displayName = authUser.displayName ?? handleNormalized;
+            tx.set(profileRef, {
+              handle: rawHandle.trim(),
+              handleNormalized,
+              displayName,
+              // Sans ce champ, la recherche ne trouverait un profil que par
+              // pseudo — jamais par prénom ou nom.
+              displayNameNormalized: normalizeSearchText(displayName),
+              avatarURL: null,
+              badgeSignature: null,
+              followerCount: 0,
+              followingCount: 0,
+              galleryCount: 0,
+              handleChangeCount: 0,
+              createdAt: now,
+              updatedAt: now,
+            });
+          }
+
+          return {status: 200 as const};
+        });
+
+        if (outcome.status !== 200) {
+          res.status(outcome.status).json({error: outcome.error});
+          return;
+        }
+        res.status(200).json({ok: true, handle: rawHandle.trim()});
+      } catch (error) {
+        logger.error('claimHandle failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Le graphe de suivi.
+//
+// `following` et `followers` sont deux vues du même lien, sur deux comptes
+// différents : le client ne peut jamais écrire les deux à la fois, et
+// firestore.rules le lui interdit. `applyFollowChange` les tient en
+// transaction, compteurs de `publicProfiles` inclus — sans elle, un compteur
+// pourrait dériver de la liste réelle au moindre écrit partiel.
+// ---------------------------------------------------------------------------
+
+/** Résultat d'un changement de suivi, prêt à devenir une réponse HTTP. */
+interface FollowChangeOutcome {
+  status: number;
+  error?: string;
+}
+
+/**
+ * Applique ou retire le lien de suivi entre deux comptes, compteurs compris.
+ * Idempotente : suivre deux fois, ou se désabonner sans être abonné, réussit
+ * sans rien réécrire.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} followerUid Celui qui suit.
+ * @param {string} targetUid Celui qui est suivi.
+ * @param {boolean} follow Vrai pour suivre, faux pour se désabonner.
+ * @return {Promise<FollowChangeOutcome>} Résultat à renvoyer au client.
+ */
+async function applyFollowChange(
+    db: admin.firestore.Firestore,
+    followerUid: string,
+    targetUid: string,
+    follow: boolean,
+): Promise<FollowChangeOutcome> {
+  const a = getAdmin();
+  const followingRef = db.collection('users').doc(followerUid)
+      .collection('following').doc(targetUid);
+  const followerRef = db.collection('users').doc(targetUid)
+      .collection('followers').doc(followerUid);
+  const ownProfileRef = db.collection('publicProfiles').doc(followerUid);
+  const targetProfileRef = db.collection('publicProfiles').doc(targetUid);
+
+  return db.runTransaction(async (tx) => {
+    const [linkSnap, ownProfileSnap, targetProfileSnap] = await Promise.all([
+      tx.get(followingRef),
+      tx.get(ownProfileRef),
+      tx.get(targetProfileRef),
+    ]);
+
+    if (!ownProfileSnap.exists) {
+      return {status: 404, error: 'own_profile_missing'};
+    }
+    if (follow && !targetProfileSnap.exists) {
+      return {status: 404, error: 'target_not_found'};
+    }
+    if (linkSnap.exists === follow) {
+      // Déjà dans l'état demandé : idempotent, rien à écrire.
+      return {status: 200};
+    }
+
+    const now = a.firestore.Timestamp.now();
+    const delta = follow ? 1 : -1;
+
+    if (follow) {
+      tx.set(followingRef, {since: now});
+      tx.set(followerRef, {since: now});
+    } else {
+      tx.delete(followingRef);
+      tx.delete(followerRef);
+    }
+    tx.update(ownProfileRef, {
+      followingCount: a.firestore.FieldValue.increment(delta),
+    });
+    if (targetProfileSnap.exists) {
+      tx.update(targetProfileRef, {
+        followerCount: a.firestore.FieldValue.increment(delta),
+      });
+    }
+
+    return {status: 200};
+  });
+}
+
+/**
+ * Lit et valide le `targetUid` d'une requête de suivi.
+ * @param {Request} req Requête entrante.
+ * @param {Response} res Réponse, pour l'erreur en cas de payload invalide.
+ * @param {string} followerUid Compte à l'origine de la requête.
+ * @return {string | null} L'identifiant cible, ou `null` si déjà répondu.
+ */
+function readTargetUid(
+    req: Request, res: Response, followerUid: string,
+): string | null {
+  const targetUid = req.body?.targetUid;
+  if (typeof targetUid !== 'string' || !targetUid) {
+    res.status(400).json({error: 'invalid_target'});
+    return null;
+  }
+  if (targetUid === followerUid) {
+    res.status(400).json({error: 'cannot_follow_self'});
+    return null;
+  }
+  return targetUid;
+}
+
+/** Suit le profil `targetUid` depuis le compte authentifié. */
+export const followUser = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = readTargetUid(req, res, uid);
+        if (!targetUid) return;
+
+        const db = getAdmin().firestore();
+        const outcome = await applyFollowChange(db, uid, targetUid, true);
+        res.status(outcome.status).json(
+            outcome.status === 200 ? {ok: true} : {error: outcome.error},
+        );
+      } catch (error) {
+        logger.error('followUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Se désabonne du profil `targetUid` depuis le compte authentifié. */
+export const unfollowUser = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = readTargetUid(req, res, uid);
+        if (!targetUid) return;
+
+        const db = getAdmin().firestore();
+        const outcome = await applyFollowChange(db, uid, targetUid, false);
+        res.status(outcome.status).json(
+            outcome.status === 200 ? {ok: true} : {error: outcome.error},
+        );
+      } catch (error) {
+        logger.error('unfollowUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Recommander un film — sendSuggestion / respondToSuggestion.
+//
+// Les trois vérifications d'envoi (lien de suivi, film vu par l'expéditeur,
+// pas encore vu par le destinataire) croisent des documents dans deux arbres
+// différents : aucune règle Firestore déclarative ne peut les exprimer. La
+// suggestion est stockée sous un identifiant déterministe
+// `{fromUid}_{itemId}`, ce qui rend « déjà recommandé, en attente » gratuit
+// à vérifier — c'est la même existence de document que la transaction
+// regarde de toute façon.
+// ---------------------------------------------------------------------------
+
+/** Le film stocké sur une suggestion, réinjecté ensuite dans la watchlist. */
+interface SuggestionItem {
+  id: string;
+  tmdbId: number;
+  mediaType: string;
+  title: string;
+  posterPath: string | null;
+  overview: string | null;
+  voteAverage: number | null;
+  genreIds: number[];
+  releaseDate: string | null;
+}
+
+/**
+ * Lit et valide l'item film d'une requête, avec la même règle que
+ * `setMediaStatus` — c'est le format que le client envoie déjà partout.
+ * @param {Request} req Requête entrante.
+ * @param {Response} res Réponse, pour l'erreur en cas de payload invalide.
+ * @return {MediaItemPayload | null} L'item, ou `null` si déjà répondu.
+ */
+function readMediaItem(req: Request, res: Response): MediaItemPayload | null {
+  const item = req.body?.item as MediaItemPayload | undefined;
+  if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
+    res.status(400).json({error: 'invalid_item'});
+    return null;
+  }
+  return item;
+}
+
+/**
+ * Recommande un film déjà vu par l'expéditeur à quelqu'un qu'il suit, qui ne
+ * l'a pas encore vu.
+ */
+export const sendSuggestion = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const fromUid = await verifyAuth(req, res);
+        if (!fromUid) return;
+
+        const targetUid = readTargetUid(req, res, fromUid);
+        if (!targetUid) return;
+
+        const item = readMediaItem(req, res);
+        if (!item) return;
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const followingRef = db.collection('users').doc(fromUid)
+            .collection('following').doc(targetUid);
+        const senderGalleryRef = db.collection('users').doc(fromUid)
+            .collection('gallery').doc(item.id);
+        const targetGalleryRef = db.collection('users').doc(targetUid)
+            .collection('gallery').doc(item.id);
+        const senderProfileRef = db.collection('publicProfiles').doc(fromUid);
+        const suggestionRef = db.collection('users').doc(targetUid)
+            .collection('suggestions').doc(`${fromUid}_${item.id}`);
+
+        const outcome = await db.runTransaction(async (tx) => {
+          const [
+            followingSnap, senderGallerySnap, targetGallerySnap,
+            senderProfileSnap, existingSnap,
+          ] = await Promise.all([
+            tx.get(followingRef),
+            tx.get(senderGalleryRef),
+            tx.get(targetGalleryRef),
+            tx.get(senderProfileRef),
+            tx.get(suggestionRef),
+          ]);
+
+          if (!senderProfileSnap.exists) {
+            return {
+              status: 404 as const,
+              error: 'own_profile_missing' as const,
+            };
+          }
+          if (!followingSnap.exists) {
+            return {status: 403 as const, error: 'not_following' as const};
+          }
+          if (!senderGallerySnap.exists) {
+            return {status: 400 as const, error: 'not_in_gallery' as const};
+          }
+          if (targetGallerySnap.exists) {
+            return {
+              status: 409 as const,
+              error: 'target_already_seen' as const,
+            };
+          }
+          if (existingSnap.exists) {
+            return {status: 409 as const, error: 'already_suggested' as const};
+          }
+
+          tx.set(suggestionRef, {
+            fromUid,
+            fromHandle: senderProfileSnap.get('handle') ?? null,
+            fromDisplayName: senderProfileSnap.get('displayName') ?? null,
+            fromAvatarURL: senderProfileSnap.get('avatarURL') ?? null,
+            item: {
+              id: item.id,
+              tmdbId: item.tmdbId,
+              mediaType: item.mediaType,
+              title: item.title,
+              posterPath: item.posterPath ?? null,
+              overview: item.overview ?? null,
+              voteAverage: item.voteAverage ?? null,
+              genreIds: item.genreIds ?? [],
+              releaseDate: item.releaseDate ?? null,
+            },
+            createdAt: a.firestore.Timestamp.now(),
+          });
+
+          return {status: 200 as const};
+        });
+
+        res.status(outcome.status).json(
+            outcome.status === 200 ? {ok: true} : {error: outcome.error},
+        );
+      } catch (error) {
+        logger.error('sendSuggestion failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Accepte ou refuse une recommandation reçue.
+ *
+ * Refuser supprime la suggestion, sans plus de trace. Accepter l'ajoute à la
+ * watchlist — ou, si le film y est déjà, ajoute simplement ce recommandeur à
+ * `recommendedBy` plutôt que de dupliquer l'entrée : l'identifiant du
+ * document watchlist est déjà celui du film, pas d'un événement.
+ *
+ * Le cas « vu entretemps » (course entre l'envoi et la réponse) se résout
+ * sans erreur : la suggestion disparaît, rien n'est ajouté, et
+ * `alreadySeen: true` le dit au client.
+ */
+export const respondToSuggestion = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const suggestionId = req.body?.suggestionId;
+        const accept = req.body?.accept;
+        if (typeof suggestionId !== 'string' || !suggestionId) {
+          res.status(400).json({error: 'invalid_suggestion'});
+          return;
+        }
+        if (typeof accept !== 'boolean') {
+          res.status(400).json({error: 'invalid_accept'});
+          return;
+        }
+
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+        const suggestionRef =
+          userRef.collection('suggestions').doc(suggestionId);
+
+        const outcome = await db.runTransaction(async (tx) => {
+          const suggestionSnap = await tx.get(suggestionRef);
+          if (!suggestionSnap.exists) {
+            return {
+              status: 404 as const,
+              error: 'suggestion_not_found' as const,
+            };
+          }
+
+          if (!accept) {
+            tx.delete(suggestionRef);
+            return {status: 200 as const, alreadySeen: false};
+          }
+
+          const item = suggestionSnap.get('item') as SuggestionItem;
+          const galleryRef = userRef.collection('gallery').doc(item.id);
+          const watchlistRef = userRef.collection('watchlist').doc(item.id);
+          const [gallerySnap, watchlistSnap] = await Promise.all([
+            tx.get(galleryRef),
+            tx.get(watchlistRef),
+          ]);
+
+          if (gallerySnap.exists) {
+            // Vu entretemps, par un autre chemin : la recommandation n'a
+            // simplement plus d'objet.
+            tx.delete(suggestionRef);
+            return {status: 200 as const, alreadySeen: true};
+          }
+
+          const now = a.firestore.Timestamp.now();
+          const recommender = {
+            uid: suggestionSnap.get('fromUid') ?? null,
+            displayName: suggestionSnap.get('fromDisplayName') ?? null,
+            avatarURL: suggestionSnap.get('fromAvatarURL') ?? null,
+            at: now,
+          };
+
+          if (watchlistSnap.exists) {
+            tx.update(watchlistRef, {
+              recommendedBy: a.firestore.FieldValue.arrayUnion(recommender),
+            });
+          } else {
+            tx.set(watchlistRef, {
+              id: item.id,
+              tmdbId: item.tmdbId,
+              mediaType: item.mediaType,
+              title: item.title,
+              posterPath: item.posterPath,
+              overview: item.overview,
+              voteAverage: item.voteAverage,
+              genreIds: item.genreIds ?? [],
+              releaseDate: item.releaseDate,
+              addedAt: now,
+              recommendedBy: [recommender],
+            });
+          }
+
+          tx.delete(suggestionRef);
+          return {status: 200 as const, alreadySeen: false};
+        });
+
+        if (outcome.status !== 200) {
+          res.status(outcome.status).json({error: outcome.error});
+          return;
+        }
+        res.status(200).json({ok: true, alreadySeen: outcome.alreadySeen});
+      } catch (error) {
+        logger.error('respondToSuggestion failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Les abonnements du compte, chacun avec son état vis-à-vis d'un film donné.
+ *
+ * C'est cette fonction qui permet au sélecteur d'ami de n'offrir que ce qui
+ * est possible : sans elle, le client devrait lire la galerie d'autrui pour
+ * savoir qui a déjà vu le film — ce que les règles Firestore interdisent, et
+ * à raison. Le serveur croise ici trois arbres et ne renvoie qu'un booléen
+ * par personne, jamais le contenu d'une galerie.
+ */
+export const getSuggestionTargets = onRequest(
+    {invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const itemId = req.body?.itemId;
+        if (typeof itemId !== 'string' || !itemId) {
+          res.status(400).json({error: 'invalid_item'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const followingSnap = await db.collection('users').doc(uid)
+            .collection('following').get();
+        const targetUids = followingSnap.docs.map((doc) => doc.id);
+        if (targetUids.length === 0) {
+          res.status(200).json({targets: []});
+          return;
+        }
+
+        // Trois lectures par abonnement, toutes ponctuelles et parallèles :
+        // le profil public (affichage), sa galerie pour ce film (déjà vu ?)
+        // et la suggestion éventuellement déjà en attente. Aucune requête
+        // ne dépend du résultat d'une autre.
+        const targets = await Promise.all(targetUids.map(async (targetUid) => {
+          const [profileSnap, gallerySnap, suggestionSnap] = await Promise.all([
+            db.collection('publicProfiles').doc(targetUid).get(),
+            db.collection('users').doc(targetUid)
+                .collection('gallery').doc(itemId).get(),
+            db.collection('users').doc(targetUid)
+                .collection('suggestions').doc(`${uid}_${itemId}`).get(),
+          ]);
+
+          if (!profileSnap.exists) return null;
+
+          const suggestedAt = suggestionSnap.get('createdAt');
+          return {
+            uid: targetUid,
+            handle: profileSnap.get('handle') ?? null,
+            displayName: profileSnap.get('displayName') ?? null,
+            avatarURL: profileSnap.get('avatarURL') ?? null,
+            alreadySeen: gallerySnap.exists,
+            alreadySuggested: suggestionSnap.exists,
+            suggestedAt: suggestedAt instanceof admin.firestore.Timestamp ?
+              suggestedAt.toDate().toISOString() : null,
+          };
+        }));
+
+        type Target = NonNullable<(typeof targets)[number]>;
+        const clean = targets.filter((t): t is Target => t !== null);
+        // Ceux à qui on peut réellement envoyer remontent en tête : la liste
+        // se lit alors de haut en bas sans avoir à sauter les lignes mortes.
+        clean.sort((a, b) => {
+          const blockedA = a.alreadySeen || a.alreadySuggested ? 1 : 0;
+          const blockedB = b.alreadySeen || b.alreadySuggested ? 1 : 0;
+          if (blockedA !== blockedB) return blockedA - blockedB;
+          return (a.displayName ?? '').localeCompare(b.displayName ?? '');
+        });
+
+        res.status(200).json({targets: clean});
+      } catch (error) {
+        logger.error('getSuggestionTargets failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Affiches renvoyées avec un profil public — un aperçu, pas la galerie. */
+const PUBLIC_PROFILE_POSTERS = 12;
+/** Genres détaillés sur l'ADN cinéphile ; le reste tombe dans « Autres ». */
+const PUBLIC_PROFILE_GENRES = 5;
+
+/**
+ * Le profil public d'un utilisateur, enrichi de quoi décider de le suivre.
+ *
+ * La galerie d'autrui n'est jamais exposée telle quelle — les règles
+ * Firestore l'interdisent au client, et c'est volontaire. Le serveur en
+ * dérive ici deux agrégats : la répartition par genre (l'information qui
+ * décide réellement d'un abonnement) et une poignée d'affiches récentes.
+ * La watchlist, elle, ne sort pas : une intention de voir est une note à
+ * soi-même, pas une déclaration publique.
+ */
+export const getPublicProfile = onRequest(
+    {invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = req.body?.targetUid;
+        if (typeof targetUid !== 'string' || !targetUid) {
+          res.status(400).json({error: 'invalid_target'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const [profileSnap, gallerySnap] = await Promise.all([
+          db.collection('publicProfiles').doc(targetUid).get(),
+          db.collection('users').doc(targetUid).collection('gallery').get(),
+        ]);
+
+        if (!profileSnap.exists) {
+          res.status(404).json({error: 'target_not_found'});
+          return;
+        }
+
+        const docs = gallerySnap.docs;
+
+        // Répartition par genre, sur le premier genre de chaque film — le
+        // même choix que la galerie côté client, pour que les deux écrans
+        // racontent la même chose.
+        const counts = new Map<number, number>();
+        for (const doc of docs) {
+          const ids = doc.get('genreIds');
+          if (!Array.isArray(ids) || ids.length === 0) continue;
+          const primary = ids[0];
+          if (typeof primary !== 'number') continue;
+          counts.set(primary, (counts.get(primary) ?? 0) + 1);
+        }
+        const total = [...counts.values()].reduce((a, b) => a + b, 0);
+        const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        const top = ranked.slice(0, PUBLIC_PROFILE_GENRES);
+        const genres = top.map(([id, n]) => ({
+          id,
+          name: GENRE_LABELS_FR[id] ?? `Genre ${id}`,
+          share: total > 0 ? n / total : 0,
+        }));
+        const remainder = ranked.slice(PUBLIC_PROFILE_GENRES)
+            .reduce((sum, [, n]) => sum + n, 0);
+        if (remainder > 0 && total > 0) {
+          genres.push({id: -1, name: 'Autres', share: remainder / total});
+        }
+
+        // Les plus récemment ajoutés, affiche obligatoire.
+        const posters = docs
+            .map((doc) => ({
+              posterPath: doc.get('posterPath') as string | null,
+              title: doc.get('title') as string | null,
+              addedAt: doc.get('addedAt'),
+            }))
+            .filter((row) => !!row.posterPath)
+            .sort((a, b) => {
+              const ta = a.addedAt instanceof admin.firestore.Timestamp ?
+                a.addedAt.toMillis() : 0;
+              const tb = b.addedAt instanceof admin.firestore.Timestamp ?
+                b.addedAt.toMillis() : 0;
+              return tb - ta;
+            })
+            .slice(0, PUBLIC_PROFILE_POSTERS)
+            .map((row) => ({posterPath: row.posterPath, title: row.title}));
+
+        res.status(200).json({
+          uid: targetUid,
+          handle: profileSnap.get('handle') ?? null,
+          displayName: profileSnap.get('displayName') ?? null,
+          avatarURL: profileSnap.get('avatarURL') ?? null,
+          badgeSignature: profileSnap.get('badgeSignature') ?? null,
+          followerCount: profileSnap.get('followerCount') ?? 0,
+          followingCount: profileSnap.get('followingCount') ?? 0,
+          galleryCount: docs.length,
+          genres,
+          posters,
+        });
+      } catch (error) {
+        logger.error('getPublicProfile failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },

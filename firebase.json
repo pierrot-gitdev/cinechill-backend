@@ -1,7 +1,7 @@
 {
   "firestore": {
-    "database": "cinechill-db",
-    "location": "eur3",
+    "database": "(default)",
+    "location": "europe-west1",
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
   },
