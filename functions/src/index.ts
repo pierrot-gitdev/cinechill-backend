@@ -81,23 +81,89 @@ function parseProviderIDs(value: unknown): number[] {
 }
 
 /**
+ * Ce qu'il faut connaître pour interroger TMDB : de quoi s'authentifier, et
+ * dans quelle langue répondre.
+ *
+ * Les deux voyagent ensemble parce qu'ils ont la même portée — celle d'une
+ * requête entrante — et parce que les laisser séparés a une conséquence
+ * concrète : on oublie la langue. Elle était jusqu'ici écrite en dur à
+ * vingt-cinq endroits, et il suffisait d'en manquer un pour renvoyer un
+ * synopsis français à une application en anglais.
+ */
+interface TMDBContext {
+  token: string;
+  language: string;
+}
+
+/** Les langues traduites. Toute autre demande retombe sur le français. */
+const SUPPORTED_LANGUAGES = ['fr-FR', 'en-US'] as const;
+
+/**
+ * Lit la langue demandée dans l'en-tête `Accept-Language`, et déclare que la
+ * réponse en dépend.
+ *
+ * On ne fait pas de négociation de contenu complète : le client est notre
+ * application, elle envoie une étiquette qu'elle a choisie dans ses réglages.
+ * On se contente donc de reconnaître la famille de langue et de retomber sur
+ * le français pour tout le reste — mieux vaut une langue par défaut qu'une
+ * réponse vide de TMDB pour un code exotique.
+ *
+ * Le `Vary` est posé ici plutôt que dans chaque point d'entrée, pour la même
+ * raison que la langue est posée dans `tmdbGET` : lire l'en-tête et oublier de
+ * déclarer qu'on en dépend est précisément l'erreur qu'on ne veut pas pouvoir
+ * commettre. Rien ne met ces réponses en cache aujourd'hui — c'est le jour où
+ * elles passeront derrière un CDN que l'oubli coûterait cher, en servant à
+ * tout le monde la langue du premier arrivé.
+ * @param {Request} req Requête entrante.
+ * @param {Response} res Réponse en cours, pour y déclarer la variation.
+ * @return {string} Étiquette de langue supportée par TMDB.
+ */
+function requestedLanguage(req: Request, res: Response): string {
+  // `vary` plutôt que `set` : il complète l'en-tête au lieu de l'écraser.
+  res.vary('Accept-Language');
+  const header = String(req.get('accept-language') ?? '').toLowerCase();
+  const exact = SUPPORTED_LANGUAGES.find((tag) =>
+    header.startsWith(tag.toLowerCase()));
+  if (exact) return exact;
+  if (header.startsWith('en')) return 'en-US';
+  return DEFAULT_LANGUAGE;
+}
+
+/**
+ * Assemble le contexte TMDB d'une requête entrante.
+ * @param {Request} req Requête entrante.
+ * @param {Response} res Réponse en cours.
+ * @return {TMDBContext} Contexte prêt pour `tmdbGET`.
+ */
+function tmdb(req: Request, res: Response): TMDBContext {
+  return {
+    token: tmdbApiKey.value(),
+    language: requestedLanguage(req, res),
+  };
+}
+
+/**
  * Call TMDB API using bearer auth.
+ *
+ * La langue est posée ici, une fois pour toutes : aucun appelant n'a plus à y
+ * penser, et aucun ne peut l'oublier. Un appelant qui aurait une raison de la
+ * forcer peut toujours la mettre dans `query`, qui a le dernier mot.
  * @param {string} path TMDB endpoint path.
  * @param {Record<string, string>} query Query parameters.
- * @param {string} token TMDB bearer token.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Record<string, unknown>>} Decoded JSON payload.
  */
 async function tmdbGET(
     path: string,
     query: Record<string, string>,
-    token: string,
+    ctx: TMDBContext,
 ): Promise<Record<string, unknown>> {
-  const params = new URLSearchParams(query);
+  const params = new URLSearchParams({language: ctx.language, ...query});
   const url = `${TMDB_BASE}${path}?${params.toString()}`;
 
   const tmdbRes = await fetch(url, {
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${ctx.token}`,
       Accept: 'application/json',
     },
   });
@@ -153,7 +219,6 @@ export const getPopularMovies = onRequest(
         const path = useDiscover ? '/discover/movie' : '/movie/popular';
 
         const query: Record<string, string> = {
-          language: DEFAULT_LANGUAGE,
           page: String(page),
         };
 
@@ -175,7 +240,7 @@ export const getPopularMovies = onRequest(
           }
         }
 
-        const data = await tmdbGET(path, query, tmdbApiKey.value());
+        const data = await tmdbGET(path, query, tmdb(req, res));
 
         res.status(200).json({
           page: data.page ?? page,
@@ -208,9 +273,13 @@ export const getMovieDetails = onRequest(
         }
 
         const id = Math.floor(idRaw);
+        // Seul appel qui n'emprunte pas `tmdbGET` : la lecture qui suit est
+        // écrite contre le JSON brut. La langue, elle, ne peut plus être
+        // gravée dans l'URL — c'est la requête entrante qui la porte.
         const url =
           `https://api.themoviedb.org/3/movie/${id}` +
-          '?language=fr-FR&append_to_response=credits,videos,watch%2Fproviders';
+          `?language=${encodeURIComponent(requestedLanguage(req, res))}` +
+          '&append_to_response=credits,videos,watch%2Fproviders';
 
         const tmdbRes = await fetch(url, {
           headers: {
@@ -267,7 +336,7 @@ export const getMovieDetails = onRequest(
           collectionID = collection.id;
           try {
             const parts = await tmdbGET(`/collection/${collection.id}`,
-                {language: DEFAULT_LANGUAGE}, tmdbApiKey.value());
+                {}, tmdb(req, res));
             if (Array.isArray(parts.parts)) {
               collectionCount = parts.parts.length;
             }
@@ -327,8 +396,7 @@ export const getMovieGenres = onRequest(
         }
 
         const data = await tmdbGET('/genre/movie/list', {
-          language: DEFAULT_LANGUAGE,
-        }, tmdbApiKey.value());
+        }, tmdb(req, res));
 
         const genres = Array.isArray(data.genres) ? data.genres : [];
         res.status(200).json({genres});
@@ -353,9 +421,8 @@ export const getMovieProviders = onRequest(
 
         const watchRegion = String(req.query.watchRegion ?? DEFAULT_REGION);
         const data = await tmdbGET('/watch/providers/movie', {
-          language: DEFAULT_LANGUAGE,
           watch_region: watchRegion,
-        }, tmdbApiKey.value());
+        }, tmdb(req, res));
 
         const providers = Array.isArray(data.results) ? data.results : [];
         res.status(200).json({results: providers});
@@ -503,26 +570,76 @@ const MOOD_GENRES: Record<string, number[]> = {
   thoughtful: [9648, 878, 18],
 };
 
-const GENRE_LABELS_FR: Record<number, string> = {
-  28: 'Action',
-  12: 'Aventure',
-  16: 'Animation',
-  35: 'Comédie',
-  80: 'Policier',
-  99: 'Documentaire',
-  18: 'Drame',
-  10751: 'Famille',
-  14: 'Fantastique',
-  36: 'Histoire',
-  27: 'Horreur',
-  10402: 'Musique',
-  9648: 'Mystère',
-  10749: 'Romance',
-  878: 'Science-fiction',
-  10770: 'Téléfilm',
-  53: 'Thriller',
-  10752: 'Guerre',
-  37: 'Western',
+/**
+ * Les noms de genres affichés dans les « raisons » d'une recommandation.
+ *
+ * Ils ne viennent pas de TMDB — ils sont écrits ici parce que la raison se
+ * compose côté serveur, sans second appel réseau. Ils suivent donc la langue
+ * de la requête comme le reste, table par table.
+ */
+const GENRE_LABELS: Record<string, Record<number, string>> = {
+  'en-US': {
+    28: 'Action',
+    12: 'Adventure',
+    16: 'Animation',
+    35: 'Comedy',
+    80: 'Crime',
+    99: 'Documentary',
+    18: 'Drama',
+    10751: 'Family',
+    14: 'Fantasy',
+    36: 'History',
+    27: 'Horror',
+    10402: 'Music',
+    9648: 'Mystery',
+    10749: 'Romance',
+    878: 'Science fiction',
+    10770: 'TV movie',
+    53: 'Thriller',
+    10752: 'War',
+    37: 'Western',
+  },
+  'fr-FR': {
+    28: 'Action',
+    12: 'Aventure',
+    16: 'Animation',
+    35: 'Comédie',
+    80: 'Policier',
+    99: 'Documentaire',
+    18: 'Drame',
+    10751: 'Famille',
+    14: 'Fantastique',
+    36: 'Histoire',
+    27: 'Horreur',
+    10402: 'Musique',
+    9648: 'Mystère',
+    10749: 'Romance',
+    878: 'Science-fiction',
+    10770: 'Téléfilm',
+    53: 'Thriller',
+    10752: 'Guerre',
+    37: 'Western',
+  },
+};
+
+/** Les autres tags de « raison », qui ne dépendent d'aucun genre. */
+const REASON_LABELS: Record<string, Record<string, string>> = {
+  'en-US': {
+    short: 'Under 1h35',
+    long: '2h +',
+    wellRated: 'Well rated',
+    onYourPlatform: 'On your platform',
+    fallback: 'CinéMatch pick',
+    otherGenres: 'Other',
+  },
+  'fr-FR': {
+    short: '< 1h35',
+    long: '2h +',
+    wellRated: 'Bien noté',
+    onYourPlatform: 'Disponible sur votre plateforme',
+    fallback: 'Sélection CinéMatch',
+    otherGenres: 'Autres',
+  },
 };
 
 const GENRE_HORROR = 27;
@@ -804,7 +921,6 @@ function baseDiscoverParams(
     relax: {dealbreaker: boolean; platforms: boolean},
 ): Record<string, string> {
   const query: Record<string, string> = {
-    'language': DEFAULT_LANGUAGE,
     'include_adult': 'false',
     'include_video': 'false',
     'vote_count.gte': '20',
@@ -866,13 +982,13 @@ function baseDiscoverParams(
  * @param {Object} relax Which hard filters to relax.
  * @param {boolean} relax.dealbreaker See baseDiscoverParams.
  * @param {boolean} relax.platforms See baseDiscoverParams.
- * @param {string} token TMDB bearer token.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Deduplicated candidate rows.
  */
 async function fetchCandidatePool(
     answers: QuestionnaireAnswersPayload,
     relax: {dealbreaker: boolean; platforms: boolean},
-    token: string,
+    ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   const base = baseDiscoverParams(answers, relax);
   const sorts = [
@@ -891,7 +1007,7 @@ async function fetchCandidatePool(
       if (sortBy === 'vote_average.desc' && !query['vote_count.gte']) {
         query['vote_count.gte'] = '100';
       }
-      requests.push(tmdbGET('/discover/movie', query, token));
+      requests.push(tmdbGET('/discover/movie', query, ctx));
     }
   }
 
@@ -912,7 +1028,7 @@ async function fetchCandidatePool(
       'vote_count.gte': '100',
       'vote_count.lte': '2000',
       'page': String(page),
-    }, token));
+    }, ctx));
   }
 
   const responses = await Promise.allSettled(requests);
@@ -2014,34 +2130,39 @@ function readSessionOutcomes(
  * de faits vérifiables sur le film plutôt que d'expliquer la formule.
  * @param {EnrichedCandidate} c Candidat enrichi.
  * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @param {string} language Langue de la requête en cours.
  * @return {string[]} Jusqu'à 4 tags courts.
  */
 function buildReasons(
-    c: EnrichedCandidate, answers: QuestionnaireAnswersPayload,
+    c: EnrichedCandidate,
+    answers: QuestionnaireAnswersPayload,
+    language: string,
 ): string[] {
+  const genres = GENRE_LABELS[language] ?? GENRE_LABELS[DEFAULT_LANGUAGE];
+  const labels = REASON_LABELS[language] ?? REASON_LABELS[DEFAULT_LANGUAGE];
   const reasons: string[] = [];
   const genreIds = c.genre_ids ?? [];
   const chosenGenreIds = genreIdsFor(answers.genres);
 
   for (const id of genreIds) {
-    if (chosenGenreIds.includes(id) && GENRE_LABELS_FR[id]) {
-      reasons.push(GENRE_LABELS_FR[id]);
+    if (chosenGenreIds.includes(id) && genres[id]) {
+      reasons.push(genres[id]);
     }
     if (reasons.length >= 2) break;
   }
 
   if (c.runtimeMinutes !== null) {
-    if (c.runtimeMinutes <= 95) reasons.push('< 1h35');
-    else if (c.runtimeMinutes >= 125) reasons.push('2h +');
+    if (c.runtimeMinutes <= 95) reasons.push(labels.short);
+    else if (c.runtimeMinutes >= 125) reasons.push(labels.long);
   }
 
-  if ((c.vote_average ?? 0) >= 7.5) reasons.push('Bien noté');
+  if ((c.vote_average ?? 0) >= 7.5) reasons.push(labels.wellRated);
 
   const matchedProvider = answers.platformIds.find((id) =>
     c.providerIds.includes(Number(id)));
-  if (matchedProvider) reasons.push('Disponible sur votre plateforme');
+  if (matchedProvider) reasons.push(labels.onYourPlatform);
 
-  if (reasons.length === 0) reasons.push('Sélection CinéMatch');
+  if (reasons.length === 0) reasons.push(labels.fallback);
   return reasons.slice(0, 4);
 }
 
@@ -2050,18 +2171,17 @@ function buildReasons(
  * candidat de la shortlist — une seule requête par film grâce à
  * append_to_response.
  * @param {DiscoverRow} row Ligne issue du pool /discover.
- * @param {string} token TMDB bearer token.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<EnrichedCandidate | null>} Candidat enrichi, ou null en
  *   cas d'échec (le film est alors simplement ignoré).
  */
 async function enrichCandidate(
-    row: DiscoverRow, token: string,
+    row: DiscoverRow, ctx: TMDBContext,
 ): Promise<EnrichedCandidate | null> {
   try {
     const detail = await tmdbGET(`/movie/${row.id}`, {
-      language: DEFAULT_LANGUAGE,
       append_to_response: 'credits,videos,watch/providers,keywords',
-    }, token);
+    }, ctx);
 
     const creditsCast = (detail.credits as {cast?: unknown} | undefined)?.cast;
     const cast: {popularity?: number}[] = Array.isArray(creditsCast) ?
@@ -2483,7 +2603,7 @@ export const getCandidatePool = onRequest(
           fetchCandidatePool(
               answers,
               {dealbreaker: true, platforms: false},
-              tmdbApiKey.value(),
+              tmdb(req, res),
           ),
         ]);
 
@@ -2505,7 +2625,7 @@ export const getCandidatePool = onRequest(
 
         if (pool.length < POOL_HARD_FLOOR && answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
-              answers, {dealbreaker: true, platforms: true}, tmdbApiKey.value(),
+              answers, {dealbreaker: true, platforms: true}, tmdb(req, res),
           );
           pool = filterByContentFormat(relaxed.filter(keep), answers);
           notice = 'Résultats élargis hors de vos plateformes habituelles.';
@@ -2604,7 +2724,7 @@ export const enrichCandidates = onRequest(
         }
 
         const enrichedResults = await Promise.allSettled(
-            rows.map((row) => enrichCandidate(row, tmdbApiKey.value())),
+            rows.map((row) => enrichCandidate(row, tmdb(req, res))),
         );
         const enriched = enrichedResults
             .filter((r) => r.status === 'fulfilled')
@@ -2753,7 +2873,10 @@ export const finalizeRecommendations = onRequest(
         // sélectionnés.
         const selected = selectWithExplorationAndDiversity(shortlist)
             .sort((a, b) => b.finalScore - a.finalScore)
-            .map((c) => ({...c, reasons: buildReasons(c, answers)}));
+            .map((c) => ({
+              ...c,
+              reasons: buildReasons(c, answers, requestedLanguage(req, res)),
+            }));
 
         const a = getAdmin();
         await a.firestore().collection('users').doc(uid)
@@ -3201,11 +3324,11 @@ function rowsFrom(
  * gens qui ont aimé ça ont aussi vu ça », `/similar` est plus littéral et
  * ramène beaucoup d'épisodes de la même saga : les deux se complètent.
  * @param {TasteProfile} profile Profil de goût.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Candidats du voisinage.
  */
 async function fetchNeighborCandidates(
-    profile: TasteProfile, token: string,
+    profile: TasteProfile, ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   const seeds = profile.seedIds;
   if (seeds.length === 0) return [];
@@ -3219,12 +3342,12 @@ async function fetchNeighborCandidates(
   const requests = [
     ...recommendationSeeds.map((id) =>
       tmdbGET(`/movie/${id}/recommendations`, {
-        language: DEFAULT_LANGUAGE, page: '1',
-      }, token)),
+        page: '1',
+      }, ctx)),
     ...similarSeeds.map((id) =>
       tmdbGET(`/movie/${id}/similar`, {
-        language: DEFAULT_LANGUAGE, page: '1',
-      }, token)),
+        page: '1',
+      }, ctx)),
   ];
 
   const settled = await Promise.allSettled(requests);
@@ -3238,18 +3361,17 @@ async function fetchNeighborCandidates(
  * nouveautés que personne n'a encore vues — l'inverse de ce qu'on cherche.
  * @param {TasteProfile} profile Profil de goût.
  * @param {number} voteCountFloor Plancher de notoriété.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Candidats profilés.
  */
 async function fetchProfiledCandidates(
-    profile: TasteProfile, voteCountFloor: number, token: string,
+    profile: TasteProfile, voteCountFloor: number, ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   const genreIds = topGenreIds(profile, 3);
   if (genreIds.length === 0) return [];
 
   const decades = targetDecades(profile);
   const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    'language': DEFAULT_LANGUAGE,
     'region': DEFAULT_REGION,
     'include_adult': 'false',
     'include_video': 'false',
@@ -3259,7 +3381,7 @@ async function fetchProfiledCandidates(
     'vote_count.gte': String(voteCountFloor),
     'sort_by': 'vote_count.desc',
     'page': String(1 + Math.floor(Math.random() * 3)),
-  }, token));
+  }, ctx));
 
   const settled = await Promise.allSettled(requests);
   return settled.flatMap((result) => rowsFrom(result, 'results'));
@@ -3270,18 +3392,17 @@ async function fetchProfiledCandidates(
  * C'est ce qui fait tourner le feed à froid, et ce qui rattrape les
  * blockbusters que tout le monde a vus en dehors de son genre de prédilection.
  * @param {TasteProfile} profile Profil de goût.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Candidats grand public.
  */
 async function fetchPillarCandidates(
-    profile: TasteProfile, token: string,
+    profile: TasteProfile, ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   const decades = profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE ?
     targetDecades(profile) :
     shuffled([1990, 2000, 2010, 2020]);
 
   const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    'language': DEFAULT_LANGUAGE,
     'region': DEFAULT_REGION,
     'include_adult': 'false',
     'include_video': 'false',
@@ -3290,7 +3411,7 @@ async function fetchPillarCandidates(
     'vote_count.gte': String(SWIPE_COLD_VOTE_COUNT_FLOOR),
     'sort_by': 'vote_count.desc',
     'page': String(1 + Math.floor(Math.random() * 3)),
-  }, token));
+  }, ctx));
 
   const settled = await Promise.allSettled(requests);
   return settled.flatMap((result) => rowsFrom(result, 'results'));
@@ -3301,21 +3422,20 @@ async function fetchPillarCandidates(
  * partagent les mêmes appels de détail (`append_to_response=credits`) : une
  * seule requête par graine sert à la fois à trouver la saga et le casting.
  * @param {TasteProfile} profile Profil de goût.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<{franchise: DiscoverRow[], people: DiscoverRow[]}>}
  *   Candidats des deux sources.
  */
 async function fetchFranchiseAndPeopleCandidates(
-    profile: TasteProfile, token: string,
+    profile: TasteProfile, ctx: TMDBContext,
 ): Promise<{franchise: DiscoverRow[]; people: DiscoverRow[]}> {
   const seeds = profile.seedIds.slice(0, SWIPE_SEEDS_DETAILS);
   if (seeds.length === 0) return {franchise: [], people: []};
 
   const detailSettled = await Promise.allSettled(
       seeds.map((id) => tmdbGET(`/movie/${id}`, {
-        language: DEFAULT_LANGUAGE,
         append_to_response: 'credits',
-      }, token)),
+      }, ctx)),
   );
 
   const collectionIds = new Set<number>();
@@ -3348,20 +3468,18 @@ async function fetchFranchiseAndPeopleCandidates(
   const [collectionSettled, peopleSettled] = await Promise.all([
     Promise.allSettled(
         Array.from(collectionIds).map((id) => tmdbGET(`/collection/${id}`, {
-          language: DEFAULT_LANGUAGE,
-        }, token)),
+        }, ctx)),
     ),
     Promise.allSettled(
         Array.from(personIds).slice(0, 2).map((id) =>
           tmdbGET('/discover/movie', {
-            'language': DEFAULT_LANGUAGE,
             'include_adult': 'false',
             'include_video': 'false',
             'with_cast': String(id),
             'vote_count.gte': String(SWIPE_VOTE_COUNT_FLOOR),
             'sort_by': 'vote_count.desc',
             'page': '1',
-          }, token)),
+          }, ctx)),
     ),
   ]);
 
@@ -3376,20 +3494,20 @@ async function fetchFranchiseAndPeopleCandidates(
  * ramené par plusieurs sources garde la première rencontrée, dans l'ordre de
  * fiabilité décroissante du signal « il l'a probablement vu ».
  * @param {TasteProfile} profile Profil de goût.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Map<number, SwipeCandidate>>} Vivier dédoublonné.
  */
 async function fetchSwipePool(
-    profile: TasteProfile, token: string,
+    profile: TasteProfile, ctx: TMDBContext,
 ): Promise<Map<number, SwipeCandidate>> {
   const voteCountFloor = profile.gallerySize >= SWIPE_PROFILE_MATURE_SIZE ?
     SWIPE_VOTE_COUNT_FLOOR : SWIPE_COLD_VOTE_COUNT_FLOOR;
 
   const [neighbors, profiled, pillars, franchiseAndPeople] = await Promise.all([
-    fetchNeighborCandidates(profile, token),
-    fetchProfiledCandidates(profile, voteCountFloor, token),
-    fetchPillarCandidates(profile, token),
-    fetchFranchiseAndPeopleCandidates(profile, token),
+    fetchNeighborCandidates(profile, ctx),
+    fetchProfiledCandidates(profile, voteCountFloor, ctx),
+    fetchPillarCandidates(profile, ctx),
+    fetchFranchiseAndPeopleCandidates(profile, ctx),
   ]);
 
   const groups: [SwipeSource, DiscoverRow[]][] = [
@@ -3724,7 +3842,7 @@ export const getSwipeFeed = onRequest(
             exclusions.galleryDocs, parseSwipeCounters(countersSnap), declared,
         );
 
-        const pool = await fetchSwipePool(profile, tmdbApiKey.value());
+        const pool = await fetchSwipePool(profile, tmdb(req, res));
         const scored = Array.from(pool.values())
             .filter((candidate) =>
               !exclusions.excluded.has(candidate.id) &&
@@ -4178,16 +4296,15 @@ function isoDate(date: Date): string {
  * `/discover` plutôt que `/movie/now_playing` : la fenêtre, le tri et le
  * filtrage restent sous contrôle, ce qui permet ensuite de classer selon les
  * goûts — impossible avec `now_playing`, qui renvoie une liste figée.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Films à l'affiche.
  */
-async function fetchInTheaters(token: string): Promise<DiscoverRow[]> {
+async function fetchInTheaters(ctx: TMDBContext): Promise<DiscoverRow[]> {
   const now = new Date();
   const from =
     new Date(now.getTime() - THEATERS_WINDOW_DAYS * 24 * 3600 * 1000);
 
   const requests = [1, 2].map((page) => tmdbGET('/discover/movie', {
-    'language': DEFAULT_LANGUAGE,
     'region': DEFAULT_REGION,
     'include_adult': 'false',
     'include_video': 'false',
@@ -4197,7 +4314,7 @@ async function fetchInTheaters(token: string): Promise<DiscoverRow[]> {
     'primary_release_date.lte': isoDate(now),
     'sort_by': 'popularity.desc',
     'page': String(page),
-  }, token));
+  }, ctx));
 
   const settled = await Promise.allSettled(requests);
   return settled.flatMap((result) => rowsFrom(result, 'results'));
@@ -4213,16 +4330,16 @@ const TRENDING_MAX_PAGES = 6;
 /**
  * Un lot de pages de `/trending/movie/week`, récupérées en parallèle.
  * @param {number[]} pages Pages à récupérer.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Lignes brutes, non filtrées.
  */
 async function fetchTrendingPages(
-    pages: number[], token: string,
+    pages: number[], ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   const settled = await Promise.allSettled(pages.map((page) => tmdbGET(
       '/trending/movie/week',
-      {language: DEFAULT_LANGUAGE, page: String(page)},
-      token,
+      {page: String(page)},
+      ctx,
   )));
   return settled.flatMap((result) => rowsFrom(result, 'results'));
 }
@@ -4239,7 +4356,7 @@ async function fetchTrendingPages(
  * @param {DeclaredProfile} declared Profil déclaré, pour le même filtrage
  *   que la réponse finale.
  * @param {Set<number>} theatricalExclusion Films encore à l'affiche.
- * @param {string} token Jeton TMDB.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<DiscoverRow[]>} Lignes brutes, assez nombreuses pour
  *   couvrir `TRENDING_MIN_SIZE` une fois nettoyées par l'appelant.
  */
@@ -4247,7 +4364,7 @@ async function backfillTrending(
     initial: DiscoverRow[],
     declared: DeclaredProfile,
     theatricalExclusion: Set<number>,
-    token: string,
+    ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
   let rows = initial;
   let nextPage = TRENDING_INITIAL_PAGES + 1;
@@ -4256,7 +4373,7 @@ async function backfillTrending(
       TRENDING_MIN_SIZE &&
     nextPage <= TRENDING_MAX_PAGES
   ) {
-    rows = rows.concat(await fetchTrendingPages([nextPage], token));
+    rows = rows.concat(await fetchTrendingPages([nextPage], ctx));
     nextPage++;
   }
   return rows;
@@ -4331,15 +4448,15 @@ export const getHomeRows = onRequest(
 
         const seedId = profile.seedIds[0] ?? null;
         const [theaters, trendingInitial, seededRaw] = await Promise.all([
-          fetchInTheaters(tmdbApiKey.value()),
+          fetchInTheaters(tmdb(req, res)),
           fetchTrendingPages(
               Array.from({length: TRENDING_INITIAL_PAGES}, (_, i) => i + 1),
-              tmdbApiKey.value(),
+              tmdb(req, res),
           ),
           seedId === null ? Promise.resolve([]) :
             tmdbGET(`/movie/${seedId}/recommendations`, {
-              language: DEFAULT_LANGUAGE, page: '1',
-            }, tmdbApiKey.value())
+              page: '1',
+            }, tmdb(req, res))
                 .then((data) => Array.isArray(data.results) ?
                   data.results as DiscoverRow[] : [])
                 .catch(() => [] as DiscoverRow[]),
@@ -4371,7 +4488,7 @@ export const getHomeRows = onRequest(
                 .map((row) => row.id),
         );
         const trending = await backfillTrending(
-            trendingInitial, declared, theatricalExclusion, tmdbApiKey.value(),
+            trendingInitial, declared, theatricalExclusion, tmdb(req, res),
         );
 
         res.status(200).json({
@@ -5515,15 +5632,25 @@ export const getPublicProfile = onRequest(
         const total = [...counts.values()].reduce((a, b) => a + b, 0);
         const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
         const top = ranked.slice(0, PUBLIC_PROFILE_GENRES);
+        // Le profil public d'un ami se lit dans *votre* langue, pas dans la
+        // sienne : c'est votre requête qui la porte.
+        const language = requestedLanguage(req, res);
+        const names = GENRE_LABELS[language] ?? GENRE_LABELS[DEFAULT_LANGUAGE];
+        const labels = REASON_LABELS[language] ??
+          REASON_LABELS[DEFAULT_LANGUAGE];
         const genres = top.map(([id, n]) => ({
           id,
-          name: GENRE_LABELS_FR[id] ?? `Genre ${id}`,
+          name: names[id] ?? `Genre ${id}`,
           share: total > 0 ? n / total : 0,
         }));
         const remainder = ranked.slice(PUBLIC_PROFILE_GENRES)
             .reduce((sum, [, n]) => sum + n, 0);
         if (remainder > 0 && total > 0) {
-          genres.push({id: -1, name: 'Autres', share: remainder / total});
+          genres.push({
+            id: -1,
+            name: labels.otherGenres,
+            share: remainder / total,
+          });
         }
 
         // Les plus récemment ajoutés, affiche obligatoire.
