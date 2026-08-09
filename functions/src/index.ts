@@ -554,6 +554,8 @@ interface QuestionnaireAnswersPayload {
   cast: string;
   runtime: string;
   era: string;
+  /** Les pays d'origine demandés — slugs du client, jamais des codes ISO. */
+  originCountries: string[];
   surpriseIntensity: number;
   preferredGenreIds: number[];
   avoidedGenreIds: number[];
@@ -636,6 +638,7 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
     cast: strOrDefault(b.cast, 'any'),
     runtime: strOrDefault(b.runtime, 'any'),
     era: strOrDefault(b.era, 'any'),
+    originCountries: strArray(b.originCountries),
     surpriseIntensity: numOrDefault(b.surpriseIntensity, 0.5),
     preferredGenreIds: numArray(b.preferredGenreIds),
     avoidedGenreIds: numArray(b.avoidedGenreIds),
@@ -676,6 +679,93 @@ function filterByContentFormat(
 ): DiscoverRow[] {
   if (answers.contentFormat !== 'animated') return rows;
   return rows.filter((row) => (row.genre_ids ?? []).includes(GENRE_ANIMATION));
+}
+
+/** Le code ISO 3166-1 derrière chaque origine nommée par le client. */
+const ORIGIN_COUNTRY_CODES: Record<string, string> = {
+  france: 'FR',
+  unitedKingdom: 'GB',
+  unitedStates: 'US',
+  japan: 'JP',
+};
+
+/** Le slug qui ne désigne pas un pays mais tous les autres. */
+const ORIGIN_ELSEWHERE = 'elsewhere';
+
+/** Les quatre pays nommés. « Ailleurs », c'est tout ce qui n'est pas là-dedans. */
+const NAMED_ORIGIN_CODES = Object.values(ORIGIN_COUNTRY_CODES);
+
+/**
+ * Les pays interrogés quand « Autre » est demandé.
+ *
+ * TMDB ne sait pas exprimer « tous les pays sauf ceux-là » : il n'existe pas de
+ * `without_origin_country`. Interroger sans contrainte remplirait le vivier de
+ * films américains qu'on jetterait ensuite. On amorce donc avec les grandes
+ * cinématographies hors des quatre nommées — l'exactitude, elle, ne dépend pas
+ * de cette liste : `matchesRequestedOrigins` accepte n'importe quel pays non
+ * nommé, y compris ceux qui manquent ici.
+ */
+const ELSEWHERE_SEED_CODES = [
+  'KR', 'IN', 'IT', 'ES', 'DE', 'CN', 'HK', 'TW', 'CA', 'AU',
+  'SE', 'DK', 'NO', 'BE', 'NL', 'BR', 'MX', 'AR', 'RU', 'PL',
+  'IR', 'TH', 'TR', 'IE', 'NZ',
+];
+
+/**
+ * Les codes pays à passer à TMDB, ou une liste vide quand rien n'est demandé.
+ * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @return {string[]} Codes ISO à interroger.
+ */
+function discoverOriginCodes(answers: QuestionnaireAnswersPayload): string[] {
+  const slugs = answers.originCountries;
+  if (slugs.length === 0) return [];
+  const codes = new Set<string>();
+  for (const slug of slugs) {
+    const code = ORIGIN_COUNTRY_CODES[slug];
+    if (code) codes.add(code);
+  }
+  if (slugs.includes(ORIGIN_ELSEWHERE)) {
+    for (const code of ELSEWHERE_SEED_CODES) codes.add(code);
+  }
+  return Array.from(codes);
+}
+
+/**
+ * L'origine demandée est un filtre dur, jamais assouplie.
+ *
+ * Même raisonnement que pour le genre : la requête cadre, ce filtre garantit.
+ * Il porte en plus la seule chose que la requête ne sait pas dire — « un pays
+ * qui n'est aucun des quatre nommés ».
+ *
+ * Un film dont le pays n'est pas renseigné passe. C'est délibéré et vérifié :
+ * les endpoints de liste de TMDB ne renvoient pas `origin_country` du tout, si
+ * bien qu'un filtre strict rejetterait l'intégralité du vivier. Le tri par pays
+ * est fait par la requête elle-même (`with_origin_country`), que TMDB accepte
+ * en paramètre même s'il ne réémet pas le champ ; ce filtre-ci garantit ce que
+ * la requête ne sait pas dire, sur des candidats enrichis qui, eux, portent
+ * l'information.
+ *
+ * @param {string[] | undefined} originCountry Pays du film, codes ISO.
+ * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @return {boolean} Vrai si le film vient d'une origine demandée.
+ */
+function matchesRequestedOrigins(
+    originCountry: string[] | undefined,
+    answers: QuestionnaireAnswersPayload,
+): boolean {
+  const slugs = answers.originCountries;
+  if (slugs.length === 0) return true;
+
+  const origins = originCountry ?? [];
+  if (origins.length === 0) return true;
+
+  const wanted = new Set(
+      slugs.map((slug) => ORIGIN_COUNTRY_CODES[slug]).filter(Boolean),
+  );
+  if (origins.some((code) => wanted.has(code))) return true;
+
+  return slugs.includes(ORIGIN_ELSEWHERE) &&
+    origins.some((code) => !NAMED_ORIGIN_CODES.includes(code));
 }
 
 /**
@@ -723,6 +813,11 @@ function baseDiscoverParams(
   const genreIds = genreIdsFor(answers.genres);
   if (genreIds.length > 0) {
     query.with_genres = genreIds.join('|');
+  }
+
+  const originCodes = discoverOriginCodes(answers);
+  if (originCodes.length > 0) {
+    query.with_origin_country = originCodes.join('|');
   }
 
   const withoutGenres = new Set<number>();
@@ -1999,8 +2094,23 @@ async function enrichCandidate(
       videos.find((v) => v.site === 'YouTube');
     const trailerKey = trailer?.key ?? null;
 
+    // Le pays d'origine n'existe que sur la fiche détaillée : les endpoints de
+    // liste de TMDB ne le renvoient pas du tout. C'est donc ici, et nulle part
+    // avant, qu'on peut le connaître — et c'est pourquoi la garantie d'origine
+    // s'applique à la finalisation, sur des candidats déjà enrichis.
+    const detailOrigins = Array.isArray(detail.origin_country) ?
+      (detail.origin_country as unknown[])
+          .filter((c): c is string => typeof c === 'string') : [];
+    const productionCountries = Array.isArray(detail.production_countries) ?
+      (detail.production_countries as {iso_3166_1?: unknown}[])
+          .map((c) => c.iso_3166_1)
+          .filter((c): c is string => typeof c === 'string') : [];
+    const originCountry = detailOrigins.length > 0 ?
+      detailOrigins : productionCountries;
+
     return {
       ...row,
+      origin_country: originCountry,
       runtimeMinutes:
         typeof detail.runtime === 'number' ? detail.runtime : null,
       belongsToCollection: detail.belongs_to_collection !== null &&
@@ -2381,6 +2491,10 @@ export const getCandidatePool = onRequest(
         // quand le vivier est trop maigre : c'est le sens de « jamais ». Le
         // genre demandé ce soir suit la même règle — c'est la réponse la plus
         // explicite du parcours, elle prime sur la taille du vivier.
+        // Le pays d'origine ne figure pas ici : TMDB ne le renvoie pas sur ses
+        // listes. C'est `with_origin_country` dans la requête qui a trié, et la
+        // finalisation qui garantira — sur des candidats enrichis, seuls à
+        // porter l'information.
         const keep = (row: DiscoverRow): boolean =>
           !exclusionSet.has(row.id) &&
           !(row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id)) &&
@@ -2599,6 +2713,14 @@ export const finalizeRecommendations = onRequest(
         );
         if (shortlist.length === 0) {
           res.status(409).json({error: 'no_candidates_in_requested_genres'});
+          return;
+        }
+
+        shortlist = shortlist.filter(
+            (c) => matchesRequestedOrigins(c.origin_country, answers),
+        );
+        if (shortlist.length === 0) {
+          res.status(409).json({error: 'no_candidates_in_requested_origins'});
           return;
         }
 
