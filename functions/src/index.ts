@@ -4640,15 +4640,14 @@ export const getHomeRows = onRequest(
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
 
-        const [gallerySnap, countersSnap, declared] = await Promise.all([
+        // Le profil de goût n'est plus construit ici : les deux rangées qui
+        // s'en servaient rangent désormais par popularité et par date d'ajout.
+        // Il coûtait une lecture de `preferences/swipeProfile` à chaque
+        // ouverture de l'accueil, pour un score que plus personne ne lit.
+        const [gallerySnap, declared] = await Promise.all([
           userRef.collection('gallery').get(),
-          userRef.collection('preferences').doc('swipeProfile').get(),
           fetchDeclaredProfile(db, uid),
         ]);
-
-        const profile = buildTasteProfile(
-            gallerySnap.docs, parseSwipeCounters(countersSnap), declared,
-        );
 
         const titleById = new Map<number, string>();
         for (const doc of gallerySnap.docs) {
@@ -4659,7 +4658,28 @@ export const getHomeRows = onRequest(
           }
         }
 
-        const seedId = profile.seedIds[0] ?? null;
+        // Le dernier film ajouté à la galerie, et lui seul.
+        //
+        // La graine venait de `pickSeedIds`, qui mêle les ajouts récents à
+        // quelques anciens puis mélange le tout : la rangée changeait de film
+        // de référence à chaque ouverture, sans que rien ne l'explique. Ce
+        // brassage a son sens pour le deck de swipe, qui doit couvrir large et
+        // ne pas se refermer sur la dernière lubie ; l'accueil, lui, a besoin
+        // d'être compris du premier coup d'œil, et « parce que tu as vu X »
+        // n'est lisible que si X est le film qu'on vient de marquer.
+        const seedId = gallerySnap.docs
+            .map((doc) => ({
+              id: doc.get('tmdbId') as unknown,
+              addedAt: doc.get('addedAt') as
+                admin.firestore.Timestamp | undefined,
+            }))
+            .filter((entry): entry is {
+              id: number;
+              addedAt: admin.firestore.Timestamp | undefined;
+            } => typeof entry.id === 'number')
+            .sort((left, right) =>
+              (right.addedAt?.toMillis() ?? 0) -
+              (left.addedAt?.toMillis() ?? 0))[0]?.id ?? null;
         const [theaters, trendingInitial, seededRaw] = await Promise.all([
           fetchInTheaters(tmdb(req, res)),
           fetchTrendingPages(
