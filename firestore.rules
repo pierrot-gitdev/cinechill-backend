@@ -82,10 +82,10 @@ service cloud.firestore {
     // Lecture ouverte à tout compte connecté. En écriture, le
     // propriétaire ne peut toucher que son identité déclarative
     // (displayName, avatarURL, badge affiché) — jamais les compteurs.
-    // followerCount / followingCount / galleryCount sont maintenus par
-    // les Cloud Functions (followUser/unfollowUser, setMediaStatus) ;
-    // les exclure ici est ce qui les rend dignes de confiance à
-    // l'affichage, sans document séparé à synchroniser.
+    // followerCount / followingCount sont maintenus en transaction par
+    // followUser/unfollowUser, galleryCount par evaluateBadges à chaque
+    // ouverture de l'app ; les exclure ici est ce qui les rend dignes de
+    // confiance à l'affichage, sans document séparé à synchroniser.
     // -----------------------------------------------------------------
     match /publicProfiles/{uid} {
       allow read: if isSignedIn();

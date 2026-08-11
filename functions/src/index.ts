@@ -5013,14 +5013,18 @@ export const evaluateBadges = onRequest(
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
 
-        const [gallerySnap, watchlistSnap, swipeSnap, badgesSnap, stateSnap] =
-          await Promise.all([
-            userRef.collection('gallery').get(),
-            userRef.collection('watchlist').get(),
-            userRef.collection('preferences').doc('swipeProfile').get(),
-            userRef.collection('badges').get(),
-            userRef.collection('preferences').doc('badgeState').get(),
-          ]);
+        const publicProfileRef = db.collection('publicProfiles').doc(uid);
+        const [
+          gallerySnap, watchlistSnap, swipeSnap, badgesSnap, stateSnap,
+          publicProfileSnap,
+        ] = await Promise.all([
+          userRef.collection('gallery').get(),
+          userRef.collection('watchlist').get(),
+          userRef.collection('preferences').doc('swipeProfile').get(),
+          userRef.collection('badges').get(),
+          userRef.collection('preferences').doc('badgeState').get(),
+          publicProfileRef.get(),
+        ]);
 
         const counters = parseSwipeCounters(swipeSnap);
         const sumValues = (record: Record<string, number>): number =>
@@ -5086,6 +5090,28 @@ export const evaluateBadges = onRequest(
           );
           writes++;
         }
+
+        // `publicProfiles.galleryCount` se rafraîchit ici, et nulle part
+        // ailleurs. Il alimente le tri des profils suggérés et le sous-titre
+        // « N vus » des listes du Hall ; le compte exact, lui, reste calculé à
+        // la volée par `getPublicProfile`.
+        //
+        // Ici plutôt que dans `setMediaStatus` et `recordSwipes` : ces deux
+        // fonctions écrivent sans lire, et leur faire tenir un compteur juste
+        // demanderait de relire l'état de chaque film avant de l'écrire. Cette
+        // fonction, elle, a déjà la galerie entière en main, et le client
+        // l'appelle à l'ouverture puis à chaque changement de galerie
+        // (`BadgesViewModel.checkForNewAchievements`) : le compteur suit donc
+        // les ajouts de près, sans qu'aucun chemin d'écriture ait à y penser.
+        //
+        // Conditionné à l'existence du profil : tout le monde n'a pas réservé
+        // de pseudo, et un `set` créerait ici un profil fantôme sans identité.
+        if (publicProfileSnap.exists &&
+            publicProfileSnap.get('galleryCount') !== gallerySnap.size) {
+          batch.update(publicProfileRef, {galleryCount: gallerySnap.size});
+          writes++;
+        }
+
         if (writes > 0) await batch.commit();
 
         res.status(200).json({badges: payload});
