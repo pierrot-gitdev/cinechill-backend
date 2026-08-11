@@ -148,6 +148,16 @@ function tmdb(req: Request, res: Response): TMDBContext {
  * La langue est posée ici, une fois pour toutes : aucun appelant n'a plus à y
  * penser, et aucun ne peut l'oublier. Un appelant qui aurait une raison de la
  * forcer peut toujours la mettre dans `query`, qui a le dernier mot.
+ *
+ * La mise en cache est posée ici pour exactement la même raison, et c'est ce
+ * qui la rend sûre : la clé est l'URL finale, celle que TMDB verra. Elle porte
+ * donc par construction la langue, la page, la région et tout paramètre qu'un
+ * appelant pourrait ajouter demain. Un cache posé chez les appelants aurait
+ * demandé de recomposer cette clé à la main partout, et il aurait suffi d'en
+ * oublier un pour servir à quelqu'un la réponse destinée à un autre.
+ *
+ * Toutes les réponses de TMDB sont publiques et sans utilisateur : il n'existe
+ * pas d'appel qu'il faudrait exclure.
  * @param {string} path TMDB endpoint path.
  * @param {Record<string, string>} query Query parameters.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
@@ -161,19 +171,23 @@ async function tmdbGET(
   const params = new URLSearchParams({language: ctx.language, ...query});
   const url = `${TMDB_BASE}${path}?${params.toString()}`;
 
-  const tmdbRes = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${ctx.token}`,
-      Accept: 'application/json',
-    },
+  // Le jeton ne fait pas partie de la clé : il est le même pour tout le monde,
+  // et l'y mettre n'aurait fait que dupliquer chaque entrée à sa rotation.
+  return cached(url, cacheTTLFor(path), async () => {
+    const tmdbRes = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${ctx.token}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!tmdbRes.ok) {
+      const details = await tmdbRes.text();
+      throw new TMDBRequestError(tmdbRes.status, details);
+    }
+
+    return await tmdbRes.json() as Record<string, unknown>;
   });
-
-  if (!tmdbRes.ok) {
-    const details = await tmdbRes.text();
-    throw new TMDBRequestError(tmdbRes.status, details);
-  }
-
-  return await tmdbRes.json() as Record<string, unknown>;
 }
 
 /**
@@ -263,6 +277,106 @@ async function passesAppCheck(
   }
 }
 
+/* ===================================================================== *
+ *  Le cache TMDB : ce qui est identique pour tout le monde
+ * ===================================================================== */
+
+/**
+ * Un cache en mémoire d'instance, volontairement sans stockage partagé.
+ *
+ * Les instances Cloud Run restent chaudes plusieurs minutes sous charge, ce
+ * qui suffit largement pour ce qu'on met dedans : des réponses TMDB qui ne
+ * dépendent d'aucun utilisateur et changent au mieux une fois par jour. Un
+ * cache partagé (Redis, Firestore) coûterait une dépendance et un aller-retour
+ * réseau pour économiser un aller-retour réseau.
+ *
+ * On stocke la *promesse* et non la valeur : deux requêtes simultanées sur la
+ * même clé partagent alors un seul appel TMDB au lieu d'en lancer deux. C'est
+ * exactement le cas de l'enrichissement, qui part à soixante requêtes de
+ * front, et de l'accueil, que tout le monde ouvre en même temps.
+ */
+interface CacheEntry {
+  expiresAt: number;
+  value: Promise<unknown>;
+}
+
+const tmdbCache = new Map<string, CacheEntry>();
+
+/**
+ * Au-delà, on évince la plus ancienne entrée insérée.
+ *
+ * Le chiffre borne la mémoire, et c'est le seul réglage à surveiller ici : une
+ * réponse de liste pèse quelques dizaines de kilo-octets, une fiche détaillée
+ * environ le double. Trois cents entrées représentent donc de l'ordre de 15 à
+ * 20 Mo par instance, un coût fixe qui ne dépend pas du trafic — à la
+ * différence de la mémoire consommée par les requêtes en vol.
+ */
+const TMDB_CACHE_MAX_ENTRIES = 300;
+
+/** Genres, plateformes, sagas : des tables de référence, stables. */
+const CACHE_TTL_REFERENCE = 24 * 3600 * 1000;
+/** Le voisinage d'un film : TMDB le recalcule lentement. */
+const CACHE_TTL_NEIGHBORS = 12 * 3600 * 1000;
+/** Listes et fiches : réévaluées dans la journée. */
+const CACHE_TTL_LISTING = 6 * 3600 * 1000;
+
+/**
+ * Combien de temps retenir la réponse d'un chemin TMDB.
+ *
+ * Le classement suit une seule question : au bout de combien de temps la
+ * réponse cesse-t-elle d'être vraie ? Le nombre de parties d'une saga ne bouge
+ * pas d'une année sur l'autre ; les tendances de la semaine, si, mais pas dans
+ * l'heure.
+ * @param {string} path Chemin TMDB appelé.
+ * @return {number} Durée de validité en millisecondes.
+ */
+function cacheTTLFor(path: string): number {
+  if (path.startsWith('/genre/') || path.startsWith('/watch/providers') ||
+      path.startsWith('/collection/')) {
+    return CACHE_TTL_REFERENCE;
+  }
+  if (path.includes('/recommendations') || path.includes('/similar')) {
+    return CACHE_TTL_NEIGHBORS;
+  }
+  return CACHE_TTL_LISTING;
+}
+
+/**
+ * Sert une valeur depuis le cache, ou la charge et la retient.
+ *
+ * Un échec n'est jamais mis en cache : l'entrée est retirée dès que la
+ * promesse est rejetée, pour que l'appel suivant retente au lieu de servir
+ * l'erreur pendant six heures.
+ * @param {string} key Clé de cache. Doit porter tout ce qui fait varier la
+ *   réponse, la langue en premier lieu.
+ * @param {number} ttlMillis Durée de validité.
+ * @param {function(): Promise<T>} load Comment obtenir la valeur.
+ * @return {Promise<T>} La valeur, fraîche ou retenue.
+ */
+async function cached<T>(
+    key: string, ttlMillis: number, load: () => Promise<T>,
+): Promise<T> {
+  const now = Date.now();
+  const hit = tmdbCache.get(key);
+  if (hit && hit.expiresAt > now) return hit.value as Promise<T>;
+
+  const value = load();
+  // Le `catch` est posé tout de suite, et non au moment de la lecture : sans
+  // lui, un rejet sur une entrée que personne n'attend encore remonterait en
+  // « unhandled rejection » et tuerait le processus.
+  value.catch(() => {
+    if (tmdbCache.get(key)?.value === value) tmdbCache.delete(key);
+  });
+
+  // `Map` conserve l'ordre d'insertion : la première clé est la plus ancienne.
+  if (!tmdbCache.has(key) && tmdbCache.size >= TMDB_CACHE_MAX_ENTRIES) {
+    const oldest = tmdbCache.keys().next();
+    if (!oldest.done) tmdbCache.delete(oldest.value);
+  }
+  tmdbCache.set(key, {expiresAt: now + ttlMillis, value});
+  return value;
+}
+
 export const getPopularMovies = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
@@ -342,26 +456,34 @@ export const getMovieDetails = onRequest(
         // Seul appel qui n'emprunte pas `tmdbGET` : la lecture qui suit est
         // écrite contre le JSON brut. La langue, elle, ne peut plus être
         // gravée dans l'URL — c'est la requête entrante qui la porte.
+        const language = requestedLanguage(req, res);
         const url =
           `https://api.themoviedb.org/3/movie/${id}` +
-          `?language=${encodeURIComponent(requestedLanguage(req, res))}` +
+          `?language=${encodeURIComponent(language)}` +
           '&append_to_response=credits,videos,watch%2Fproviders';
 
-        const tmdbRes = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${tmdbApiKey.value()}`,
-            Accept: 'application/json',
-          },
-        });
-
-        if (!tmdbRes.ok) {
-          const details = await tmdbRes.text();
-          logger.error('TMDB detail error', {status: tmdbRes.status, details});
-          res.status(tmdbRes.status).json({error: 'tmdb_error', details});
-          return;
-        }
-
-        const data = await tmdbRes.json();
+        // La fiche d'un film ouverte par quelqu'un le sera par d'autres :
+        // c'est la page la plus partagée de l'app. L'erreur est levée plutôt
+        // que renvoyée sur place, pour qu'un échec ne soit jamais mis en cache.
+        // Le seul appel qui garde son enveloppe explicite, faute de passer par
+        // `tmdbGET`. La clé reste l'URL, comme partout ailleurs.
+        const data = await cached(
+            url, CACHE_TTL_LISTING,
+            async () => {
+              const tmdbRes = await fetch(url, {
+                headers: {
+                  Authorization: `Bearer ${tmdbApiKey.value()}`,
+                  Accept: 'application/json',
+                },
+              });
+              if (!tmdbRes.ok) {
+                throw new TMDBRequestError(
+                    tmdbRes.status, await tmdbRes.text(),
+                );
+              }
+              return await tmdbRes.json();
+            },
+        );
 
         const videos = Array.isArray(data.videos?.results) ?
           data.videos.results : [];
@@ -446,6 +568,7 @@ export const getMovieDetails = onRequest(
           watch_providers_fr: watchProvidersFR,
         });
       } catch (error) {
+        if (sendTMDBError(error, res)) return;
         logger.error('getMovieDetails failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
@@ -4365,6 +4488,8 @@ async function fetchInTheaters(ctx: TMDBContext): Promise<DiscoverRow[]> {
   const from =
     new Date(now.getTime() - THEATERS_WINDOW_DAYS * 24 * 3600 * 1000);
 
+  // La fenêtre glisse chaque nuit. Elle figure dans les paramètres, donc dans
+  // l'URL, donc dans la clé de cache : la veille s'évince d'elle-même.
   const requests = [1, 2].map((page) => tmdbGET('/discover/movie', {
     'region': DEFAULT_REGION,
     'include_adult': 'false',
