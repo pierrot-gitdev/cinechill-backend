@@ -986,7 +986,9 @@ const ORIGIN_COUNTRY_CODES: Record<string, string> = {
 /** Le slug qui ne désigne pas un pays mais tous les autres. */
 const ORIGIN_ELSEWHERE = 'elsewhere';
 
-/** Les quatre pays nommés. « Ailleurs », c'est tout ce qui n'est pas là-dedans. */
+/**
+ * Les quatre pays nommés. « Ailleurs », c'est tout ce qui n'est pas là-dedans.
+ */
 const NAMED_ORIGIN_CODES = Object.values(ORIGIN_COUNTRY_CODES);
 
 /**
@@ -1188,12 +1190,12 @@ async function fetchCandidatePool(
     }
   }
 
-  // Il y avait ici une tranche qui retirait `with_genres` pour élargir le vivier
-  // au-delà des genres demandés. Elle se justifiait quand les genres étaient
-  // *déduits* d'un trajet d'humeur : une déduction fausse enfermait la recherche
-  // sans recours. Les genres sont maintenant choisis explicitement, et un choix
-  // explicite ne se contourne pas — élargir au-delà reviendrait à proposer autre
-  // chose que ce qui a été demandé.
+  // Il y avait ici une tranche qui retirait `with_genres` pour élargir le
+  // vivier au-delà des genres demandés. Elle se justifiait quand les genres
+  // étaient *déduits* d'un trajet d'humeur : une déduction fausse enfermait la
+  // recherche sans recours. Les genres sont maintenant choisis explicitement,
+  // et un choix explicite ne se contourne pas — élargir au-delà reviendrait à
+  // proposer autre chose que ce qui a été demandé.
 
   // La tranche basse notoriété : bien notés mais peu vus. Sans elle, un vivier
   // trié par popularité rend « familiarité : inconnu » structurellement
@@ -1595,15 +1597,15 @@ const ENRICHED_SIGMA: Partial<AxisVector> = {
 /**
  * Lexique de ton, appliqué aux **noms** de mots-clés que TMDB renvoie.
  *
- * On travaille sur les libellés et non sur des identifiants : les identifiants de
- * mots-clés TMDB existent, mais les inventer de mémoire produirait des tables
- * fausses et silencieusement inefficaces. Les noms, eux, arrivent dans la réponse
- * et se lisent tels quels.
+ * On travaille sur les libellés et non sur des identifiants : les identifiants
+ * de mots-clés TMDB existent, mais les inventer de mémoire produirait des
+ * tables fausses et silencieusement inefficaces. Les noms, eux, arrivent dans
+ * la réponse et se lisent tels quels.
  *
- * Couverture inégale et assumée — beaucoup de films n'ont aucun de ces mots-clés.
- * C'est pourquoi l'incertitude du ton ne se resserre que lorsqu'un mot est
- * effectivement reconnu : sans correspondance, on en reste à ce que disent les
- * genres, c'est-à-dire pas grand-chose.
+ * Couverture inégale et assumée — beaucoup de films n'ont aucun de ces
+ * mots-clés. C'est pourquoi l'incertitude du ton ne se resserre que lorsqu'un
+ * mot est effectivement reconnu : sans correspondance, on en reste à ce que
+ * disent les genres, c'est-à-dire pas grand-chose.
  */
 const TONE_KEYWORDS: Record<string, number> = {
   'feel good': 0.9, 'friendship': 0.6, 'family relationships': 0.6,
@@ -1683,9 +1685,10 @@ function genreAxisValue(
  * Positionne un film sur les huit axes à partir des seuls champs de liste.
  *
  * `fa` est la seule mesure vraiment solide de cette étape : elle repose sur des
- * nombres (popularité, votes) et non sur une lecture des genres. `in` est laissé
- * à zéro, avec une incertitude maximale — la durée n'existe pas avant l'appel de
- * détail, et prétendre l'estimer fausserait le classement au lieu de l'aider.
+ * nombres (popularité, votes) et non sur une lecture des genres. `in` est
+ * laissé à zéro, avec une incertitude maximale — la durée n'existe pas avant
+ * l'appel de détail, et prétendre l'estimer fausserait le classement au lieu de
+ * l'aider.
  *
  * @param {DiscoverRow} row Le film.
  * @param {PoolStats} stats Distributions du vivier.
@@ -1702,10 +1705,12 @@ function coarseAxesFor(row: DiscoverRow, stats: PoolStats): AxisVector {
   const isFamiliarOrigin = origins.length === 0 ||
     origins.some((c) => c === 'FR' || c === 'US' || c === 'GB');
 
+  const familiarity = 1 - 2 * reach + (isFamiliarOrigin ? 0 : 0.15);
+
   return {
     ch: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ch),
     ry: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ry),
-    fa: Math.max(-1, Math.min(1, 1 - 2 * reach + (isFamiliarOrigin ? 0 : 0.15))),
+    fa: Math.max(-1, Math.min(1, familiarity)),
     de: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.de),
     an: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.an),
     to: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.to),
@@ -1717,10 +1722,10 @@ function coarseAxesFor(row: DiscoverRow, stats: PoolStats): AxisVector {
 /**
  * Resserre les axes que seul le détail du film permet de mesurer.
  *
- * Ne recalcule jamais `fa` depuis zéro : sa part « notoriété » a été établie sur
- * la distribution du vivier complet, que cette étape n'a plus sous la main. On
- * se contente d'y ajouter ce que le détail apprend — l'appartenance à une saga,
- * qui rend un film plus familier qu'un inédit à notoriété égale.
+ * Ne recalcule jamais `fa` depuis zéro : sa part « notoriété » a été établie
+ * sur la distribution du vivier complet, que cette étape n'a plus sous la main.
+ * On se contente d'y ajouter ce que le détail apprend — l'appartenance à une
+ * saga, qui rend un film plus familier qu'un inédit à notoriété égale.
  *
  * @param {AxisVector} base Axes grossiers.
  * @param {EnrichedCandidate} c Candidat enrichi.
@@ -1862,9 +1867,9 @@ function parseBelief(raw: unknown): BeliefPayload | null {
  * Le score d'un film : une proximité tolérante au doute.
  *
  * Un axe dont on ignore la position de la personne (σ grand) *ou* celle du film
- * (s grand) voit son terme s'aplatir et cesse de départager — le modèle ne bluffe
- * jamais sur ce qu'il ne sait pas. Un axe sur lequel rien n'a été exprimé porte
- * un poids nul et ne compte pas du tout.
+ * (s grand) voit son terme s'aplatir et cesse de départager — le modèle ne
+ * bluffe jamais sur ce qu'il ne sait pas. Un axe sur lequel rien n'a été
+ * exprimé porte un poids nul et ne compte pas du tout.
  *
  * @param {AxisVector} axes Position du film.
  * @param {AxisVector} filmSigma Incertitude sur cette position.
@@ -1899,9 +1904,13 @@ function beliefScore(
 const TRAIT_PRIOR_TAU = 1;
 /** Demi-vie d'une observation, en jours. Les goûts bougent ; le profil suit. */
 const TRAIT_HALF_LIFE_DAYS = 180;
-/** Un film vu : on l'a regardé jusqu'à en témoigner, sans dire qu'on l'a aimé. */
+/**
+ * Un film vu : on l'a regardé jusqu'à en témoigner, sans dire qu'on l'a aimé.
+ */
 const TRAIT_WEIGHT_GALLERY = 0.6;
-/** Une intention, pas une expérience — le soi projeté, à croire avec prudence. */
+/**
+ * Une intention, pas une expérience — le soi projeté, à croire avec prudence.
+ */
 const TRAIT_WEIGHT_WATCHLIST = 0.2;
 /** La parole de l'utilisateur sur lui-même l'emporte sur toute inférence. */
 const TRAIT_WEIGHT_CORRECTION = 2.0;
@@ -1922,8 +1931,10 @@ interface TraitEntry {
   addedAtMillis: number;
 }
 
-/** Ce qu'un film a laissé, une fois regardé. Le seul signal du système qui porte
- * sur l'expérience vécue et non sur une intention ou une déclaration. */
+/**
+ * Ce qu'un film a laissé, une fois regardé. Le seul signal du système qui porte
+ * sur l'expérience vécue et non sur une intention ou une déclaration.
+ */
 type VerdictValue = 'stayed' | 'passed' | 'unfinished';
 
 interface TraitVerdict {
@@ -2019,7 +2030,8 @@ function traitAxesFor(entry: TraitEntry): Partial<AxisVector> {
   };
   if (entry.inCollection) {
     // Une saga est un terrain connu ; l'inverse ne se déduit pas — un film hors
-    // saga peut être aussi bien un inédit qu'un classique que tout le monde a vu.
+    // saga peut être aussi bien un inédit qu'un classique que tout le monde a
+    // vu.
     axes.fa = -0.5;
   }
   return axes;
@@ -2032,10 +2044,12 @@ function traitAxesFor(entry: TraitEntry): Partial<AxisVector> {
  * @param {number} sameDayCount Nombre d'entrées ajoutées le même jour.
  * @return {number} Poids effectif.
  */
-function traitWeight(base: number, ageDays: number, sameDayCount: number): number {
+function traitWeight(
+    base: number, ageDays: number, sameDayCount: number,
+): number {
   const decay = Math.pow(0.5, Math.max(0, ageDays) / TRAIT_HALF_LIFE_DAYS);
-  // Vingt films ajoutés le même soir ne sont pas vingt soirées : c'est un import,
-  // et sans ce plafond il écraserait deux ans de visionnage réel.
+  // Vingt films ajoutés le même soir ne sont pas vingt soirées : c'est un
+  // import, et sans ce plafond il écraserait deux ans de visionnage réel.
   const burst = Math.min(1, TRAIT_DAILY_CAP / Math.max(1, sameDayCount));
   return base * decay * burst;
 }
@@ -2095,21 +2109,23 @@ function buildTraitProfile(
   ingest(gallery, TRAIT_WEIGHT_GALLERY);
   ingest(watchlist, TRAIT_WEIGHT_WATCHLIST);
 
-  // Les verdicts, ensuite. Ils portent sur des films dont on connaît la position
-  // exacte — celle calculée à la finalisation, conservée dans l'historique — donc
-  // ils n'ont pas à repasser par les genres comme la bibliothèque.
+  // Les verdicts, ensuite. Ils portent sur des films dont on connaît la
+  // position exacte — celle calculée à la finalisation, conservée dans
+  // l'historique — donc ils n'ont pas à repasser par les genres comme la
+  // bibliothèque.
   for (const entry of verdicts) {
     const ageDays = (now - entry.atMillis) / (24 * 3600 * 1000);
     const weight = traitWeight(VERDICT_WEIGHT[entry.verdict], ageDays, 1);
     for (const axis of AXIS_KEYS) {
       const value = entry.axes[axis];
       if (typeof value !== 'number') continue;
-      // Un film abandonné est une preuve *contre* sa position. La mise à jour ne
-      // sait que tirer vers une cible, jamais repousser : on vise donc un point
-      // atténué du côté opposé, proportionnel à l'écart d'origine — un film neutre
-      // ne produit ainsi aucun signal, là où une simple inversion en inventerait un.
-      // Réserve honnête : « pas fini » peut tenir à la fatigue ou à l'heure plutôt
-      // qu'au goût, d'où un poids inférieur à celui de « resté avec moi ».
+      // Un film abandonné est une preuve *contre* sa position. La mise à jour
+      // ne sait que tirer vers une cible, jamais repousser : on vise donc un
+      // point atténué du côté opposé, proportionnel à l'écart d'origine — un
+      // film neutre ne produit ainsi aucun signal, là où une simple inversion
+      // en inventerait un. Réserve honnête : « pas fini » peut tenir à la
+      // fatigue ou à l'heure plutôt qu'au goût, d'où un poids inférieur à celui
+      // de « resté avec moi ».
       const target = entry.verdict === 'unfinished' ? -0.4 * value : value;
       observe(axis, Math.max(-1, Math.min(1, target)), weight);
     }
@@ -2149,8 +2165,8 @@ function buildTraitProfile(
     }
   }
 
-  // Les corrections passent en dernier et pèsent le plus lourd : ce que quelqu'un
-  // dit de lui-même prime sur ce qu'on a déduit de ses habitudes.
+  // Les corrections passent en dernier et pèsent le plus lourd : ce que
+  // quelqu'un dit de lui-même prime sur ce qu'on a déduit de ses habitudes.
   const correctedAxes: AxisKey[] = [];
   for (const axis of AXIS_KEYS) {
     const value = corrections[axis];
@@ -2192,8 +2208,10 @@ function traitEntriesFrom(
   return entries;
 }
 
-/** Ce qu'on redemandera à la prochaine ouverture, quand un film a été lancé sans
- * qu'on sache encore ce qu'il a donné. */
+/**
+ * Ce qu'on redemandera à la prochaine ouverture, quand un film a été lancé sans
+ * qu'on sache encore ce qu'il a donné.
+ */
 interface PendingVerdict {
   tmdbId: number;
   title: string | null;
@@ -2202,8 +2220,10 @@ interface PendingVerdict {
 /** Le délai avant de demander ce qu'un film a donné. Trop tôt, la personne est
  * encore devant ; trop tard, elle ne s'en souvient plus. */
 const VERDICT_DELAY_HOURS = 8;
-/** Au-delà, on n'en parle plus : une question sur un film d'il y a trois semaines
- * est une corvée, pas une conversation. */
+/**
+ * Au-delà, on n'en parle plus : une question sur un film d'il y a trois
+ * semaines est une corvée, pas une conversation.
+ */
 const VERDICT_EXPIRY_DAYS = 14;
 
 /**
@@ -2232,20 +2252,22 @@ function meanFilmAxes(films: unknown[]): Partial<AxisVector> {
   return out;
 }
 
+/** Ce que l'historique des séances apprend, une fois relu. */
+interface SessionOutcomes {
+  verdicts: TraitVerdict[];
+  pending: PendingVerdict | null;
+  signals: SessionSignal[];
+}
+
 /**
  * Relit l'historique des séances : les verdicts déjà donnés, celui qu'on
  * pourrait encore demander, et ce que chaque séance laisse au trait.
  * @param {admin.firestore.QuerySnapshot} snap Historique récent.
- * @return {{verdicts: TraitVerdict[]; pending: PendingVerdict | null;
- *   signals: SessionSignal[]}} Lecture.
+ * @return {SessionOutcomes} Lecture.
  */
 function readSessionOutcomes(
     snap: admin.firestore.QuerySnapshot,
-): {
-  verdicts: TraitVerdict[];
-  pending: PendingVerdict | null;
-  signals: SessionSignal[];
-} {
+): SessionOutcomes {
   const verdicts: TraitVerdict[] = [];
   const signals: SessionSignal[] = [];
   let pending: PendingVerdict | null = null;
@@ -2278,8 +2300,8 @@ function readSessionOutcomes(
       record.at.toMillis() : 0;
     const verdict = doc.get('verdict');
 
-    if (typeof verdict === 'string' &&
-        (verdict === 'stayed' || verdict === 'passed' || verdict === 'unfinished')) {
+    if (verdict === 'stayed' || verdict === 'passed' ||
+        verdict === 'unfinished') {
       verdicts.push({
         axes: parseAxes(record.axes),
         verdict,
@@ -2598,12 +2620,14 @@ export const getTasteProfile = onRequest(
 );
 
 /**
- * Ce qu'une séance a donné, en deux temps : le film lancé, puis ce qu'il a laissé.
+ * Ce qu'une séance a donné, en deux temps : le film lancé, puis ce qu'il a
+ * laissé.
  *
- * C'est le seul endroit du système où l'on apprend quelque chose de l'expérience
- * réelle plutôt que d'une déclaration ou d'une intention. Tout le reste — les
- * charges du corpus, les coefficients du cadran, la force des sources — sera un
- * jour calibré sur ces deux signaux ; en attendant ils nourrissent déjà le trait.
+ * C'est le seul endroit du système où l'on apprend quelque chose de
+ * l'expérience réelle plutôt que d'une déclaration ou d'une intention. Tout le
+ * reste — les charges du corpus, les coefficients du cadran, la force des
+ * sources — sera un jour calibré sur ces deux signaux ; en attendant ils
+ * nourrissent déjà le trait.
  */
 export const recordSessionOutcome = onRequest(
     {invoker: 'public', timeoutSeconds: 20},
@@ -2686,7 +2710,8 @@ export const recordSessionOutcome = onRequest(
 
         if (body.kind === 'verdict') {
           const value = body.verdict;
-          if (value !== 'stayed' && value !== 'passed' && value !== 'unfinished') {
+          if (value !== 'stayed' && value !== 'passed' &&
+            value !== 'unfinished') {
             res.status(400).json({error: 'invalid_verdict'});
             return;
           }
@@ -2741,7 +2766,8 @@ export const setTasteCorrection = onRequest(
           await ref.set(
               {[axis]: admin.firestore.FieldValue.delete()}, {merge: true},
           );
-        } else if (typeof body.value === 'number' && Number.isFinite(body.value)) {
+        } else if (typeof body.value === 'number' &&
+          Number.isFinite(body.value)) {
           await ref.set(
               {[axis]: Math.max(-1, Math.min(1, body.value))}, {merge: true},
           );
@@ -2801,7 +2827,8 @@ export const getCandidatePool = onRequest(
         // porter l'information.
         const keep = (row: DiscoverRow): boolean =>
           !exclusionSet.has(row.id) &&
-          !(row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id)) &&
+          !(row.genre_ids ?? [])
+              .some((id) => declared.bannedGenreIDs.has(id)) &&
           matchesRequestedGenres(row.genre_ids, answers);
 
         let pool = filterByContentFormat(rawPool.filter(keep), answers);
@@ -2897,8 +2924,8 @@ export const enrichCandidates = onRequest(
         }
 
         // Les axes grossiers arrivent avec les candidats et servent de base au
-        // raffinage : c'est la seule façon de préserver la part « notoriété » de
-        // `fa`, calculée sur le vivier entier à l'étape précédente.
+        // raffinage : c'est la seule façon de préserver la part « notoriété »
+        // de `fa`, calculée sur le vivier entier à l'étape précédente.
         const coarseByID = new Map<number, AxisVector>();
         for (const raw of rawCandidates) {
           if (typeof raw !== 'object' || raw === null) continue;
@@ -2992,9 +3019,9 @@ export const finalizeRecommendations = onRequest(
               trailerKey:
                 typeof c.trailer_key === 'string' ? c.trailer_key : null,
               budget: typeof c.budget === 'number' ? c.budget : null,
-              // Les axes voyagent avec le candidat depuis leur calcul initial et
-              // restent attachés à lui : les filtres et tris qui suivent peuvent
-              // réordonner la shortlist sans jamais les désaligner.
+              // Les axes voyagent avec le candidat depuis leur calcul initial
+              // et restent attachés à lui : les filtres et tris qui suivent
+              // peuvent réordonner la shortlist sans jamais les désaligner.
               axes: parseAxes(c.axes),
               axisSigma: parseSigma(c.axis_sigma),
               finalScore: 0,
@@ -3039,8 +3066,8 @@ export const finalizeRecommendations = onRequest(
         }
 
         // Le scoring par proximité dans l'espace commun est la voie normale.
-        // L'ancienne formule pondérée reste le repli d'un client qui n'enverrait
-        // pas encore de croyance — elle n'a pas d'autre usage.
+        // L'ancienne formule pondérée reste le repli d'un client qui
+        // n'enverrait pas encore de croyance — elle n'a pas d'autre usage.
         const belief = parseBelief(body.belief);
         shortlist = shortlist
             .map((c) => ({
