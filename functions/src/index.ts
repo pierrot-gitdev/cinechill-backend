@@ -4831,12 +4831,58 @@ function countBy<T>(
 }
 
 /**
+ * Ce que raconte le détail d'un badge, dans chaque langue.
+ *
+ * Même parti que `GENRE_LABELS` et `REASON_LABELS` un peu plus haut, et pour la
+ * même raison : ces phrases se composent ici, à partir de chiffres que seul le
+ * serveur a en main, et sans second aller-retour. Elles suivent donc la langue
+ * de la requête, table par table.
+ *
+ * Le prix de ce choix est qu'elles échappent au catalogue de l'app. La solution
+ * plus fidèle à la règle serait de renvoyer les chiffres bruts et de composer
+ * côté client ; elle coûte un aller-retour de conception pour cinq phrases.
+ */
+const BADGE_DETAIL_LABELS: Record<string, {
+  missingDecades: (years: string) => string;
+  actionFilms: (genre: string) => string;
+  genresWithTen: (n: number) => string;
+  watchlistFloor: (peak: number) => string;
+  watchlistLeft: (n: number) => string;
+  bestCollection: (percent: number) => string;
+}> = {
+  'fr-FR': {
+    missingDecades: (years) => `Il vous manque les années ${years}.`,
+    actionFilms: (genre) => `Films d'${genre} dans votre galerie.`,
+    genresWithTen: (n) =>
+      `${n} genres comptent déjà au moins 10 films.`,
+    watchlistFloor: (peak) =>
+      `Votre watchlist doit d'abord atteindre 15 films (record : ${peak}).`,
+    watchlistLeft: (n) =>
+      `Il reste ${n} film${n > 1 ? 's' : ''} à voir.`,
+    bestCollection: (percent) =>
+      `Votre saga la plus avancée est complétée à ${percent} %.`,
+  },
+  'en-US': {
+    missingDecades: (years) => `You are missing the ${years}.`,
+    actionFilms: (genre) => `${genre} films in your gallery.`,
+    genresWithTen: (n) =>
+      `${n} genres already count at least 10 films.`,
+    watchlistFloor: (peak) =>
+      `Your watchlist has to reach 15 films first (best: ${peak}).`,
+    watchlistLeft: (n) =>
+      `${n} film${n > 1 ? 's' : ''} left to watch.`,
+    bestCollection: (percent) =>
+      `Your most advanced saga is ${percent}% complete.`,
+  },
+};
+
+/**
  * Applique les quinze règles.
  * @param {GalleryFact[]} facts Galerie normalisée.
  * @param {number} watchlistSize Taille actuelle de la watchlist.
  * @param {number} watchlistPeak Plus grande taille jamais atteinte.
  * @param {number} totalDecisions Nombre de cartes tranchées au swipe.
- * @param {Map<string, string>} genreNames Noms de genres, pour les détails.
+ * @param {string} language Langue de la requête en cours.
  * @return {BadgeState[]} État des quinze badges, sans les dates d'obtention.
  */
 function computeBadgeStates(
@@ -4844,8 +4890,11 @@ function computeBadgeStates(
     watchlistSize: number,
     watchlistPeak: number,
     totalDecisions: number,
-    genreNames: Map<string, string>,
+    language: string,
 ): BadgeState[] {
+  const say = BADGE_DETAIL_LABELS[language] ??
+    BADGE_DETAIL_LABELS[DEFAULT_LANGUAGE];
+  const genreNames = GENRE_LABELS[language] ?? GENRE_LABELS[DEFAULT_LANGUAGE];
   const size = facts.length;
 
   const decades = new Set<number>();
@@ -4905,7 +4954,7 @@ function computeBadgeStates(
     1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020,
   ].filter((d) => !decades.has(d));
 
-  const actionName = genreNames.get(String(GENRE_ACTION)) ?? 'action';
+  const actionName = genreNames[GENRE_ACTION] ?? 'Action';
 
   const rule = (
       id: string, current: number, target: number, detail: string | null = null,
@@ -4925,28 +4974,23 @@ function computeBadgeStates(
     rule('archaeologist', preSeventies, 25),
     rule('traveler', decades.size, 8,
       missingDecades.length > 0 && decades.size < 8 ?
-        `Il vous manque les années ` +
-          `${missingDecades.slice(0, 3).join(', ')}.` : null),
+        say.missingDecades(missingDecades.slice(0, 3).join(', ')) : null),
     rule('steel_heart', genreCounts.get(GENRE_ACTION) ?? 0, 75,
-        `Films d'${actionName.toLowerCase()} dans votre galerie.`),
+        say.actionFilms(actionName.toLowerCase())),
     rule('sleepless', genreCounts.get(27) ?? 0, 40),
-    rule('panoramic', genresWithTen, 8,
-        `${genresWithTen} genres comptent déjà au moins 10 films.`),
+    rule('panoramic', genresWithTen, 8, say.genresWithTen(genresWithTen)),
     rule('marathon', streak, 7),
     rule('ritual', streak, 60),
     rule('clean_list',
       watchlistPeak >= 15 && watchlistSize === 0 ? 1 : 0, 1,
       watchlistPeak < 15 ?
-        `Votre watchlist doit d'abord atteindre 15 films ` +
-          `(record : ${watchlistPeak}).` :
-        `Il reste ${watchlistSize} film${
-          watchlistSize > 1 ? 's' : ''} à voir.`),
+        say.watchlistFloor(watchlistPeak) :
+        say.watchlistLeft(watchlistSize)),
     rule('sorter', totalDecisions, 500),
     rule('signature', topDirector, 8),
     rule('integral', completedCollections > 0 ? 1 : 0, 1,
       bestCollectionRatio > 0 ?
-        `Votre saga la plus avancée est complétée à ` +
-          `${Math.round(bestCollectionRatio * 100)} %.` : null),
+        say.bestCollection(Math.round(bestCollectionRatio * 100)) : null),
     rule('night_owl', nightAdds, 15),
   ];
 }
@@ -4993,13 +5037,12 @@ export const evaluateBadges = onRequest(
             watchlistSnap.size,
         );
 
-        const genreNames = new Map<string, string>();
         const states = computeBadgeStates(
             toGalleryFacts(gallerySnap.docs),
             watchlistSnap.size,
             watchlistPeak,
             totalDecisions,
-            genreNames,
+            requestedLanguage(req, res),
         );
 
         const alreadyUnlocked = new Map<string, admin.firestore.Timestamp>();
