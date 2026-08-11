@@ -70,3 +70,7 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# APP_CHECK_MODE est un réglage de déploiement, pas un secret : il doit
+# voyager avec le dépôt, sans quoi un déploiement neuf repart sur autre chose.
+!functions/.env

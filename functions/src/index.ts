@@ -1,6 +1,6 @@
 import {setGlobalOptions} from 'firebase-functions/v2/options';
 import {onRequest, Request} from 'firebase-functions/v2/https';
-import {defineSecret} from 'firebase-functions/params';
+import {defineSecret, defineString} from 'firebase-functions/params';
 import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
 import * as admin from 'firebase-admin';
@@ -201,6 +201,68 @@ function sendTMDBError(
   return true;
 }
 
+/* ===================================================================== *
+ *  App Check : distinguer notre application d'un client fabriqué
+ * ===================================================================== */
+
+/**
+ * Le degré d'exigence sur l'attestation, réglable sans changer le code.
+ *
+ * Trois valeurs, et l'ordre dans lequel on les traverse est la seule façon
+ * sûre d'activer App Check sur une application déjà distribuée :
+ *
+ * - `off` : rien n'est vérifié.
+ * - `monitor` (défaut) : on vérifie et on journalise, mais on laisse passer.
+ *   C'est l'état dans lequel il faut déployer, puis observer les journaux
+ *   quelques jours.
+ * - `enforce` : un jeton absent ou invalide fait un 401.
+ *
+ * Le défaut est `monitor` et non `enforce` à dessein : un déploiement ne doit
+ * jamais pouvoir couper le service à des binaires déjà installés qui n'ont pas
+ * encore la version cliente capable d'attester.
+ */
+const appCheckMode = defineString('APP_CHECK_MODE', {default: 'monitor'});
+
+/**
+ * Vérifie l'attestation de l'application appelante.
+ *
+ * C'est la seule protection qui vaille pour les points d'entrée ouverts : ils
+ * n'ont pas d'utilisateur à authentifier, et leur URL est extractible du
+ * binaire. L'authentification Firebase ne les couvrirait pas davantage, un
+ * compte étant gratuit et illimité à créer.
+ * @param {Request} req Requête entrante.
+ * @param {Response} res Réponse, pour le refus en mode `enforce`.
+ * @return {Promise<boolean>} Faux quand la requête a déjà reçu son refus.
+ */
+async function passesAppCheck(
+    req: Request, res: Response,
+): Promise<boolean> {
+  const mode = appCheckMode.value();
+  if (mode === 'off') return true;
+
+  const token = req.header('X-Firebase-AppCheck') ?? '';
+  if (!token) {
+    if (mode !== 'enforce') {
+      logger.warn('app check: jeton absent', {path: req.path});
+      return true;
+    }
+    res.status(401).json({error: 'missing_app_check'});
+    return false;
+  }
+
+  try {
+    await getAdmin().appCheck().verifyToken(token);
+    return true;
+  } catch (error) {
+    if (mode !== 'enforce') {
+      logger.warn('app check: jeton refusé', {path: req.path, error});
+      return true;
+    }
+    res.status(401).json({error: 'invalid_app_check'});
+    return false;
+  }
+}
+
 export const getPopularMovies = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
@@ -209,6 +271,8 @@ export const getPopularMovies = onRequest(
           res.status(405).json({error: 'method_not_allowed'});
           return;
         }
+
+        if (!await passesAppCheck(req, res)) return;
 
         const page = parsePage(req.query.page);
         const genreID = parseOptionalInt(req.query.genreId);
@@ -265,6 +329,8 @@ export const getMovieDetails = onRequest(
           res.status(405).json({error: 'method_not_allowed'});
           return;
         }
+
+        if (!await passesAppCheck(req, res)) return;
 
         const idRaw = Number(req.query.id);
         if (!Number.isFinite(idRaw) || idRaw <= 0) {
@@ -395,8 +461,9 @@ export const getMovieGenres = onRequest(
           return;
         }
 
-        const data = await tmdbGET('/genre/movie/list', {
-        }, tmdb(req, res));
+        if (!await passesAppCheck(req, res)) return;
+
+        const data = await tmdbGET('/genre/movie/list', {}, tmdb(req, res));
 
         const genres = Array.isArray(data.genres) ? data.genres : [];
         res.status(200).json({genres});
@@ -418,6 +485,8 @@ export const getMovieProviders = onRequest(
           res.status(405).json({error: 'method_not_allowed'});
           return;
         }
+
+        if (!await passesAppCheck(req, res)) return;
 
         const watchRegion = String(req.query.watchRegion ?? DEFAULT_REGION);
         const data = await tmdbGET('/watch/providers/movie', {
@@ -465,23 +534,8 @@ export const setMediaStatus = onRequest(
           return;
         }
 
-        const authHeader = req.headers.authorization ?? '';
-        const token = authHeader.startsWith('Bearer ') ?
-          authHeader.slice(7) : '';
-        if (!token) {
-          res.status(401).json({error: 'missing_token'});
-          return;
-        }
-
-        let uid: string;
-        try {
-          const a = getAdmin();
-          const decoded = await a.auth().verifyIdToken(token);
-          uid = decoded.uid;
-        } catch {
-          res.status(401).json({error: 'invalid_token'});
-          return;
-        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
 
         const status = req.body?.status as MediaStatus | undefined;
         const item = req.body?.item as MediaItemPayload | undefined;
@@ -2310,11 +2364,18 @@ function softmaxPick<T extends {adjustedScore: number}>(items: T[]): T {
 /**
  * Verify the Firebase bearer token on a request, sending the appropriate
  * error response and returning null if it's missing/invalid.
+ *
+ * L'attestation de l'application est vérifiée d'abord, et au même endroit :
+ * c'est ce qui garantit qu'aucun point d'entrée authentifié ne peut l'oublier.
+ * Un compte Firebase étant gratuit et illimité à créer, le jeton utilisateur
+ * dit qui appelle, jamais depuis quoi.
  * @param {Request} req Incoming request.
  * @param {Response} res Response to write an error to on failure.
  * @return {Promise<string | null>} The authenticated uid, or null.
  */
 async function verifyAuth(req: Request, res: Response): Promise<string | null> {
+  if (!await passesAppCheck(req, res)) return null;
+
   const authHeader = req.headers.authorization ?? '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
   if (!token) {
@@ -5057,6 +5118,11 @@ export const handleAvailable = onRequest(
           res.status(405).json({error: 'method_not_allowed'});
           return;
         }
+
+        // Le seul point d'entrée qui ne peut pas être authentifié : il est
+        // appelé pendant la saisie, avant que le compte n'existe. C'est donc
+        // l'attestation seule qui le protège de l'énumération de pseudos.
+        if (!await passesAppCheck(req, res)) return;
 
         const raw = req.query.handle;
         if (typeof raw !== 'string') {
