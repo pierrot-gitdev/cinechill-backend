@@ -86,15 +86,20 @@ service cloud.firestore {
     // followUser/unfollowUser, galleryCount par evaluateBadges à chaque
     // ouverture de l'app ; les exclure ici est ce qui les rend dignes de
     // confiance à l'affichage, sans document séparé à synchroniser.
+    //
+    // La création est fermée, et c'est elle qui garantit l'unicité des pseudos.
+    // Aucune règle déclarative ne peut vérifier qu'un pseudo est libre : il
+    // faut lire `usernames/{handle}` et y écrire dans le même souffle, ce que
+    // seule une transaction sait faire. claimHandle la tient, côté serveur, via
+    // l'Admin SDK qui ignore ces règles. Laisser le client créer ce document
+    // ouvrirait un second chemin vers la même donnée, celui-là sans registre :
+    // deux comptes pourraient porter le même pseudo, ou reprendre celui d'un
+    // autre. L'app ne l'empruntait pas — SocialStore ne fait que compléter un
+    // document déjà créé par claimHandle.
     // -----------------------------------------------------------------
     match /publicProfiles/{uid} {
       allow read: if isSignedIn();
-      allow create: if isOwner(uid)
-        && request.resource.data.keys().hasOnly([
-             'handle', 'handleNormalized', 'displayName', 'displayNameNormalized',
-             'avatarURL', 'badgeSignature',
-           ])
-        && request.resource.data.handleNormalized == request.resource.data.handleNormalized.lower();
+      allow create: if false;
       // displayNameNormalized est écrit par le client en même temps que
       // displayName (voir SocialStore.syncDisplayName) : c'est ce qui
       // permet à la recherche de trouver un profil par prénom/nom, pas
