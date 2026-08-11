@@ -4675,19 +4675,18 @@ export const getHomeRows = onRequest(
                 .catch(() => [] as DiscoverRow[]),
         ]);
 
-        // Le classement par correspondance est ce qui distingue « au cinéma »
-        // de « pour vous au cinéma ». La popularité ne sert qu'à départager :
-        // en tête de tri elle ramènerait les mêmes blockbusters en permanence.
-        const rankedTheaters = [...theaters].sort((left, right) => {
-          const leftScore =
-            tasteMatch({...left, source: 'profile', score: 0}, profile);
-          const rightScore =
-            tasteMatch({...right, source: 'profile', score: 0}, profile);
-          if (Math.abs(leftScore - rightScore) > 0.02) {
-            return rightScore - leftScore;
-          }
-          return (right.popularity ?? 0) - (left.popularity ?? 0);
-        });
+        // Popularité décroissante, et rien d'autre. La rangée a d'abord classé
+        // par correspondance avec les goûts, la popularité ne servant qu'à
+        // départager ; l'ordre obtenu était juste mais illisible, puisque rien
+        // à l'écran n'explique pourquoi tel film passe devant tel autre. « Au
+        // cinéma en ce moment » énonce un fait, pas une recommandation : on
+        // range donc par ce que le titre laisse attendre.
+        //
+        // Les deux pages viennent déjà de TMDB en `popularity.desc`, mais on
+        // retrie explicitement : leur concaténation n'est ordonnée que tant que
+        // les pages arrivent dans l'ordre, ce que `allSettled` ne promet pas.
+        const rankedTheaters = [...theaters].sort(
+            (left, right) => (right.popularity ?? 0) - (left.popularity ?? 0));
 
         const noExclusion = new Set<number>();
         const seededExclusion = seedId === null ?
