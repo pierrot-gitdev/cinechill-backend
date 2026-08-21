@@ -649,7 +649,7 @@ interface MediaItemPayload {
 }
 
 export const setMediaStatus = onRequest(
-    {invoker: 'public'},
+    {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
       try {
         if (req.method !== 'POST') {
@@ -678,6 +678,14 @@ export const setMediaStatus = onRequest(
         const watchlistRef = userRef.collection('watchlist').doc(item.id);
         const galleryRef = userRef.collection('gallery').doc(item.id);
 
+        // L'écriture remplace le document : on relit d'abord ce que la
+        // Galerie sait déjà (coup de cœur, pays d'origine enrichi) pour ne
+        // pas l'effacer quand le film reste vu.
+        const previousSnap = status === 'seen' ?
+          await galleryRef.get() : null;
+        const previousLovedAt = previousSnap?.get('lovedAt');
+        const previousOrigin = previousSnap?.get('originCountry');
+
         const batch = db.batch();
         batch.delete(watchlistRef);
         batch.delete(galleryRef);
@@ -700,15 +708,99 @@ export const setMediaStatus = onRequest(
         };
 
         if (status === 'toWatch') {
+          // Le coup de cœur ne suit pas : il ne vit que sur un film de la
+          // Galerie, et « à voir » contredit « vu et adoré ». Choix assumé,
+          // le même que dans recordSwipes.
           batch.set(watchlistRef, data);
         } else if (status === 'seen') {
-          batch.set(galleryRef, data);
+          batch.set(galleryRef, {
+            ...data,
+            ...(previousLovedAt instanceof a.firestore.Timestamp ?
+              {lovedAt: previousLovedAt} : {}),
+            ...(Array.isArray(previousOrigin) ?
+              {originCountry: previousOrigin} : {}),
+          });
         }
 
         await batch.commit();
+
+        // C1 — le film qui vient d'entrer en galerie reçoit sa position tout
+        // de suite, via le cache global : une fiche TMDB au plus, souvent
+        // aucune quand un autre utilisateur l'a déjà payée.
+        if (status === 'seen') {
+          try {
+            const snap = await galleryRef.get();
+            if (snap.exists && snap.get('axesV') !== AXES_VERSION) {
+              await positionGalleryDocs([snap], tmdb(req, res), db);
+            }
+          } catch (error) {
+            logger.warn('setMediaStatus: positioning failed', {error});
+          }
+        }
+
         res.status(200).json({ok: true});
       } catch (error) {
         logger.error('setMediaStatus failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Pose ou retire un coup de cœur sur un film de la Galerie.
+ *
+ * Le cœur est binaire, jamais une note : l'app a déjà refusé deux fois
+ * l'échelle d'étoiles, et ce point d'entrée n'en rouvre pas la porte. Il
+ * n'opère que sur un film déjà vu — aimer un film qu'on n'a pas dans sa
+ * Galerie n'a pas de sens pour le profil, et le client n'a d'ailleurs aucun
+ * chemin pour le demander.
+ */
+export const setGalleryLove = onRequest(
+    {invoker: 'public', timeoutSeconds: 20},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const itemId = typeof body.itemId === 'string' ? body.itemId : '';
+        const loved = body.loved;
+        if (!itemId || typeof loved !== 'boolean') {
+          res.status(400).json({error: 'invalid_request'});
+          return;
+        }
+
+        const a = getAdmin();
+        const galleryRef = a.firestore()
+            .collection('users').doc(uid)
+            .collection('gallery').doc(itemId);
+        const snap = await galleryRef.get();
+        if (!snap.exists) {
+          res.status(404).json({error: 'not_in_gallery'});
+          return;
+        }
+
+        if (loved) {
+          // Re-poser un cœur déjà posé ne rajeunit pas le signal : la date
+          // d'origine reste, c'est elle que la demi-vie du trait regarde.
+          if (!(snap.get('lovedAt') instanceof a.firestore.Timestamp)) {
+            await galleryRef.set(
+                {lovedAt: a.firestore.Timestamp.now()}, {merge: true},
+            );
+          }
+        } else {
+          await galleryRef.set(
+              {lovedAt: a.firestore.FieldValue.delete()}, {merge: true},
+          );
+        }
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('setGalleryLove failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
@@ -813,11 +905,41 @@ const REASON_LABELS: Record<string, Record<string, string>> = {
     short: '< 1h35',
     long: '2h +',
     wellRated: 'Bien noté',
-    onYourPlatform: 'Disponible sur votre plateforme',
+    onYourPlatform: 'Disponible sur ta plateforme',
     fallback: 'Sélection CinéMatch',
     otherGenres: 'Autres',
   },
 };
+
+/**
+ * Les raisons « promesse tenue » (C5) : la croyance du soir croisée avec la
+ * position réelle du film, dite en une phrase. Par axe, la phrase du pôle
+ * négatif puis celle du pôle positif — on ne parle que d'un axe que la
+ * personne a réellement pesé, et que le film honore.
+ */
+const REASON_PROMISE:
+  Record<string, Partial<Record<string, [string, string]>>> = {
+    'fr-FR': {
+      ch: ['Rien de lourd, comme demandé', 'Un film qui pèse, comme demandé'],
+      ry: ['Un rythme posé, comme demandé', 'Du rythme, comme demandé'],
+      fa: ['Une valeur sûre', 'Une vraie découverte, comme demandé'],
+      de: ['Il se laisse suivre', 'Exigeant, comme demandé'],
+      an: ['Ancré dans le réel, comme demandé', 'Un vrai ailleurs'],
+      to: ['Un ton qui ne fait pas de cadeau', 'Chaleureux, comme demandé'],
+      ec: ['Une histoire à hauteur de gens', 'Du grand spectacle'],
+      in: ['Court, comme demandé', 'Long format, comme demandé'],
+    },
+    'en-US': {
+      ch: ['Nothing heavy, as asked', 'A film that weighs, as asked'],
+      ry: ['A steady pace, as asked', 'Fast-paced, as asked'],
+      fa: ['A safe bet', 'A real discovery, as asked'],
+      de: ['Easy to follow', 'Demanding, as asked'],
+      an: ['Grounded in the real, as asked', 'A true elsewhere'],
+      to: ['A tone that pulls no punches', 'Warm, as asked'],
+      ec: ['A story at eye level', 'Grand spectacle'],
+      in: ['Short, as asked', 'Long format, as asked'],
+    },
+  };
 
 const GENRE_HORROR = 27;
 const GENRE_DRAMA = 18;
@@ -833,6 +955,40 @@ const RESULT_COUNT = 3;
 const SOFTMAX_TEMPERATURE = 9;
 const HISTORY_WINDOW_DAYS = 30;
 const HISTORY_RUNS_CONSIDERED = 5;
+
+/**
+ * Les plafonds de durée du cadre (V3·0), en minutes. Le budget temps est une
+ * contrainte du réel — le four, le train de 7 h — pas une préférence à
+ * pondérer : « 1h30 » cochée, aucun film de 2 h dans la sélection. L'axe
+ * Durée du trait continue, lui, de porter le *goût* des formats longs — les
+ * deux ne se confondent plus.
+ */
+const RUNTIME_CAPS: Record<string, number> = {short: 100, medium: 140};
+
+/**
+ * Le plafond de durée du soir, ou null quand la soirée est longue.
+ * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
+ * @return {number | null} Plafond en minutes.
+ */
+function runtimeCapFor(answers: QuestionnaireAnswersPayload): number | null {
+  return RUNTIME_CAPS[answers.runtime] ?? null;
+}
+
+/** Graines personnelles du vivier (C3) : têtes du graphe interrogées. */
+const POOL_SEED_COUNT = 10;
+/** Candidats retenus par graine — le voisinage proche, pas la page entière. */
+const POOL_SEED_TAKE = 12;
+/** L'avantage d'un film de la watchlist au score final (C4), sur 100. Assez
+ * pour gagner les égalités, pas assez pour imposer un film qui ne colle pas
+ * à l'ambiance. */
+const WATCHLIST_BONUS = 6;
+/** Si un film de la liste arrive à moins de cet écart du n°1, il prend la
+ * première place : « si l'algo se rapproche d'un film de ta liste, c'est lui
+ * qu'on te propose ». */
+const WATCHLIST_PRIORITY_GAP = 4;
+/** Un seul film de la liste par soirée : CinéMatch doit rester le lieu où
+ * l'on découvre aussi — l'onglet Watchlist a déjà son « choix du soir ». */
+const WATCHLIST_CAP_PER_NIGHT = 1;
 
 interface QuestionnaireAnswersPayload {
   contentFormat: string;
@@ -1141,6 +1297,15 @@ function baseDiscoverParams(
     query['with_runtime.lte'] = '110';
   }
 
+  // Le budget temps du cadre (V3·0) : un filtre dur, dès la requête. La
+  // garantie finale se joue à la finalisation, sur la durée réelle — ici on
+  // évite simplement de remplir le vivier de films qu'on devra jeter.
+  const cap = runtimeCapFor(answers);
+  if (cap !== null) {
+    const existing = Number(query['with_runtime.lte'] ?? Infinity);
+    query['with_runtime.lte'] = String(Math.min(cap, existing));
+  }
+
   if (!relax.platforms && answers.platformIds.length > 0) {
     query.watch_region = answers.watchRegion ?? 'FR';
     query.with_watch_providers = answers.platformIds.join('|');
@@ -1223,18 +1388,32 @@ async function fetchCandidatePool(
   return Array.from(byId.values());
 }
 
+/** Ce que la bibliothèque apporte au vivier d'une séance. */
+interface PoolLibrary {
+  /** Films à exclure : la galerie (déjà vus) et les séances récentes. La
+   * watchlist n'y figure plus (C4) — un film mis de côté est une intention,
+   * pas une interdiction de séjour. */
+  excluded: Set<number>;
+  /** Les films de la watchlist, prêts à entrer dans le vivier. */
+  watchlistRows: DiscoverRow[];
+  /** Films aimés (coup de cœur), du plus récent au plus ancien — les graines
+   * de repli quand le graphe de duels est encore vide. */
+  lovedSeeds: number[];
+  /** Titres connus, par tmdbId — pour nommer les graines (C5). */
+  titles: Map<number, string>;
+}
+
 /**
- * Fetch the ids of movies to exclude because the user already marked them
- * seen/to-watch, or because they were already shown in a recent CinéMatch
- * run — the anti-repetition mechanism described in the spec.
+ * Lit la bibliothèque pour composer le vivier : les exclusions, la watchlist
+ * candidate et les graines personnelles.
  * @param {admin.firestore.Firestore} db Firestore instance.
  * @param {string} uid Authenticated user id.
- * @return {Promise<Set<number>>} TMDB ids to exclude from the pool.
+ * @return {Promise<PoolLibrary>} La bibliothèque, prête pour le vivier.
  */
-async function fetchExclusionSet(
+async function fetchLibraryForPool(
     db: admin.firestore.Firestore,
     uid: string,
-): Promise<Set<number>> {
+): Promise<PoolLibrary> {
   const userRef = db.collection('users').doc(uid);
   const cutoff = admin.firestore.Timestamp.fromMillis(
       Date.now() - HISTORY_WINDOW_DAYS * 24 * 3600 * 1000,
@@ -1251,13 +1430,18 @@ async function fetchExclusionSet(
   ]);
 
   const excluded = new Set<number>();
-  for (const doc of watchlistSnap.docs) {
-    const id = doc.get('tmdbId');
-    if (typeof id === 'number') excluded.add(id);
-  }
+  const titles = new Map<number, string>();
+  const loved: {tmdbId: number; at: number}[] = [];
   for (const doc of gallerySnap.docs) {
     const id = doc.get('tmdbId');
-    if (typeof id === 'number') excluded.add(id);
+    if (typeof id !== 'number') continue;
+    excluded.add(id);
+    const title = doc.get('title');
+    if (typeof title === 'string') titles.set(id, title);
+    const lovedAt = doc.get('lovedAt');
+    if (lovedAt instanceof admin.firestore.Timestamp) {
+      loved.push({tmdbId: id, at: lovedAt.toMillis()});
+    }
   }
   for (const doc of historySnap.docs) {
     const ids = doc.get('tmdbIds');
@@ -1265,7 +1449,41 @@ async function fetchExclusionSet(
       for (const id of ids) if (typeof id === 'number') excluded.add(id);
     }
   }
-  return excluded;
+
+  const watchlistRows: DiscoverRow[] = [];
+  for (const doc of watchlistSnap.docs) {
+    const id = doc.get('tmdbId');
+    if (typeof id !== 'number') continue;
+    const title = doc.get('title');
+    if (typeof title === 'string') titles.set(id, title);
+    const originCountry = doc.get('originCountry');
+    watchlistRows.push({
+      id,
+      title: typeof title === 'string' ? title : undefined,
+      overview: typeof doc.get('overview') === 'string' ?
+        doc.get('overview') as string : null,
+      poster_path: typeof doc.get('posterPath') === 'string' ?
+        doc.get('posterPath') as string : null,
+      vote_average: typeof doc.get('voteAverage') === 'number' ?
+        doc.get('voteAverage') as number : null,
+      vote_count: typeof doc.get('voteCount') === 'number' ?
+        doc.get('voteCount') as number : null,
+      popularity: null,
+      genre_ids: Array.isArray(doc.get('genreIds')) ?
+        doc.get('genreIds') as number[] : [],
+      release_date: typeof doc.get('releaseDate') === 'string' ?
+        doc.get('releaseDate') as string : null,
+      origin_country: Array.isArray(originCountry) ?
+        originCountry as string[] : [],
+    });
+  }
+
+  return {
+    excluded,
+    watchlistRows,
+    lovedSeeds: loved.sort((a, b) => b.at - a.at).map((entry) => entry.tmdbId),
+    titles,
+  };
 }
 
 /**
@@ -1595,39 +1813,373 @@ const ENRICHED_SIGMA: Partial<AxisVector> = {
 };
 
 /**
- * Lexique de ton, appliqué aux **noms** de mots-clés que TMDB renvoie.
+ * Version du positionnement gratuit (C1). Incrémentée à chaque évolution du
+ * lexique ou des tables de paires : les caches `filmAxes` et les documents de
+ * galerie qui portent une version antérieure sont recalculés au passage.
+ */
+const AXES_VERSION = 1;
+
+/**
+ * Le lexique multi-axes (C1), appliqué aux **noms** de mots-clés que TMDB
+ * renvoie.
  *
  * On travaille sur les libellés et non sur des identifiants : les identifiants
  * de mots-clés TMDB existent, mais les inventer de mémoire produirait des
  * tables fausses et silencieusement inefficaces. Les noms, eux, arrivent dans
  * la réponse et se lisent tels quels.
  *
- * Couverture inégale et assumée — beaucoup de films n'ont aucun de ces
- * mots-clés. C'est pourquoi l'incertitude du ton ne se resserre que lorsqu'un
- * mot est effectivement reconnu : sans correspondance, on en reste à ce que
- * disent les genres, c'est-à-dire pas grand-chose.
+ * L'ancien lexique n'exploitait que 22 mots, sur le seul ton. Celui-ci couvre
+ * les mots-clés les plus fréquents du catalogue utile et parle sur tous les
+ * axes qu'un mot peut honnêtement renseigner — « based on novel » dit
+ * l'ancrage, « space opera » l'ampleur, « slow burn » le rythme. Couverture
+ * inégale et assumée : beaucoup de films n'ont aucun de ces mots, et
+ * l'incertitude d'un axe ne se resserre que lorsqu'un mot y a effectivement
+ * répondu.
+ *
+ * Sens des axes : ch léger→éprouvant · ry contemplatif→haletant ·
+ * fa connu→confidentiel · de limpide→exigeant · an réel→imaginaire ·
+ * to distancié→chaleureux · ec intime→épique.
  */
-const TONE_KEYWORDS: Record<string, number> = {
-  'feel good': 0.9, 'friendship': 0.6, 'family relationships': 0.6,
-  'coming of age': 0.5, 'love': 0.5, 'hope': 0.7, 'christmas': 0.6,
-  'redemption': 0.5, 'heartwarming': 0.9, 'tenderness': 0.8,
-  'nihilism': -0.9, 'cynicism': -0.8, 'black comedy': -0.6, 'satire': -0.5,
-  'dystopia': -0.6, 'brutality': -0.8, 'revenge': -0.6, 'bleak': -0.8,
-  'cruelty': -0.9, 'despair': -0.8, 'paranoia': -0.6, 'betrayal': -0.5,
-};
+const KEYWORD_AXIS_WEIGHTS:
+  Record<string, Partial<Record<AxisKey, number>>> = {
+    // ----- D'où vient l'histoire : l'ancrage avant tout.
+    'based on novel or book': {an: -0.4, de: 0.25},
+    'based on true story': {an: -0.85, ch: 0.3},
+    'based on a true story': {an: -0.85, ch: 0.3},
+    'based on real events': {an: -0.8, ch: 0.3},
+    'biography': {an: -0.85, de: 0.2, ry: -0.3},
+    'based on comic': {an: 0.6, ec: 0.5, ch: -0.25, ry: 0.4},
+    'based on comic book': {an: 0.6, ec: 0.5, ch: -0.25, ry: 0.4},
+    'based on video game': {an: 0.65, ry: 0.5, de: -0.4},
+    'based on manga': {an: 0.55, ry: 0.3},
+    'based on play or musical': {an: -0.3, de: 0.3, ec: -0.4},
+    'based on fairy tale': {an: 0.7, to: 0.4, ch: -0.3},
+    'remake': {fa: -0.3},
+    'sequel': {fa: -0.4},
+    'superhero': {an: 0.7, ec: 0.7, ch: -0.3, ry: 0.5},
+    'historical fiction': {an: -0.55, de: 0.2},
+    'docudrama': {an: -0.8, de: 0.3},
+    // ----- La charge : ce que la soirée pèsera.
+    'holocaust': {ch: 0.95, an: -0.8, to: -0.6},
+    'world war ii': {ch: 0.6, an: -0.6, ec: 0.4},
+    'world war i': {ch: 0.65, an: -0.6, ec: 0.4},
+    'war crimes': {ch: 0.9, to: -0.7},
+    'genocide': {ch: 0.95, to: -0.8},
+    'terminal illness': {ch: 0.8, to: 0.1, ry: -0.4},
+    'cancer': {ch: 0.75, ry: -0.4},
+    'grief': {ch: 0.7, ry: -0.4, to: 0.1},
+    'mourning': {ch: 0.7, ry: -0.4},
+    'suicide': {ch: 0.85, to: -0.5},
+    'depression': {ch: 0.75, ry: -0.5, to: -0.3},
+    'drug addiction': {ch: 0.75, to: -0.4},
+    'addiction': {ch: 0.7, to: -0.3},
+    'domestic violence': {ch: 0.8, to: -0.6},
+    'child abuse': {ch: 0.9, to: -0.7},
+    'sexual abuse': {ch: 0.9, to: -0.7},
+    'rape': {ch: 0.9, to: -0.7},
+    'kidnapping': {ch: 0.5, ry: 0.4},
+    'hostage': {ch: 0.45, ry: 0.5},
+    'poverty': {ch: 0.6, an: -0.6, ec: -0.4},
+    'homelessness': {ch: 0.65, an: -0.7, ec: -0.5},
+    'racism': {ch: 0.65, an: -0.6, de: 0.3},
+    'slavery': {ch: 0.8, an: -0.7},
+    'prison': {ch: 0.5, ec: -0.3},
+    'death': {ch: 0.5},
+    'death of mother': {ch: 0.65, to: 0.1},
+    'tragedy': {ch: 0.7},
+    'melancholy': {ch: 0.5, ry: -0.5, to: -0.1},
+    'torture': {ch: 0.85, to: -0.8},
+    'serial killer': {ch: 0.6, to: -0.6, ry: 0.2},
+    'murder': {ch: 0.4, to: -0.3},
+    'gore': {ch: 0.6, to: -0.6, ry: 0.3},
+    'violence': {ch: 0.5, to: -0.4},
+    'brutality': {ch: 0.7, to: -0.8},
+    'cruelty': {ch: 0.7, to: -0.9},
+    'feel good': {ch: -0.7, to: 0.9},
+    'parody': {ch: -0.7, to: 0.3, de: -0.4},
+    'spoof': {ch: -0.7, de: -0.5},
+    'slapstick comedy': {ch: -0.8, de: -0.6, to: 0.4},
+    'romantic comedy': {ch: -0.6, to: 0.6},
+    'buddy comedy': {ch: -0.6, to: 0.5},
+    'wedding': {ch: -0.4, to: 0.5},
+    'christmas': {ch: -0.5, to: 0.7},
+    'summer': {ch: -0.4, to: 0.4},
+    'vacation': {ch: -0.5, to: 0.4},
+    // ----- Le rythme : ce que le montage impose.
+    'slow burn': {ry: -0.8, de: 0.4},
+    'slow cinema': {ry: -0.95, de: 0.6, fa: 0.4},
+    'contemplative': {ry: -0.8, de: 0.4},
+    'road trip': {ry: 0.1, to: 0.3, ec: 0.2},
+    'road movie': {ry: -0.2, to: 0.2, ec: 0.2},
+    'car chase': {ry: 0.8, ch: -0.2},
+    'chase': {ry: 0.7},
+    'heist': {ry: 0.6, de: 0.2, ch: -0.2, to: 0.2},
+    'one man army': {ry: 0.8, ec: 0.4, de: -0.5},
+    'martial arts': {ry: 0.8, ec: 0.2},
+    'kung fu': {ry: 0.8, ec: 0.2},
+    'explosion': {ry: 0.7, ec: 0.5},
+    'shootout': {ry: 0.7},
+    'survival': {ry: 0.5, ch: 0.4},
+    'race against time': {ry: 0.8},
+    'action hero': {ry: 0.7, ec: 0.4, de: -0.4},
+    'meditation': {ry: -0.7, de: 0.3},
+    'long take': {ry: -0.5, de: 0.4, fa: 0.3},
+    // ----- La densité : l'attention qu'il faudra fournir.
+    'nonlinear timeline': {de: 0.7, ry: -0.2},
+    'time loop': {de: 0.5, an: 0.5},
+    'time travel': {de: 0.4, an: 0.7},
+    'plot twist': {de: 0.4, ry: 0.2},
+    'twist ending': {de: 0.4},
+    'unreliable narrator': {de: 0.7},
+    'ambiguous ending': {de: 0.6, fa: 0.2},
+    'open ending': {de: 0.5},
+    'philosophy': {de: 0.8, ry: -0.5},
+    'philosophical': {de: 0.8, ry: -0.5},
+    'existentialism': {de: 0.8, ry: -0.5, ch: 0.4},
+    'surrealism': {de: 0.8, an: 0.8, fa: 0.4},
+    'psychological thriller': {de: 0.5, ch: 0.4, ry: 0.1},
+    'psychological': {de: 0.5, ch: 0.3},
+    'mindfuck': {de: 0.8},
+    'political thriller': {de: 0.5, an: -0.4},
+    'politics': {de: 0.5, an: -0.5},
+    'courtroom drama': {de: 0.4, an: -0.5, ry: -0.4, ec: -0.5},
+    'investigation': {de: 0.4, ry: 0},
+    'conspiracy': {de: 0.4, ry: 0.2},
+    'espionage': {de: 0.3, ry: 0.4, ec: 0.3},
+    'spy': {de: 0.2, ry: 0.5, ec: 0.3},
+    'whodunit': {de: 0.4, ry: -0.1},
+    'satire': {de: 0.4, to: -0.5, ch: -0.2},
+    'social commentary': {de: 0.5, an: -0.5},
+    'allegory': {de: 0.7, an: 0.3},
+    'arthouse': {de: 0.7, ry: -0.6, fa: 0.6},
+    'experimental': {de: 0.8, fa: 0.7, ry: -0.4},
+    'voice over narration': {de: 0.2},
+    // ----- L'ancrage : le monde du film.
+    'dystopia': {an: 0.7, ch: 0.4, to: -0.5},
+    'post-apocalyptic future': {an: 0.7, ch: 0.4, ec: 0.4},
+    'post-apocalyptic': {an: 0.7, ch: 0.4, ec: 0.4},
+    'apocalypse': {an: 0.6, ec: 0.6, ch: 0.3},
+    'alien': {an: 0.8, ec: 0.4},
+    'alien invasion': {an: 0.8, ec: 0.7, ry: 0.5},
+    'extraterrestrial': {an: 0.8, ec: 0.4},
+    'space': {an: 0.7, ec: 0.7},
+    'space opera': {an: 0.85, ec: 0.9, ry: 0.4},
+    'spaceship': {an: 0.8, ec: 0.6},
+    'space travel': {an: 0.8, ec: 0.7},
+    'artificial intelligence': {an: 0.6, de: 0.4},
+    'artificial intelligence (a.i.)': {an: 0.6, de: 0.4},
+    'robot': {an: 0.7, ec: 0.3},
+    'cyborg': {an: 0.7, ec: 0.3, ry: 0.4},
+    'android': {an: 0.7, de: 0.3},
+    'virtual reality': {an: 0.7, de: 0.4},
+    'cyberpunk': {an: 0.75, de: 0.4, to: -0.4},
+    'magic': {an: 0.8, to: 0.3},
+    'sword and sorcery': {an: 0.85, ec: 0.6},
+    'wizard': {an: 0.85, to: 0.2},
+    'dragon': {an: 0.85, ec: 0.6},
+    'fairy tale': {an: 0.75, to: 0.4, ch: -0.3},
+    'ghost': {an: 0.65, ch: 0.3},
+    'haunted house': {an: 0.6, ch: 0.4, ec: -0.4},
+    'haunting': {an: 0.6, ch: 0.4},
+    'vampire': {an: 0.7, ch: 0.2},
+    'zombie': {an: 0.7, ry: 0.5, ch: 0.3},
+    'werewolf': {an: 0.7, ch: 0.2},
+    'monster': {an: 0.7, ec: 0.3, ch: 0.2},
+    'demon': {an: 0.7, ch: 0.4, to: -0.4},
+    'demonic possession': {an: 0.65, ch: 0.5, to: -0.5},
+    'exorcism': {an: 0.6, ch: 0.5},
+    'supernatural': {an: 0.7, ch: 0.2},
+    'supernatural horror': {an: 0.7, ch: 0.4, to: -0.4},
+    'mythology': {an: 0.7, ec: 0.5, de: 0.2},
+    'superpowers': {an: 0.7, ec: 0.5, ch: -0.2},
+    'parallel world': {an: 0.8, de: 0.4},
+    'multiverse': {an: 0.8, de: 0.4, ec: 0.6},
+    'small town': {an: -0.4, ec: -0.5},
+    'working class': {an: -0.7, ec: -0.5, ch: 0.3},
+    'journalism': {an: -0.6, de: 0.4, ry: -0.2},
+    'sports': {an: -0.5, to: 0.3, ry: 0.3},
+    'boxing': {an: -0.5, ry: 0.4, ch: 0.3},
+    'cooking': {an: -0.5, to: 0.5, ry: -0.3, ec: -0.5},
+    'immigration': {an: -0.7, ch: 0.5, ec: -0.3},
+    'french new wave': {an: -0.5, fa: 0.6, de: 0.5, ry: -0.5},
+    // ----- Le ton : la température.
+    'friendship': {to: 0.6, ch: -0.2},
+    'family relationships': {to: 0.5},
+    'family': {to: 0.5, ch: -0.3},
+    'father son relationship': {to: 0.4, ch: 0.2},
+    'mother daughter relationship': {to: 0.4, ch: 0.2},
+    'coming of age': {to: 0.5, ch: 0, ec: -0.5},
+    'love': {to: 0.5},
+    'falling in love': {to: 0.6, ch: -0.3},
+    'love triangle': {to: 0.2, ch: 0.1},
+    'first love': {to: 0.6, ec: -0.5},
+    'forbidden love': {to: 0.3, ch: 0.3},
+    'hope': {to: 0.7, ch: -0.2},
+    'hopeful': {to: 0.7, ch: -0.3},
+    'redemption': {to: 0.5, ch: 0.3},
+    'heartwarming': {to: 0.9, ch: -0.5},
+    'tenderness': {to: 0.8, ch: -0.2, ry: -0.4},
+    'kindness': {to: 0.8, ch: -0.3},
+    'nostalgia': {to: 0.5, ry: -0.3},
+    'nostalgic': {to: 0.5, ry: -0.3},
+    'found family': {to: 0.7, ch: -0.2},
+    'dog': {to: 0.6, ch: -0.3},
+    'friendship between men': {to: 0.5},
+    'friendship between women': {to: 0.5},
+    'nihilism': {to: -0.9, ch: 0.5, de: 0.5},
+    'cynicism': {to: -0.8, de: 0.3},
+    'black comedy': {to: -0.6, ch: -0.1, de: 0.3},
+    'dark comedy': {to: -0.6, ch: -0.1, de: 0.3},
+    'revenge': {to: -0.6, ry: 0.4, ch: 0.3},
+    'bleak': {to: -0.8, ch: 0.6, ry: -0.4},
+    'despair': {to: -0.6, ch: 0.7},
+    'paranoia': {to: -0.6, ch: 0.4, de: 0.3},
+    'betrayal': {to: -0.5, ch: 0.3},
+    'corruption': {to: -0.5, an: -0.5, de: 0.3},
+    'loneliness': {to: -0.2, ch: 0.5, ec: -0.6, ry: -0.4},
+    'isolation': {to: -0.3, ch: 0.5, ec: -0.6},
+    'obsession': {to: -0.4, ch: 0.4, de: 0.3},
+    'jealousy': {to: -0.4, ch: 0.3},
+    'greed': {to: -0.5, ch: 0.3},
+    'organized crime': {to: -0.5, ch: 0.4, an: -0.3},
+    'mafia': {to: -0.5, ch: 0.4, an: -0.4},
+    'gangster': {to: -0.5, ch: 0.3, an: -0.3},
+    'drug cartel': {to: -0.6, ch: 0.5, an: -0.4},
+    'hitman': {to: -0.4, ry: 0.5},
+    // ----- L'ampleur : la taille du monde à l'écran.
+    'epic': {ec: 0.9, ch: 0.2},
+    'battle': {ec: 0.7, ry: 0.6},
+    'army': {ec: 0.6},
+    'kingdom': {ec: 0.6, an: 0.5},
+    'empire': {ec: 0.7},
+    'disaster': {ec: 0.8, ry: 0.6, ch: 0.3},
+    'natural disaster': {ec: 0.8, ry: 0.6},
+    'earthquake': {ec: 0.7, ry: 0.6},
+    'pandemic': {ec: 0.6, ch: 0.5, an: -0.2},
+    'heist crew': {ec: 0.2, ry: 0.5},
+    'one location': {ec: -0.8, de: 0.3},
+    'single location': {ec: -0.8, de: 0.3},
+    'chamber drama': {ec: -0.85, ry: -0.5, de: 0.4},
+    'two person': {ec: -0.8, ry: -0.4},
+    'dinner party': {ec: -0.7, ry: -0.4},
+    'intimate': {ec: -0.7, ry: -0.4, to: 0.3},
+    'character study': {ec: -0.75, de: 0.4, ry: -0.5},
+    'monologue': {ec: -0.7, de: 0.4, ry: -0.6},
+    'minimalist': {ec: -0.6, de: 0.4, fa: 0.4},
+    // ----- La familiarité : là où les nombres ne suffisent pas.
+    'cult film': {fa: 0.5},
+    'cult classic': {fa: 0.4},
+    'independent film': {fa: 0.5},
+    'low budget': {fa: 0.5, ec: -0.4},
+    'found footage': {fa: 0.4, an: 0.2, ec: -0.4},
+    'anthology': {fa: 0.4, de: 0.3},
+    'mockumentary': {fa: 0.4, de: 0.3, ch: -0.4},
+    'blockbuster': {fa: -0.6, ec: 0.6},
+  };
+
+/** Ce que le lexique a lu sur un film : la position moyenne par axe touché,
+ * et le nombre de mots qui ont répondu sur chacun. */
+interface KeywordReading {
+  axes: Partial<Record<AxisKey, number>>;
+  hits: Partial<Record<AxisKey, number>>;
+}
 
 /**
- * La position de ton lue dans les mots-clés, ou `null` si aucun n'est reconnu.
+ * La lecture du lexique sur les mots-clés d'un film. Un axe sans mot reconnu
+ * n'apparaît pas : il restera à ce que disent les genres, avec l'incertitude
+ * qui va avec.
  * @param {string[]} names Noms de mots-clés renvoyés par TMDB.
- * @return {number | null} Position −1..+1, ou null.
+ * @return {KeywordReading} Position et nombre de réponses, par axe.
  */
-function toneFromKeywords(names: string[]): number | null {
-  const hits = names
-      .map((name) => TONE_KEYWORDS[name.toLowerCase()])
-      .filter((value): value is number => typeof value === 'number');
-  if (hits.length === 0) return null;
-  const sum = hits.reduce((acc, value) => acc + value, 0);
-  return Math.max(-1, Math.min(1, sum / hits.length));
+function keywordAxesFor(names: string[]): KeywordReading {
+  const sums: Partial<Record<AxisKey, number>> = {};
+  const hits: Partial<Record<AxisKey, number>> = {};
+  for (const name of names) {
+    const entry = KEYWORD_AXIS_WEIGHTS[name.toLowerCase()];
+    if (!entry) continue;
+    for (const axis of AXIS_KEYS) {
+      const value = entry[axis];
+      if (typeof value !== 'number') continue;
+      sums[axis] = (sums[axis] ?? 0) + value;
+      hits[axis] = (hits[axis] ?? 0) + 1;
+    }
+  }
+  const axes: Partial<Record<AxisKey, number>> = {};
+  for (const axis of AXIS_KEYS) {
+    const count = hits[axis];
+    if (!count) continue;
+    axes[axis] = Math.max(-1, Math.min(1, (sums[axis] ?? 0) / count));
+  }
+  return {axes, hits};
+}
+
+/**
+ * Déviations par paire de genres (C1). La moyenne genre par genre confond
+ * drame+comédie, drame+guerre et drame+romance ; ces tables redonnent du
+ * relief là où la moyenne aplatit — même grain de curation que les tables
+ * mono-genre, appliqué aux paires fréquentes. La clé est `idA+idB`, ids
+ * croissants.
+ */
+const GENRE_PAIR_ADJUSTMENTS:
+  Record<string, Partial<Record<AxisKey, number>>> = {
+    '18+35': {to: 0.3, ch: 0.1, de: 0.1},
+    '18+10752': {ch: 0.3, ec: 0.3, an: -0.2},
+    '18+10749': {to: 0.3, ec: -0.2, ry: -0.2},
+    '18+9648': {de: 0.3, ry: -0.2},
+    '18+80': {ch: 0.3, de: 0.2, to: -0.2},
+    '18+36': {de: 0.2, ry: -0.2, an: -0.3},
+    '18+53': {ch: 0.2, ry: -0.2},
+    '18+878': {de: 0.4, ry: -0.3, ec: -0.1},
+    '16+18': {ch: 0.3, de: 0.3, to: -0.2},
+    '18+10402': {to: 0.2, ch: 0.1},
+    '18+37': {ry: -0.3, ch: 0.2},
+    '28+35': {ch: -0.3, to: 0.3, ry: 0.2},
+    '28+878': {ec: 0.3, an: 0.2},
+    '28+53': {ry: 0.3},
+    '18+28': {ch: 0.2},
+    '28+80': {ry: 0.3, to: -0.3},
+    '12+28': {ec: 0.3, ch: -0.2},
+    '27+35': {ch: -0.4, to: 0.2},
+    '27+53': {ry: 0.2, ch: 0.2},
+    '27+9648': {de: 0.2, ry: -0.2},
+    '27+878': {ch: 0.3, ry: 0.2},
+    '9648+53': {de: 0.3},
+    '53+80': {an: -0.2, de: 0.2},
+    '35+80': {ch: -0.3},
+    '12+878': {ec: 0.3, ch: -0.2},
+    '12+14': {ec: 0.3, to: 0.2, ch: -0.2},
+    '14+10751': {ch: -0.5, to: 0.5},
+    '14+10749': {to: 0.3, ec: -0.2},
+    '35+10749': {ch: -0.4, to: 0.5},
+    '16+10751': {ch: -0.5, to: 0.5},
+    '12+16': {ec: 0.2, ch: -0.3},
+    '36+10752': {ch: 0.3, ec: 0.3, an: -0.3},
+    '99+10402': {to: 0.3, ch: -0.2},
+    '12+10751': {ch: -0.4, to: 0.4},
+    '35+10751': {ch: -0.5, to: 0.5},
+  };
+
+/**
+ * Applique les déviations de paires aux axes déjà moyennés par genre.
+ * @param {AxisVector} axes Position issue des tables mono-genre.
+ * @param {number[]} genreIds Genres TMDB du film.
+ * @return {AxisVector} Position corrigée, bornée à −1..+1.
+ */
+function applyGenrePairs(axes: AxisVector, genreIds: number[]): AxisVector {
+  const out = {...axes};
+  const sorted = [...new Set(genreIds)].sort((a, b) => a - b);
+  for (let i = 0; i < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length; j++) {
+      const entry = GENRE_PAIR_ADJUSTMENTS[`${sorted[i]}+${sorted[j]}`];
+      if (!entry) continue;
+      for (const axis of AXIS_KEYS) {
+        const delta = entry[axis];
+        if (typeof delta !== 'number') continue;
+        out[axis] = Math.max(-1, Math.min(1, out[axis] + delta));
+      }
+    }
+  }
+  return out;
 }
 
 /** Distribution du vivier, pour situer un film *parmi les autres*. */
@@ -1707,7 +2259,9 @@ function coarseAxesFor(row: DiscoverRow, stats: PoolStats): AxisVector {
 
   const familiarity = 1 - 2 * reach + (isFamiliarOrigin ? 0 : 0.15);
 
-  return {
+  // Les paires de genres corrigent la moyenne avant tout le reste : c'est un
+  // savoir de liste, disponible dès cette étape, contrairement aux mots-clés.
+  return applyGenrePairs({
     ch: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ch),
     ry: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ry),
     fa: Math.max(-1, Math.min(1, familiarity)),
@@ -1716,7 +2270,7 @@ function coarseAxesFor(row: DiscoverRow, stats: PoolStats): AxisVector {
     to: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.to),
     ec: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ec),
     in: 0,
-  };
+  }, genreIds);
 }
 
 /**
@@ -1754,11 +2308,17 @@ function refineAxes(base: AxisVector, c: EnrichedCandidate): AxisVector {
     axes.ec = Math.max(-1, Math.min(1, 0.4 * axes.ec + 0.6 * logScale));
   }
 
-  // Le ton : les mots-clés priment nettement sur les genres, qui n'en disent
-  // presque rien — une comédie peut être tendre ou glaçante.
-  const tone = toneFromKeywords(c.keywordNames ?? []);
-  if (tone !== null) {
-    axes.to = Math.max(-1, Math.min(1, 0.25 * axes.to + 0.75 * tone));
+  // Le lexique multi-axes (C1) : sur chaque axe où au moins un mot-clé a
+  // répondu, la lecture des mots prime sur celle des genres — nettement pour
+  // le ton, dont les genres ne disent presque rien (une comédie peut être
+  // tendre ou glaçante), franchement mais sans l'effacer pour le reste.
+  const reading = keywordAxesFor(c.keywordNames ?? []);
+  for (const axis of AXIS_KEYS) {
+    const word = reading.axes[axis];
+    if (typeof word !== 'number') continue;
+    const wordShare = axis === 'to' ? 0.75 : 0.55;
+    axes[axis] = Math.max(-1, Math.min(1,
+        (1 - wordShare) * axes[axis] + wordShare * word));
   }
 
   return axes;
@@ -1781,10 +2341,21 @@ function axisSigmaFor(
   if (!c || typeof c.budget !== 'number' || c.budget <= 0) {
     sigma.ec = COARSE_SIGMA.ec;
   }
-  // Le ton ne se resserre que si un mot-clé du lexique a répondu. Sans quoi il
-  // reste l'axe le plus incertain du modèle, et doit peser en conséquence.
-  if (c && toneFromKeywords(c.keywordNames ?? []) !== null) {
-    sigma.to = 0.45;
+  // Un axe ne se resserre que si un mot-clé du lexique y a répondu : la
+  // précision se mérite donnée par donnée, elle ne se décrète pas. Le ton,
+  // axe le plus pauvre côté genres, passe d'« on ne sait presque rien » à
+  // « on sait » dès qu'un mot parle ; les autres gagnent plus prudemment.
+  if (c) {
+    const reading = keywordAxesFor(c.keywordNames ?? []);
+    for (const axis of AXIS_KEYS) {
+      const count = reading.hits[axis] ?? 0;
+      if (count <= 0) continue;
+      if (axis === 'to') {
+        sigma.to = 0.45;
+      } else {
+        sigma[axis] = Math.max(0.3, sigma[axis] * (count >= 2 ? 0.7 : 0.8));
+      }
+    }
   }
   return sigma;
 }
@@ -1909,6 +2480,30 @@ const TRAIT_HALF_LIFE_DAYS = 180;
  */
 const TRAIT_WEIGHT_GALLERY = 0.6;
 /**
+ * Un film vu ET aimé (coup de cœur). Ce n'est pas un bonus qui s'ajoute :
+ * c'est la même observation devenue deux fois plus sûre, alignée sur le
+ * verdict « resté avec moi » — les deux disent la même chose par des chemins
+ * différents, ils doivent peser pareil.
+ */
+const TRAIT_WEIGHT_GALLERY_LOVED = 1.2;
+/**
+ * Un film vu jamais duellé, une fois le graphe de préférence assez dense pour
+ * parler (C2) : le poids uniforme du « vu » redescend, parce que le graphe
+ * sait désormais distinguer ce qui a compté de ce qui a seulement occupé une
+ * soirée.
+ */
+const TRAIT_WEIGHT_GALLERY_UNDUELED = 0.2;
+/**
+ * Le plancher d'un film qui perd systématiquement ses duels : légèrement
+ * négatif, jamais un rejet — c'est la répétition qui fait signal.
+ */
+const TRAIT_WEIGHT_GALLERY_LOSER = -0.15;
+/** Films notés dans le graphe à partir desquels il module le poids du vu. */
+const PREFS_MATURE_SIZE = 8;
+/** Un « Ce n'est pas lui » : un rejet par film, daté — le même poids que le
+ * refus d'un trio, mais à la bonne granularité. */
+const TRAIT_WEIGHT_PASSED_FILM = 0.3;
+/**
  * Une intention, pas une expérience — le soi projeté, à croire avec prudence.
  */
 const TRAIT_WEIGHT_WATCHLIST = 0.2;
@@ -1926,9 +2521,16 @@ interface TraitProfile {
 }
 
 interface TraitEntry {
+  tmdbId: number | null;
   genreIds: number[];
   inCollection: boolean;
   addedAtMillis: number;
+  /** Coup de cœur posé sur l'entrée. L'absence ne dit pas « pas aimé » :
+   * elle dit « rien déclaré », et ne pénalise jamais. */
+  loved: boolean;
+  /** La position réelle du film (C1), quand la Galerie l'a déjà apprise.
+   * Sans elle, le trait retombe sur la lecture des genres, comme avant. */
+  axes: Partial<AxisVector> | null;
 }
 
 /**
@@ -1938,6 +2540,7 @@ interface TraitEntry {
 type VerdictValue = 'stayed' | 'passed' | 'unfinished';
 
 interface TraitVerdict {
+  tmdbId: number;
   axes: AxisVector;
   verdict: VerdictValue;
   atMillis: number;
@@ -2003,6 +2606,9 @@ interface SessionSignal {
   rejected: boolean;
   launched: boolean;
   atMillis: number;
+  /** Les « Ce n'est pas lui » de la séance : un rejet par film, avec la
+   * position exacte du film refusé. */
+  passes: {axes: Partial<AxisVector>; atMillis: number}[];
 }
 
 /**
@@ -2019,6 +2625,20 @@ interface SessionSignal {
  * @return {Partial<AxisVector>} Position, axes inconnus omis.
  */
 function traitAxesFor(entry: TraitEntry): Partial<AxisVector> {
+  // La position réelle (C1) prime quand elle existe : chaque film vu pèse
+  // alors à des coordonnées dignes de ce nom, durée comprise — l'axe `in`
+  // cesse d'être hors de portée du trait.
+  if (entry.axes) {
+    const out: Partial<AxisVector> = {};
+    for (const axis of AXIS_KEYS) {
+      const value = entry.axes[axis];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        out[axis] = Math.max(-1, Math.min(1, value));
+      }
+    }
+    if (Object.keys(out).length > 0) return out;
+  }
+
   const genreIds = entry.genreIds;
   const axes: Partial<AxisVector> = {
     ch: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ch),
@@ -2061,6 +2681,8 @@ function traitWeight(
  * @param {Partial<AxisVector>} corrections Corrections posées sur la Fiche.
  * @param {TraitVerdict[]} verdicts Ce que les films lancés ont laissé.
  * @param {SessionSignal[]} signals Ce que chaque séance a déclaré et donné.
+ * @param {Map<number, number>} prefs Le graphe de préférence (C2), score par
+ *   tmdbId — il module le poids des films vus.
  * @return {TraitProfile} Le trait.
  */
 function buildTraitProfile(
@@ -2069,6 +2691,7 @@ function buildTraitProfile(
     corrections: Partial<AxisVector>,
     verdicts: TraitVerdict[] = [],
     signals: SessionSignal[] = [],
+    prefs: Map<number, number> = new Map(),
 ): TraitProfile {
   const mu = {} as AxisVector;
   const tau = {} as AxisVector;
@@ -2093,21 +2716,59 @@ function buildTraitProfile(
   }
 
   const now = Date.now();
-  const ingest = (entries: TraitEntry[], base: number): void => {
+  const ingest = (
+      entries: TraitEntry[],
+      baseFor: (entry: TraitEntry) => number,
+  ): void => {
     for (const entry of entries) {
+      const base = baseFor(entry);
+      if (base === 0) continue;
       const ageDays = (now - entry.addedAtMillis) / (24 * 3600 * 1000);
       const sameDay = countByDay.get(dayKey(entry.addedAtMillis)) ?? 1;
-      const weight = traitWeight(base, ageDays, sameDay);
+      const weight = traitWeight(Math.abs(base), ageDays, sameDay);
       const axes = traitAxesFor(entry);
       for (const axis of AXIS_KEYS) {
         const value = axes[axis];
-        if (typeof value === 'number') observe(axis, value, weight);
+        if (typeof value !== 'number') continue;
+        // Un poids négatif est une preuve *contre* la position du film :
+        // même convention que « pas fini », cible atténuée du côté opposé.
+        const target = base >= 0 ? value :
+          Math.max(-1, Math.min(1, -0.4 * value));
+        observe(axis, target, weight);
       }
     }
   };
 
-  ingest(gallery, TRAIT_WEIGHT_GALLERY);
-  ingest(watchlist, TRAIT_WEIGHT_WATCHLIST);
+  // Le poids d'un film vu n'est plus uniforme. Trois choses le modulent,
+  // dans cet ordre :
+  // - le graphe de préférence (C2), quand il est assez dense : un film qui
+  //   gagne ses duels monte vers 1, un film jamais duellé descend vers 0,2,
+  //   un film qui perd systématiquement pèse légèrement contre sa position ;
+  // - le coup de cœur, qui plancher le film à 1,2 quel que soit le graphe —
+  //   ce que quelqu'un déclare aimer prime sur ce que ses duels racontent ;
+  // - le verdict « resté avec moi », qui porte déjà tout le signal du cœur
+  //   avec la position exacte du film : le cœur qui en découle ne re-pèse
+  //   pas, sans quoi la même soirée compterait deux fois.
+  const stayedIds = new Set(
+      verdicts.filter((v) => v.verdict === 'stayed').map((v) => v.tmdbId),
+  );
+  const prefsMature = prefs.size >= PREFS_MATURE_SIZE;
+  ingest(gallery, (entry) => {
+    let weight = TRAIT_WEIGHT_GALLERY;
+    if (prefsMature) {
+      const elo = entry.tmdbId !== null ? prefs.get(entry.tmdbId) : undefined;
+      weight = elo === undefined ? TRAIT_WEIGHT_GALLERY_UNDUELED :
+        Math.max(TRAIT_WEIGHT_GALLERY_LOSER,
+            Math.min(1, 0.2 + (elo - 1000) * (0.8 / 60)));
+    }
+    if (entry.loved) {
+      weight = entry.tmdbId !== null && stayedIds.has(entry.tmdbId) ?
+        Math.max(weight, TRAIT_WEIGHT_GALLERY) :
+        Math.max(weight, TRAIT_WEIGHT_GALLERY_LOVED);
+    }
+    return weight;
+  });
+  ingest(watchlist, () => TRAIT_WEIGHT_WATCHLIST);
 
   // Les verdicts, ensuite. Ils portent sur des films dont on connaît la
   // position exacte — celle calculée à la finalisation, conservée dans
@@ -2163,6 +2824,19 @@ function buildTraitProfile(
         observe(axis, Math.max(-1, Math.min(1, -0.4 * value)), weight);
       }
     }
+
+    // « Ce n'est pas lui » : le refus à la granularité du film, ce que le
+    // rejet de trio moyennait sur trois. Même prudence — cible atténuée,
+    // seulement sur les axes où le film se situait franchement.
+    for (const pass of signal.passes) {
+      const passAge = (now - pass.atMillis) / (24 * 3600 * 1000);
+      const weight = traitWeight(TRAIT_WEIGHT_PASSED_FILM, passAge, 1);
+      for (const axis of AXIS_KEYS) {
+        const value = pass.axes[axis];
+        if (typeof value !== 'number' || Math.abs(value) < 0.25) continue;
+        observe(axis, Math.max(-1, Math.min(1, -0.4 * value)), weight);
+      }
+    }
   }
 
   // Les corrections passent en dernier et pèsent le plus lourd : ce que
@@ -2187,10 +2861,13 @@ function buildTraitProfile(
 /**
  * Lit les entrées de bibliothèque utiles au trait.
  * @param {admin.firestore.QuerySnapshot} snap Collection Firestore.
+ * @param {Map<string, FilmPosition>} freshPositions Positions apprises
+ *   pendant l'appel en cours, pas encore visibles dans le snapshot.
  * @return {TraitEntry[]} Entrées normalisées.
  */
 function traitEntriesFrom(
     snap: admin.firestore.QuerySnapshot,
+    freshPositions: Map<string, FilmPosition> = new Map(),
 ): TraitEntry[] {
   const entries: TraitEntry[] = [];
   for (const doc of snap.docs) {
@@ -2198,14 +2875,49 @@ function traitEntriesFrom(
     const addedAt = doc.get('addedAt');
     const millis = addedAt instanceof admin.firestore.Timestamp ?
       addedAt.toMillis() : Date.now();
+    const tmdbId = doc.get('tmdbId');
+    // Les positions apprises pendant cet appel ne sont pas encore dans le
+    // snapshot : elles arrivent par la carte des fraîches.
+    const fresh = freshPositions.get(doc.id);
+    const storedAxes = doc.get('axes');
+    const axes = fresh ? fresh.axes :
+      (doc.get('axesV') === AXES_VERSION &&
+        typeof storedAxes === 'object' && storedAxes !== null) ?
+        storedAxes as Partial<AxisVector> : null;
     entries.push({
+      tmdbId: typeof tmdbId === 'number' ? tmdbId : null,
       genreIds: Array.isArray(genreIds) ?
         genreIds.filter((g): g is number => typeof g === 'number') : [],
       inCollection: typeof doc.get('collectionId') === 'number',
       addedAtMillis: millis,
+      loved: doc.get('lovedAt') instanceof admin.firestore.Timestamp,
+      axes,
     });
   }
   return entries;
+}
+
+/**
+ * Le graphe de préférence (C2), relu : un score type Elo par film de la
+ * Galerie, construit duel après duel.
+ * @param {admin.firestore.DocumentSnapshot} snap Document `taste/filmPrefs`.
+ * @return {Map<number, number>} Score par tmdbId.
+ */
+function parseFilmPrefs(
+    snap: admin.firestore.DocumentSnapshot,
+): Map<number, number> {
+  const prefs = new Map<number, number>();
+  if (!snap.exists) return prefs;
+  const data = snap.data() ?? {};
+  for (const [key, value] of Object.entries(data)) {
+    const tmdbId = Number(key);
+    if (!Number.isFinite(tmdbId)) continue;
+    const rating = (value as {r?: unknown} | null)?.r;
+    if (typeof rating === 'number' && Number.isFinite(rating)) {
+      prefs.set(tmdbId, rating);
+    }
+  }
+  return prefs;
 }
 
 /**
@@ -2281,14 +2993,36 @@ function readSessionOutcomes(
     const answersRaw = doc.get('answers');
     const launched = doc.get('launched');
     const hasLaunch = typeof launched === 'object' && launched !== null;
+    const createdMillis = createdAt instanceof admin.firestore.Timestamp ?
+      createdAt.toMillis() : now;
+
+    // Les « Ce n'est pas lui » de la séance, rattachés à la position que le
+    // film refusé occupait dans le bloc `films`.
+    const filmRows = Array.isArray(films) ?
+      films as Record<string, unknown>[] : [];
+    const rawPasses = doc.get('passes');
+    const passes = (Array.isArray(rawPasses) ? rawPasses : [])
+        .map((raw) => {
+          if (typeof raw !== 'object' || raw === null) return null;
+          const record = raw as Record<string, unknown>;
+          const tmdbId = Number(record.tmdbId);
+          if (!Number.isFinite(tmdbId)) return null;
+          const film = filmRows.find((f) => Number(f.id) === tmdbId);
+          if (!film) return null;
+          const at = record.at instanceof admin.firestore.Timestamp ?
+            record.at.toMillis() : createdMillis;
+          return {axes: parseAxes(film.axes), atMillis: at};
+        })
+        .filter((p): p is {axes: AxisVector; atMillis: number} => p !== null);
+
     signals.push({
       answers: (typeof answersRaw === 'object' && answersRaw !== null) ?
         answersRaw as Record<string, unknown> : {},
       trioAxes: meanFilmAxes(Array.isArray(films) ? films : []),
       rejected: doc.get('rejected') === true,
       launched: hasLaunch,
-      atMillis: createdAt instanceof admin.firestore.Timestamp ?
-        createdAt.toMillis() : now,
+      atMillis: createdMillis,
+      passes,
     });
 
     if (!hasLaunch) continue;
@@ -2303,6 +3037,7 @@ function readSessionOutcomes(
     if (verdict === 'stayed' || verdict === 'passed' ||
         verdict === 'unfinished') {
       verdicts.push({
+        tmdbId,
         axes: parseAxes(record.axes),
         verdict,
         atMillis: at || now,
@@ -2324,24 +3059,98 @@ function readSessionOutcomes(
   return {verdicts, pending, signals};
 }
 
+/** Ce que la finalisation sait de la rencontre film-personne (C5). */
+interface ReasonContext {
+  /** Le film de la personne qui a semé ce candidat, s'il y en a un. */
+  seedTitle: string | null;
+  /** Le candidat vient de la watchlist. */
+  isListed: boolean;
+  /** Le prénom du premier ami à l'avoir suggéré, si la liste le sait. */
+  recommender: string | null;
+  /** La croyance du soir, pour la raison « promesse tenue ». */
+  belief: BeliefPayload | null;
+}
+
 /**
- * Construit les tags "pourquoi ce film" affichés à l'utilisateur, à partir
- * de faits vérifiables sur le film plutôt que d'expliquer la formule.
+ * La raison « promesse tenue » : l'axe que la personne a le plus pesé ce
+ * soir, quand le film l'honore. Rien n'est produit si aucun axe ne remplit
+ * les deux conditions — une raison creuse coûte plus cher que pas de raison.
+ * @param {EnrichedCandidate} c Candidat.
+ * @param {BeliefPayload} belief Croyance du soir.
+ * @param {string} language Langue de la requête.
+ * @return {string | null} La phrase, ou rien.
+ */
+function promiseReason(
+    c: EnrichedCandidate, belief: BeliefPayload, language: string,
+): string | null {
+  const table = REASON_PROMISE[language] ?? REASON_PROMISE[DEFAULT_LANGUAGE];
+  let best: {axis: AxisKey; strength: number} | null = null;
+  for (const axis of AXIS_KEYS) {
+    const weight = belief.weight[axis];
+    const mu = belief.mu[axis];
+    if (weight <= 0 || Math.abs(mu) < 0.35) continue;
+    const filmValue = c.axes?.[axis];
+    if (typeof filmValue !== 'number') continue;
+    if (Math.abs(mu - filmValue) > 0.35) continue;
+    const strength = weight * Math.abs(mu);
+    if (!best || strength > best.strength) best = {axis, strength};
+  }
+  if (!best) return null;
+  const phrases = table[best.axis];
+  if (!phrases) return null;
+  return belief.mu[best.axis] >= 0 ? phrases[1] : phrases[0];
+}
+
+/**
+ * Construit les tags "pourquoi ce film" affichés à l'utilisateur.
+ *
+ * Les raisons V3 décrivent la **rencontre**, plus seulement le film, par
+ * ordre de force : la filiation (« Proche de X, que tu as aimé » — elle
+ * prouve que l'app connaît la galerie), l'intention (« Il t'attendait dans
+ * ta liste »), la promesse tenue (croyance × position), puis les faits
+ * vérifiables d'avant.
  * @param {EnrichedCandidate} c Candidat enrichi.
  * @param {QuestionnaireAnswersPayload} answers Réponses au questionnaire.
  * @param {string} language Langue de la requête en cours.
+ * @param {ReasonContext | null} context Ce que la séance sait de la
+ *   rencontre.
  * @return {string[]} Jusqu'à 4 tags courts.
  */
 function buildReasons(
     c: EnrichedCandidate,
     answers: QuestionnaireAnswersPayload,
     language: string,
+    context: ReasonContext | null = null,
 ): string[] {
   const genres = GENRE_LABELS[language] ?? GENRE_LABELS[DEFAULT_LANGUAGE];
   const labels = REASON_LABELS[language] ?? REASON_LABELS[DEFAULT_LANGUAGE];
+  const english = language.startsWith('en');
   const reasons: string[] = [];
   const genreIds = c.genre_ids ?? [];
   const chosenGenreIds = genreIdsFor(answers.genres);
+
+  if (context?.seedTitle) {
+    reasons.push(english ?
+      `Close to ${context.seedTitle}, a film you loved` :
+      `Proche de ${context.seedTitle}, que tu as aimé`);
+  }
+
+  if (context?.isListed) {
+    let listed = english ?
+      'It was waiting on your list' :
+      'Il t\'attendait dans ta liste';
+    if (context.recommender) {
+      listed += english ?
+        ` · Suggested by ${context.recommender}` :
+        ` · Suggéré par ${context.recommender}`;
+    }
+    reasons.push(listed);
+  }
+
+  if (context?.belief) {
+    const promise = promiseReason(c, context.belief, language);
+    if (promise) reasons.push(promise);
+  }
 
   for (const id of genreIds) {
     if (chosenGenreIds.includes(id) && genres[id]) {
@@ -2556,6 +3365,310 @@ function discoverRowToJSON(row: DiscoverRow) {
   };
 }
 
+/* ===================================================================== *
+ *  La Porte : les cinq artéfacts qui gardent CinéMatch
+ * ===================================================================== */
+
+/**
+ * Les seuils des cinq artéfacts. Des constantes serveur, pas des valeurs
+ * client : elles s'ajustent sans release, et la porte raconte toujours l'état
+ * que le serveur mesure réellement.
+ */
+const DOOR_MEMOIRE_TARGET = 30;
+const DOOR_EVENTAIL_TARGET = 6;
+const DOOR_COEUR_TARGET = 12;
+const DOOR_HORIZONS_DECADES_TARGET = 4;
+const DOOR_HORIZONS_COUNTRIES_TARGET = 3;
+const DOOR_PROMESSE_TARGET = 10;
+/**
+ * Films positionnés par appel, au plus. La Galerie s'enrichit paresseusement :
+ * quelques fiches par ouverture de l'onglet, persistées sur les documents, et
+ * tout converge en quelques visites sans jamais coûter une rafale d'appels.
+ */
+const GALLERY_POSITION_BATCH = 10;
+
+interface DoorArtifact {
+  key: string;
+  done: boolean;
+  current: number;
+  target: number;
+}
+
+interface DoorState {
+  unlocked: boolean;
+  artifacts: DoorArtifact[];
+  horizons: {
+    decades: number;
+    decadesTarget: number;
+    countries: number;
+    countriesTarget: number;
+  };
+}
+
+/** La position d'un film de bibliothèque, telle que le cache la garde. */
+interface FilmPosition {
+  axes: AxisVector;
+  sigma: AxisVector;
+  runtimeMinutes: number | null;
+  originCountry: string[];
+}
+
+/**
+ * Positionne un film **hors vivier** depuis sa fiche détaillée TMDB.
+ *
+ * La différence avec `coarseAxesFor` tient à la familiarité : sans vivier
+ * autour, pas de percentile — la notoriété se lit en absolu, sur le compte de
+ * votes en échelle logarithmique (30 votes → inconnu, 30 000 → connu de
+ * tous). Le reste passe par les mêmes tables, les mêmes paires et le même
+ * lexique que les candidats d'une séance : une seule grammaire de position.
+ * @param {Record<string, unknown>} detail Fiche `/movie/{id}` avec keywords.
+ * @return {FilmPosition} Position, incertitude, durée et pays.
+ */
+function positionFilmFromDetail(
+    detail: Record<string, unknown>,
+): FilmPosition {
+  const genreIds = Array.isArray(detail.genres) ?
+    (detail.genres as {id?: unknown}[])
+        .map((g) => g.id)
+        .filter((id): id is number => typeof id === 'number') : [];
+  const voteCount =
+    typeof detail.vote_count === 'number' ? detail.vote_count : 0;
+  const runtime =
+    typeof detail.runtime === 'number' && detail.runtime > 0 ?
+      detail.runtime : null;
+  const budget =
+    typeof detail.budget === 'number' && detail.budget > 0 ?
+      detail.budget : null;
+  const rawKeywords =
+    (detail.keywords as {keywords?: unknown} | undefined)?.keywords;
+  const keywordNames = Array.isArray(rawKeywords) ?
+    (rawKeywords as {name?: unknown}[])
+        .map((k) => k.name)
+        .filter((n): n is string => typeof n === 'string') : [];
+  const detailOrigins = Array.isArray(detail.origin_country) ?
+    (detail.origin_country as unknown[])
+        .filter((c): c is string => typeof c === 'string') : [];
+  const production = Array.isArray(detail.production_countries) ?
+    (detail.production_countries as {iso_3166_1?: unknown}[])
+        .map((c) => c.iso_3166_1)
+        .filter((c): c is string => typeof c === 'string') : [];
+  const origins = detailOrigins.length > 0 ? detailOrigins : production;
+
+  const reach = Math.max(0, Math.min(1,
+      (Math.log10(voteCount + 1) - 1.5) / 3));
+  const isFamiliarOrigin = origins.length === 0 ||
+    origins.some((c) => c === 'FR' || c === 'US' || c === 'GB');
+  const fa = Math.max(-1, Math.min(1,
+      1 - 2 * reach + (isFamiliarOrigin ? 0 : 0.15)));
+
+  const base = applyGenrePairs({
+    ch: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ch),
+    ry: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ry),
+    fa,
+    de: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.de),
+    an: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.an),
+    to: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.to),
+    ec: genreAxisValue(genreIds, GENRE_AXIS_WEIGHTS.ec),
+    in: 0,
+  }, genreIds);
+
+  // Le raffinage des candidats, réutilisé tel quel sur un candidat de
+  // circonstance : durée, budget, saga et lexique parlent pareil partout.
+  const pseudo: EnrichedCandidate = {
+    id: 0,
+    genre_ids: genreIds,
+    runtimeMinutes: runtime,
+    belongsToCollection:
+      detail.belongs_to_collection !== null &&
+      detail.belongs_to_collection !== undefined,
+    castPopularities: [],
+    providerIds: [],
+    trailerKey: null,
+    budget,
+    keywordNames,
+    finalScore: 0,
+    reasons: [],
+  };
+
+  return {
+    axes: refineAxes(base, pseudo),
+    sigma: axisSigmaFor(true, pseudo),
+    runtimeMinutes: runtime,
+    originCountry: origins,
+  };
+}
+
+/**
+ * Positionne un lot de films de la Galerie (C1), en passant par le cache
+ * global `filmAxes/{tmdbId}` — partagé entre tous les utilisateurs, versionné
+ * par `AXES_VERSION`, recalculé quand le lexique change. Chaque document de
+ * galerie traité reçoit sa position, sa durée et son pays, et n'y repassera
+ * plus tant que la version tient.
+ * @param {admin.firestore.DocumentSnapshot[]} docs Documents à traiter.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @return {Promise<Map<string, FilmPosition>>} Positions apprises, par id de
+ *   document.
+ */
+async function positionGalleryDocs(
+    docs: admin.firestore.DocumentSnapshot[],
+    ctx: TMDBContext,
+    db: admin.firestore.Firestore,
+): Promise<Map<string, FilmPosition>> {
+  const learned = new Map<string, FilmPosition>();
+
+  // En parallèle, pas en file : dix fiches séquentielles ajouteraient deux
+  // secondes à chaque ouverture de l'onglet tant que la Galerie n'est pas
+  // couverte, pour un lot que TMDB sert sans broncher d'un seul coup.
+  await Promise.all(docs.map(async (doc) => {
+    // La garde vit ici, pour couvrir tous les appelants d'un coup : les
+    // espaces d'ids film/série de TMDB sont disjoints, et `/movie/{id}` sur
+    // une série renverrait souvent un film sans rapport — dont les axes
+    // bidons prendraient ensuite le pas sur les genres dans le trait.
+    if (doc.get('mediaType') !== 'movie') return;
+    const tmdbId = Number(doc.get('tmdbId'));
+    if (!Number.isFinite(tmdbId)) return;
+    const cacheRef = db.collection('filmAxes').doc(String(tmdbId));
+    try {
+      let position: FilmPosition | null = null;
+      const cached = await cacheRef.get();
+      if (cached.exists && cached.get('v') === AXES_VERSION) {
+        position = {
+          axes: parseAxes(cached.get('axes')),
+          sigma: parseSigma(cached.get('sigma')),
+          runtimeMinutes: typeof cached.get('runtimeMinutes') === 'number' ?
+            cached.get('runtimeMinutes') as number : null,
+          originCountry: Array.isArray(cached.get('originCountry')) ?
+            (cached.get('originCountry') as unknown[])
+                .filter((c): c is string => typeof c === 'string') : [],
+        };
+      } else {
+        const detail = await tmdbGET(
+            `/movie/${tmdbId}`, {append_to_response: 'keywords'}, ctx,
+        );
+        position = positionFilmFromDetail(detail);
+        await cacheRef.set({
+          v: AXES_VERSION,
+          axes: position.axes,
+          sigma: position.sigma,
+          runtimeMinutes: position.runtimeMinutes,
+          originCountry: position.originCountry,
+          updatedAt: admin.firestore.Timestamp.now(),
+        });
+      }
+      await doc.ref.set({
+        axes: position.axes,
+        axesSigma: position.sigma,
+        runtimeMinutes: position.runtimeMinutes,
+        originCountry: position.originCountry,
+        axesV: AXES_VERSION,
+      }, {merge: true});
+      learned.set(doc.id, position);
+    } catch {
+      // Une fiche injoignable n'empêche ni la porte ni le trait : le film
+      // restera sans position jusqu'à un prochain passage.
+    }
+  }));
+  return learned;
+}
+
+/**
+ * Les documents de galerie qui attendent encore leur position, dans la
+ * version courante du lexique.
+ * @param {admin.firestore.QuerySnapshot} gallerySnap La Galerie.
+ * @return {admin.firestore.DocumentSnapshot[]} Documents à traiter.
+ */
+function pendingGalleryPositions(
+    gallerySnap: admin.firestore.QuerySnapshot,
+): admin.firestore.DocumentSnapshot[] {
+  return gallerySnap.docs.filter((doc) =>
+    doc.get('mediaType') === 'movie' && doc.get('axesV') !== AXES_VERSION);
+}
+
+/**
+ * Mesure l'état des cinq artéfacts sur la bibliothèque telle qu'elle est.
+ * @param {admin.firestore.QuerySnapshot} gallerySnap La Galerie.
+ * @param {admin.firestore.QuerySnapshot} watchlistSnap La watchlist.
+ * @param {Map<string, string[]>} freshOrigins Pays appris pendant cet appel,
+ *   pas encore visibles dans le snapshot.
+ * @return {DoorState} La porte, artéfact par artéfact.
+ */
+function doorStateFrom(
+    gallerySnap: admin.firestore.QuerySnapshot,
+    watchlistSnap: admin.firestore.QuerySnapshot,
+    freshOrigins: Map<string, string[]>,
+): DoorState {
+  const genres = new Set<number>();
+  const decades = new Set<number>();
+  const countries = new Set<string>();
+  let lovedCount = 0;
+
+  for (const doc of gallerySnap.docs) {
+    const genreIds = doc.get('genreIds');
+    if (Array.isArray(genreIds)) {
+      for (const id of genreIds) {
+        if (typeof id === 'number') genres.add(id);
+      }
+    }
+    const decade = decadeOf(doc.get('releaseDate'));
+    if (decade !== null) decades.add(decade);
+    const origins = freshOrigins.get(doc.id) ?? doc.get('originCountry');
+    if (Array.isArray(origins)) {
+      for (const code of origins) {
+        if (typeof code === 'string' && code.length > 0) countries.add(code);
+      }
+    }
+    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) lovedCount++;
+  }
+
+  const memoire = {
+    key: 'memoire',
+    current: gallerySnap.size,
+    target: DOOR_MEMOIRE_TARGET,
+    done: gallerySnap.size >= DOOR_MEMOIRE_TARGET,
+  };
+  const eventail = {
+    key: 'eventail',
+    current: genres.size,
+    target: DOOR_EVENTAIL_TARGET,
+    done: genres.size >= DOOR_EVENTAIL_TARGET,
+  };
+  const coeur = {
+    key: 'coeur',
+    current: lovedCount,
+    target: DOOR_COEUR_TARGET,
+    done: lovedCount >= DOOR_COEUR_TARGET,
+  };
+  // Les Horizons portent deux mesures : la jauge additionne les deux pour
+  // avancer d'un cran à chaque progrès, le détail garde les vrais comptes.
+  const horizons = {
+    key: 'horizons',
+    current: Math.min(decades.size, DOOR_HORIZONS_DECADES_TARGET) +
+      Math.min(countries.size, DOOR_HORIZONS_COUNTRIES_TARGET),
+    target: DOOR_HORIZONS_DECADES_TARGET + DOOR_HORIZONS_COUNTRIES_TARGET,
+    done: decades.size >= DOOR_HORIZONS_DECADES_TARGET &&
+      countries.size >= DOOR_HORIZONS_COUNTRIES_TARGET,
+  };
+  const promesse = {
+    key: 'promesse',
+    current: watchlistSnap.size,
+    target: DOOR_PROMESSE_TARGET,
+    done: watchlistSnap.size >= DOOR_PROMESSE_TARGET,
+  };
+
+  const artifacts = [memoire, eventail, coeur, horizons, promesse];
+  return {
+    unlocked: artifacts.every((artifact) => artifact.done),
+    artifacts,
+    horizons: {
+      decades: decades.size,
+      decadesTarget: DOOR_HORIZONS_DECADES_TARGET,
+      countries: countries.size,
+      countriesTarget: DOOR_HORIZONS_COUNTRIES_TARGET,
+    },
+  };
+}
+
 /**
  * Le trait : ce que la bibliothèque raconte, traduit dans l'espace commun.
  *
@@ -2565,7 +3678,7 @@ function discoverRowToJSON(row: DiscoverRow) {
  * vide : le démarrage à froid est un chemin normal, pas une erreur.
  */
 export const getTasteProfile = onRequest(
-    {invoker: 'public', timeoutSeconds: 20},
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
     async (req: Request, res: Response) => {
       try {
         if (req.method !== 'POST') {
@@ -2577,14 +3690,16 @@ export const getTasteProfile = onRequest(
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
-        const [gallerySnap, watchlistSnap, correctionsSnap, historySnap] =
-          await Promise.all([
-            userRef.collection('gallery').get(),
-            userRef.collection('watchlist').get(),
-            userRef.collection('taste').doc('corrections').get(),
-            userRef.collection('recommendationHistory')
-                .orderBy('createdAt', 'desc').limit(20).get(),
-          ]);
+        const [
+          gallerySnap, watchlistSnap, correctionsSnap, historySnap, prefsSnap,
+        ] = await Promise.all([
+          userRef.collection('gallery').get(),
+          userRef.collection('watchlist').get(),
+          userRef.collection('taste').doc('corrections').get(),
+          userRef.collection('recommendationHistory')
+              .orderBy('createdAt', 'desc').limit(20).get(),
+          userRef.collection('taste').doc('filmPrefs').get(),
+        ]);
 
         const corrections: Partial<AxisVector> = {};
         if (correctionsSnap.exists) {
@@ -2594,14 +3709,32 @@ export const getTasteProfile = onRequest(
           }
         }
 
+        // Le rattrapage C1 : quelques films positionnés par ouverture, via le
+        // cache global. La porte y lit les pays au passage, le trait les
+        // positions — un seul chemin d'enrichissement pour les deux.
+        const pending = pendingGalleryPositions(gallerySnap);
+        let freshPositions = new Map<string, FilmPosition>();
+        if (pending.length > 0) {
+          freshPositions = await positionGalleryDocs(
+              pending.slice(0, GALLERY_POSITION_BATCH), tmdb(req, res), db,
+          );
+        }
+        const freshOrigins = new Map<string, string[]>();
+        for (const [id, position] of freshPositions) {
+          freshOrigins.set(id, position.originCountry);
+        }
+
         const outcomes = readSessionOutcomes(historySnap);
         const trait = buildTraitProfile(
-            traitEntriesFrom(gallerySnap),
+            traitEntriesFrom(gallerySnap, freshPositions),
             traitEntriesFrom(watchlistSnap),
             corrections,
             outcomes.verdicts,
             outcomes.signals,
+            parseFilmPrefs(prefsSnap),
         );
+
+        const door = doorStateFrom(gallerySnap, watchlistSnap, freshOrigins);
 
         res.status(200).json({
           mu: trait.mu,
@@ -2611,6 +3744,7 @@ export const getTasteProfile = onRequest(
           corrected_axes: trait.correctedAxes,
           verdict_count: outcomes.verdicts.length,
           pending_verdict: outcomes.pending,
+          door,
         });
       } catch (error) {
         logger.error('getTasteProfile failed', {error});
@@ -2722,7 +3856,51 @@ export const recordSessionOutcome = onRequest(
             res.status(404).json({error: 'session_not_found'});
             return;
           }
+          // Relu avant l'écriture : un verdict rejoué — retry réseau, double
+          // tap — ne doit pas re-payer le bonus du graphe à chaque passage.
+          const previousVerdict = doc.get('verdict');
           await doc.ref.set({verdict: value}, {merge: true});
+
+          // « Je l'ai adoré » vaut coup de cœur : le même signal, dit après
+          // la soirée, ne doit pas rester enfermé dans la séance. On le pose
+          // sur le film si la Galerie le connaît ; sinon on n'invente pas une
+          // entrée sans métadonnées.
+          if (value === 'stayed' && previousVerdict !== 'stayed') {
+            const galleryRef = userRef.collection('gallery')
+                .doc(`movie-${tmdbId}`);
+            const gallerySnap = await galleryRef.get();
+            if (gallerySnap.exists &&
+              !(gallerySnap.get('lovedAt') instanceof
+                admin.firestore.Timestamp)) {
+              await galleryRef.set(
+                  {lovedAt: admin.firestore.Timestamp.now()}, {merge: true},
+              );
+            }
+            // Et il parle au graphe : « resté avec moi » vaut un duel gagné
+            // d'office — l'approximation d'un gain contre le champ entier.
+            await bumpFilmPref(userRef, tmdbId, ELO_STAYED_BONUS);
+          }
+          res.status(200).json({ok: true});
+          return;
+        }
+
+        if (body.kind === 'pass') {
+          // « Ce n'est pas lui » — le refus à la granularité du film, daté.
+          // Le trait s'en servira comme preuve contre la position du refusé.
+          const doc = historySnap.docs.find((d) => {
+            const ids = d.get('tmdbIds');
+            return Array.isArray(ids) && ids.includes(tmdbId);
+          });
+          if (!doc) {
+            res.status(404).json({error: 'session_not_found'});
+            return;
+          }
+          await doc.ref.set({
+            passes: admin.firestore.FieldValue.arrayUnion({
+              tmdbId,
+              at: admin.firestore.Timestamp.now(),
+            }),
+          }, {merge: true});
           res.status(200).json({ok: true});
           return;
         }
@@ -2730,6 +3908,195 @@ export const recordSessionOutcome = onRequest(
         res.status(400).json({error: 'unknown_kind'});
       } catch (error) {
         logger.error('recordSessionOutcome failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/* ===================================================================== *
+ *  Le graphe de préférence (C2) : les duels entre films vus
+ * ===================================================================== */
+
+/** Le score de départ d'un film jamais duellé. */
+const ELO_START = 1000;
+/** Le pas d'apprentissage d'un duel. Classique, et volontairement vif : le
+ * graphe doit parler après une poignée de duels, pas après cent. */
+const ELO_K = 32;
+/** Ce que vaut un « resté avec moi » : un duel gagné d'office, l'ordre de
+ * grandeur d'une victoire nette contre le champ. */
+const ELO_STAYED_BONUS = 40;
+
+/**
+ * Ajoute d'office des points à un film du graphe — le chemin du verdict.
+ * @param {admin.firestore.DocumentReference} userRef Le document utilisateur.
+ * @param {number} tmdbId Le film.
+ * @param {number} delta Les points à ajouter.
+ */
+async function bumpFilmPref(
+    userRef: admin.firestore.DocumentReference,
+    tmdbId: number,
+    delta: number,
+): Promise<void> {
+  const prefsRef = userRef.collection('taste').doc('filmPrefs');
+  await prefsRef.firestore.runTransaction(async (txn) => {
+    const snap = await txn.get(prefsRef);
+    const entry = (snap.get(String(tmdbId)) ?? {}) as Record<string, unknown>;
+    const rating = typeof entry.r === 'number' ? entry.r : ELO_START;
+    const wins = typeof entry.w === 'number' ? entry.w : 0;
+    txn.set(prefsRef, {
+      [String(tmdbId)]: {
+        r: rating + delta,
+        w: wins + 1,
+        l: typeof entry.l === 'number' ? entry.l : 0,
+        at: admin.firestore.Timestamp.now(),
+      },
+    }, {merge: true});
+  });
+}
+
+/**
+ * Un duel entre deux films **vus** : « tu as vu les deux, lequel tu
+ * relancerais ce soir ? » La réponse s'écrit dans le graphe de préférence
+ * persistant — un score léger type Elo par film de la Galerie — qui résout
+ * « voir ≠ aimer » sans jamais demander une note.
+ */
+export const recordFilmDuel = onRequest(
+    {invoker: 'public', timeoutSeconds: 20},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const winnerId = Number(body.winnerTmdbId);
+        const loserId = Number(body.loserTmdbId);
+        if (!Number.isFinite(winnerId) || !Number.isFinite(loserId) ||
+          winnerId === loserId) {
+          res.status(400).json({error: 'invalid_duel'});
+          return;
+        }
+
+        const prefsRef = getAdmin().firestore()
+            .collection('users').doc(uid)
+            .collection('taste').doc('filmPrefs');
+
+        await prefsRef.firestore.runTransaction(async (txn) => {
+          const snap = await txn.get(prefsRef);
+          const read = (id: number): Record<string, unknown> =>
+            (snap.get(String(id)) ?? {}) as Record<string, unknown>;
+          const winner = read(winnerId);
+          const loser = read(loserId);
+          const winnerRating =
+            typeof winner.r === 'number' ? winner.r : ELO_START;
+          const loserRating =
+            typeof loser.r === 'number' ? loser.r : ELO_START;
+
+          // Elo standard : la victoire attendue rapporte peu, la surprise
+          // beaucoup — c'est ce qui fait converger le graphe vite sans
+          // qu'une préférence évidente écrase tout.
+          const expected =
+            1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
+          const gain = ELO_K * (1 - expected);
+          const now = admin.firestore.Timestamp.now();
+
+          txn.set(prefsRef, {
+            [String(winnerId)]: {
+              r: winnerRating + gain,
+              w: (typeof winner.w === 'number' ? winner.w : 0) + 1,
+              l: typeof winner.l === 'number' ? winner.l : 0,
+              at: now,
+            },
+            [String(loserId)]: {
+              r: loserRating - gain,
+              w: typeof loser.w === 'number' ? loser.w : 0,
+              l: (typeof loser.l === 'number' ? loser.l : 0) + 1,
+              at: now,
+            },
+          }, {merge: true});
+        });
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('recordFilmDuel failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Les films de la Galerie, positionnés (C1), prêts pour les duels du client.
+ *
+ * Renvoie la même forme qu'un candidat de vivier — le client les fait entrer
+ * dans le même moteur de questions sans conversion. Seuls sortent les films
+ * déjà positionnés dans la version courante du lexique ; l'appel en
+ * positionne quelques-uns au passage, comme `getTasteProfile`.
+ */
+export const getGalleryAxes = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const db = getAdmin().firestore();
+        const gallerySnap = await db.collection('users').doc(uid)
+            .collection('gallery').get();
+
+        const pending = pendingGalleryPositions(gallerySnap);
+        let fresh = new Map<string, FilmPosition>();
+        if (pending.length > 0) {
+          fresh = await positionGalleryDocs(
+              pending.slice(0, GALLERY_POSITION_BATCH), tmdb(req, res), db,
+          );
+        }
+
+        const candidates = gallerySnap.docs
+            .map((doc) => {
+              const tmdbId = Number(doc.get('tmdbId'));
+              if (!Number.isFinite(tmdbId)) return null;
+              const position = fresh.get(doc.id);
+              const stored = doc.get('axesV') === AXES_VERSION;
+              if (!position && !stored) return null;
+              const axes = position ? position.axes :
+                parseAxes(doc.get('axes'));
+              const sigma = position ? position.sigma :
+                parseSigma(doc.get('axesSigma'));
+              const originCountry = doc.get('originCountry');
+              return {
+                id: tmdbId,
+                title: typeof doc.get('title') === 'string' ?
+                  doc.get('title') as string : null,
+                overview: null,
+                poster_path: typeof doc.get('posterPath') === 'string' ?
+                  doc.get('posterPath') as string : null,
+                vote_average: typeof doc.get('voteAverage') === 'number' ?
+                  doc.get('voteAverage') as number : null,
+                vote_count: null,
+                popularity: null,
+                genre_ids: Array.isArray(doc.get('genreIds')) ?
+                  doc.get('genreIds') as number[] : [],
+                release_date: typeof doc.get('releaseDate') === 'string' ?
+                  doc.get('releaseDate') as string : null,
+                origin_country: Array.isArray(originCountry) ?
+                  originCountry as string[] : [],
+                axes,
+                axis_sigma: sigma,
+              };
+            })
+            .filter((row) => row !== null);
+
+        res.status(200).json({candidates});
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getGalleryAxes failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
@@ -2806,16 +4173,60 @@ export const getCandidatePool = onRequest(
         const answers = parseAnswers(req.body);
         const a = getAdmin();
         const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+        const ctx = tmdb(req, res);
 
-        const [exclusionSet, declared, rawPool] = await Promise.all([
-          fetchExclusionSet(db, uid),
+        const [library, declared, prefsSnap, rawPool] = await Promise.all([
+          fetchLibraryForPool(db, uid),
           fetchDeclaredProfile(db, uid),
+          userRef.collection('taste').doc('filmPrefs').get(),
           fetchCandidatePool(
               answers,
               {dealbreaker: true, platforms: false},
-              tmdb(req, res),
+              ctx,
           ),
         ]);
+
+        // Les graines personnelles (C3) : le voisinage TMDB des têtes du
+        // graphe de préférence, complétées par les coups de cœur récents.
+        // Un candidat qui entre par ressemblance à un film que tu relances
+        // part avec une longueur d'avance sémantique qu'aucun score ne peut
+        // rattraper après coup.
+        const prefs = parseFilmPrefs(prefsSnap);
+        const seedIds: number[] = [];
+        const pushSeed = (id: number): void => {
+          if (seedIds.length < POOL_SEED_COUNT && !seedIds.includes(id)) {
+            seedIds.push(id);
+          }
+        };
+        // Les têtes du graphe seulement : un film sous le score de départ a
+        // *perdu* ses duels, il ne sème rien. Les coups de cœur complètent.
+        for (const [id, rating] of
+          [...prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
+          if (rating <= ELO_START) break;
+          pushSeed(id);
+        }
+        for (const id of library.lovedSeeds) pushSeed(id);
+
+        const seedRows = new Map<number, DiscoverRow>();
+        const seedOf = new Map<number, number>();
+        await Promise.all(seedIds.map(async (seedId) => {
+          try {
+            const response = await tmdbGET(
+                `/movie/${seedId}/recommendations`, {page: '1'}, ctx,
+            );
+            const results = Array.isArray(response.results) ?
+              response.results as DiscoverRow[] : [];
+            for (const row of results.slice(0, POOL_SEED_TAKE)) {
+              if (!seedRows.has(row.id)) {
+                seedRows.set(row.id, row);
+                seedOf.set(row.id, seedId);
+              }
+            }
+          } catch {
+            // Une graine muette n'appauvrit que son voisinage.
+          }
+        }));
 
         // Les genres bannis dans les réglages ne sont jamais assouplis, même
         // quand le vivier est trop maigre : c'est le sens de « jamais ». Le
@@ -2824,28 +4235,82 @@ export const getCandidatePool = onRequest(
         // Le pays d'origine ne figure pas ici : TMDB ne le renvoie pas sur ses
         // listes. C'est `with_origin_country` dans la requête qui a trié, et la
         // finalisation qui garantira — sur des candidats enrichis, seuls à
-        // porter l'information.
+        // porter l'information. La durée suit le même chemin (V3·0).
         const keep = (row: DiscoverRow): boolean =>
-          !exclusionSet.has(row.id) &&
+          !library.excluded.has(row.id) &&
           !(row.genre_ids ?? [])
               .some((id) => declared.bannedGenreIDs.has(id)) &&
           matchesRequestedGenres(row.genre_ids, answers);
 
-        let pool = filterByContentFormat(rawPool.filter(keep), answers);
+        // L'ordre de fusion dit la priorité : les graines d'abord, la
+        // watchlist réintégrée ensuite (C4), le catalogue en appoint — plus
+        // comme colonne vertébrale. Sur une soirée plafonnée, les lignes
+        // personnelles — durée inconnue à ce stade — sont contingentées : le
+        // catalogue, seul à respecter le plafond dès la requête, doit rester
+        // majoritaire jusqu'à l'enrichissement, sans quoi la garantie de
+        // durée viderait la sélection au dernier moment.
+        const personalCeiling =
+          runtimeCapFor(answers) !== null ? 20 : Number.POSITIVE_INFINITY;
+        const personal: DiscoverRow[] = [];
+        for (const row of seedRows.values()) {
+          if (personal.length >= personalCeiling) break;
+          personal.push(row);
+        }
+        for (const row of library.watchlistRows) {
+          if (personal.length >= personalCeiling) break;
+          if (!personal.some((existing) => existing.id === row.id)) {
+            personal.push(row);
+          }
+        }
+        const personalPool =
+          filterByContentFormat(personal.filter(keep), answers);
+
+        const mergeRows = (catalogue: DiscoverRow[]): DiscoverRow[] => {
+          const byId = new Map<number, DiscoverRow>();
+          for (const row of personalPool) byId.set(row.id, row);
+          for (const row of catalogue) {
+            if (!byId.has(row.id)) byId.set(row.id, row);
+          }
+          return [...byId.values()];
+        };
+
+        // Le plancher de repli se juge sur le seul catalogue : lui seul a
+        // traversé le filtre des plateformes, et graines ou watchlist ne
+        // doivent pas masquer un vivier réellement asséché.
+        let cataloguePool =
+          filterByContentFormat(rawPool.filter(keep), answers);
         let notice: string | null = null;
 
-        if (pool.length < POOL_HARD_FLOOR && answers.platformIds.length > 0) {
+        if (cataloguePool.length < POOL_HARD_FLOOR &&
+          answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
-              answers, {dealbreaker: true, platforms: true}, tmdb(req, res),
+              answers, {dealbreaker: true, platforms: true}, ctx,
           );
-          pool = filterByContentFormat(relaxed.filter(keep), answers);
+          cataloguePool =
+            filterByContentFormat(relaxed.filter(keep), answers);
           notice = 'Résultats élargis hors de vos plateformes habituelles.';
         }
+        const pool = mergeRows(cataloguePool);
         if (!notice && pool.length < POOL_HEALTHY_TARGET) {
           logger.info('getCandidatePool: below healthy pool target', {
             uid, poolSize: pool.length, target: POOL_HEALTHY_TARGET,
           });
         }
+
+        // La provenance des graines, gardée pour la finalisation : c'est elle
+        // qui permettra la raison « Proche de X » (C5) sans faire transiter
+        // un champ de plus par le client.
+        const provenance: Record<string, string> = {};
+        for (const row of pool) {
+          const seedId = seedOf.get(row.id);
+          if (seedId === undefined) continue;
+          const title = library.titles.get(seedId);
+          if (title) provenance[String(row.id)] = title;
+        }
+        await userRef.collection('taste').doc('lastSeeds').set({
+          byCandidate: provenance,
+          at: a.firestore.Timestamp.now(),
+        });
 
         // Les axes sont calculés ici et nulle part ailleurs : le client les
         // rejoue tels quels pour son classement local, et les renvoie à la
@@ -2988,6 +4453,40 @@ export const finalizeRecommendations = onRequest(
         const rawCandidates =
           Array.isArray(body.candidates) ? body.candidates : [];
 
+        // Ce que la finalisation lit elle-même plutôt que de le faire
+        // transiter par le client : l'appartenance à la watchlist (C4), le
+        // prénom d'un ami qui a suggéré, et la provenance des graines (C5).
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+        const [watchlistSnap, seedsSnap] = await Promise.all([
+          userRef.collection('watchlist').get(),
+          userRef.collection('taste').doc('lastSeeds').get(),
+        ]);
+        const watchlistIds = new Set<number>();
+        const recommenders = new Map<number, string>();
+        for (const doc of watchlistSnap.docs) {
+          const id = doc.get('tmdbId');
+          if (typeof id !== 'number') continue;
+          watchlistIds.add(id);
+          const rows = doc.get('recommendedBy');
+          const first = Array.isArray(rows) ? rows[0] : null;
+          const name = (first as {displayName?: unknown} | null)?.displayName;
+          if (typeof name === 'string' && name.length > 0) {
+            recommenders.set(id, name);
+          }
+        }
+        const seedTitles = new Map<number, string>();
+        const byCandidate = seedsSnap.get('byCandidate');
+        if (typeof byCandidate === 'object' && byCandidate !== null) {
+          for (const [key, value] of Object.entries(byCandidate)) {
+            const id = Number(key);
+            if (Number.isFinite(id) && typeof value === 'string') {
+              seedTitles.set(id, value);
+            }
+          }
+        }
+
         let shortlist: EnrichedCandidate[] = rawCandidates
             .filter((c): c is Record<string, unknown> =>
               typeof c === 'object' && c !== null)
@@ -3055,6 +4554,31 @@ export const finalizeRecommendations = onRequest(
           return;
         }
 
+        // La durée, garantie sur la mesure réelle (V3·0). Un film à durée
+        // inconnue est écarté quand un plafond est actif : mieux vaut dire
+        // qu'il n'y a rien que trahir en silence.
+        const runtimeCap = runtimeCapFor(answers);
+        if (runtimeCap !== null) {
+          shortlist = shortlist.filter((c) =>
+            typeof c.runtimeMinutes === 'number' &&
+            c.runtimeMinutes <= runtimeCap);
+          if (shortlist.length === 0) {
+            res.status(409).json({error: 'no_candidates_within_runtime'});
+            return;
+          }
+        }
+
+        // Les plateformes, rejouées ici pour les entrées qui n'ont pas
+        // traversé la requête TMDB — graines (C3) et watchlist (C4). Souple,
+        // jamais un vivier vide : c'est la même politique de secours que le
+        // repli hors plateformes du vivier.
+        if (answers.platformIds.length > 0) {
+          const onPlatform = shortlist.filter((c) =>
+            answers.platformIds.some((id) =>
+              c.providerIds.includes(Number(id))));
+          if (onPlatform.length >= RESULT_COUNT) shortlist = onPlatform;
+        }
+
         // "predictablePlot" est un filtre dur : on retire les suites/sagas,
         // sauf si ça viderait la shortlist (jamais de résultat vide).
         if (answers.dealbreaker === 'predictablePlot') {
@@ -3076,31 +4600,73 @@ export const finalizeRecommendations = onRequest(
                 beliefScore(c.axes, c.axisSigma, belief) :
                 finalWeightedScore(c, answers),
             }))
-            .sort((a, b) => b.finalScore - a.finalScore);
+            // C4 — l'avantage modeste de la watchlist : de quoi gagner les
+            // égalités, pas de quoi imposer un film qui ne colle pas au soir.
+            .map((c) => watchlistIds.has(c.id) ? {
+              ...c,
+              finalScore: Math.min(100, c.finalScore + WATCHLIST_BONUS),
+            } : c)
+            .sort((lhs, rhs) => rhs.finalScore - lhs.finalScore);
 
         // L'exploration (softmax) choisit délibérément les 3 films dans un
         // ordre non strictement trié — on re-trie par score pour l'affichage
         // (#1/#2/#3) sans changer *lesquels* des 3 films ont été
         // sélectionnés.
-        const selected = selectWithExplorationAndDiversity(shortlist)
-            .sort((a, b) => b.finalScore - a.finalScore)
-            .map((c) => ({
-              ...c,
-              reasons: buildReasons(c, answers, requestedLanguage(req, res)),
-            }));
+        let selected = selectWithExplorationAndDiversity(shortlist)
+            .sort((lhs, rhs) => rhs.finalScore - lhs.finalScore);
 
-        const a = getAdmin();
-        await a.firestore().collection('users').doc(uid)
+        // C4 — la règle de priorité, franche : si un film de la liste arrive
+        // à quelques points du n°1, c'est lui qu'on propose. La traduction
+        // algorithmique de « si l'algo se rapproche d'un film de ta liste,
+        // c'est lui qu'on te montre ».
+        const bestListed = shortlist.find((c) => watchlistIds.has(c.id));
+        if (bestListed && shortlist.length > 0 &&
+          shortlist[0].finalScore - bestListed.finalScore <=
+            WATCHLIST_PRIORITY_GAP) {
+          selected = [
+            bestListed,
+            ...selected.filter((c) => c.id !== bestListed.id),
+          ].slice(0, RESULT_COUNT);
+        }
+
+        // C4 — le plafond : un film de la liste par soirée. Deux « Ce n'est
+        // pas lui » ne doivent pas enchaîner deux films de la liste.
+        let listedCount = 0;
+        const capped: EnrichedCandidate[] = [];
+        for (const candidate of selected) {
+          if (watchlistIds.has(candidate.id)) {
+            listedCount += 1;
+            if (listedCount > WATCHLIST_CAP_PER_NIGHT) continue;
+          }
+          capped.push(candidate);
+        }
+        for (const candidate of shortlist) {
+          if (capped.length >= RESULT_COUNT) break;
+          if (watchlistIds.has(candidate.id)) continue;
+          if (capped.some((c) => c.id === candidate.id)) continue;
+          capped.push(candidate);
+        }
+        const finalSelection = capped.slice(0, RESULT_COUNT).map((c) => ({
+          ...c,
+          reasons: buildReasons(c, answers, requestedLanguage(req, res), {
+            seedTitle: seedTitles.get(c.id) ?? null,
+            isListed: watchlistIds.has(c.id),
+            recommender: recommenders.get(c.id) ?? null,
+            belief,
+          }),
+        }));
+
+        await userRef
             .collection('recommendationHistory').add({
               createdAt: a.firestore.Timestamp.now(),
-              tmdbIds: selected.map((c) => c.id),
+              tmdbIds: finalSelection.map((c) => c.id),
               answers,
               // La position des trois films est conservée ici, et nulle part
               // ailleurs : c'est à elle que le verdict du lendemain viendra
               // s'accrocher. Sans ça, savoir qu'un film est « resté » avec
               // quelqu'un n'apprendrait rien — on ignorerait de quel film il
               // s'agissait dans l'espace commun.
-              films: selected.map((c, index) => ({
+              films: finalSelection.map((c, index) => ({
                 id: c.id,
                 title: c.title ?? null,
                 rank: index + 1,
@@ -3109,7 +4675,7 @@ export const finalizeRecommendations = onRequest(
             });
 
         res.status(200).json({
-          results: selected.map((c) => ({
+          results: finalSelection.map((c) => ({
             id: c.id,
             title: c.title ?? 'Sans titre',
             poster_path: c.poster_path ?? null,
@@ -4093,6 +5659,9 @@ export const getSwipeFeed = onRequest(
 /** Une décision de swipe telle qu'envoyée par le client. */
 interface SwipeDecisionPayload {
   decision: 'seen' | 'skipped' | 'watchlist';
+  /** Le second cran du balayage droite : vu ET adoré. Un modificateur de
+   * « seen », pas un quatrième verbe — la liste des décisions reste fermée. */
+  loved: boolean;
   item: MediaItemPayload & {voteCount?: number | null};
 }
 
@@ -4117,7 +5686,11 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
     if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
       continue;
     }
-    decisions.push({decision, item});
+    decisions.push({
+      decision,
+      loved: decision === 'seen' && entry.loved === true,
+      item,
+    });
   }
   return decisions;
 }
@@ -4143,7 +5716,7 @@ function skipCooldownMillis(skipCount: number): number {
  * n'attend jamais cette écriture.
  */
 export const recordSwipes = onRequest(
-    {invoker: 'public', timeoutSeconds: 30},
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
     async (req: Request, res: Response) => {
       try {
         if (req.method !== 'POST') {
@@ -4184,6 +5757,35 @@ export const recordSwipes = onRequest(
           }
         }
 
+        // L'écriture « seen » remplace le document : sans cette lecture, un
+        // film re-balayé perdrait le coup de cœur et le pays d'origine qu'il
+        // portait déjà.
+        const previousGallery = new Map<string, {
+          lovedAt: admin.firestore.Timestamp | null;
+          originCountry: string[] | null;
+        }>();
+        const seenIds = decisions
+            .filter((d) => d.decision === 'seen')
+            .map((d) => d.item.id);
+        if (seenIds.length > 0) {
+          const refs = Array.from(new Set(seenIds))
+              .map((id) => userRef.collection('gallery').doc(id));
+          const snaps = await db.getAll(...refs);
+          for (const snap of snaps) {
+            if (!snap.exists) continue;
+            const lovedAt = snap.get('lovedAt');
+            const originCountry = snap.get('originCountry');
+            previousGallery.set(snap.id, {
+              lovedAt: lovedAt instanceof a.firestore.Timestamp ?
+                lovedAt : null,
+              originCountry: Array.isArray(originCountry) ?
+                originCountry.filter(
+                    (c): c is string => typeof c === 'string',
+                ) : null,
+            });
+          }
+        }
+
         const counters = {
           genreSeen: {} as Record<string, admin.firestore.FieldValue>,
           genreWanted: {} as Record<string, admin.firestore.FieldValue>,
@@ -4200,7 +5802,7 @@ export const recordSwipes = onRequest(
 
         const batch = db.batch();
 
-        for (const {decision, item} of decisions) {
+        for (const {decision, loved, item} of decisions) {
           const galleryRef = userRef.collection('gallery').doc(item.id);
           const watchlistRef = userRef.collection('watchlist').doc(item.id);
           const skipRef = userRef.collection('swipeSkips').doc(item.id);
@@ -4245,11 +5847,22 @@ export const recordSwipes = onRequest(
           // le plus récent remplace le précédent, comme dans setMediaStatus.
           batch.delete(skipRef);
           if (decision === 'seen') {
+            const previous = previousGallery.get(item.id);
+            const lovedAt = loved ? now : previous?.lovedAt ?? null;
             batch.delete(watchlistRef);
-            batch.set(galleryRef, data);
+            batch.set(galleryRef, {
+              ...data,
+              ...(lovedAt ? {lovedAt} : {}),
+              ...(previous?.originCountry ?
+                {originCountry: previous.originCountry} : {}),
+            });
             for (const genreId of genreIds) bump('genreSeen', String(genreId));
             if (decade !== null) bump('decadeSeen', String(decade));
           } else {
+            // Reclasser un film vu en « à voir » emporte son coup de cœur, et
+            // c'est voulu : le cœur ne vit que sur un film de la Galerie, et
+            // « je veux le voir » contredit « je l'ai vu et adoré ». Le pays
+            // d'origine repart aussi ; l'enrichissement le rapprendra.
             batch.delete(galleryRef);
             batch.set(watchlistRef, data);
             for (const genreId of genreIds) {
@@ -4280,6 +5893,28 @@ export const recordSwipes = onRequest(
         );
 
         await batch.commit();
+
+        // C1 — les films qui viennent d'entrer en galerie reçoivent leur
+        // position, via le cache global. Plafonné : un lot de quarante venus
+        // d'un import attendra le rattrapage pour le reste.
+        if (seenIds.length > 0) {
+          try {
+            const refs = Array.from(new Set(seenIds))
+                .map((id) => userRef.collection('gallery').doc(id));
+            const snaps = await db.getAll(...refs);
+            const pendingDocs = snaps.filter((snap) =>
+              snap.exists && snap.get('axesV') !== AXES_VERSION);
+            if (pendingDocs.length > 0) {
+              await positionGalleryDocs(
+                  pendingDocs.slice(0, GALLERY_POSITION_BATCH),
+                  tmdb(req, res), db,
+              );
+            }
+          } catch (error) {
+            logger.warn('recordSwipes: positioning failed', {error});
+          }
+        }
+
         res.status(200).json({ok: true, recorded: decisions.length});
       } catch (error) {
         logger.error('recordSwipes failed', {error});
