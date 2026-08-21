@@ -4102,6 +4102,107 @@ export const getGalleryAxes = onRequest(
     },
 );
 
+/* ===================================================================== *
+ *  La passe de rattrapage : l'existant rejoint la V3
+ * ===================================================================== */
+
+/** Films positionnés par tour de rattrapage. */
+const BACKFILL_CHUNK = 10;
+/**
+ * Le budget d'une passe, en deçà du délai de la fonction : elle doit
+ * toujours rendre son compte plutôt que d'être coupée, sans quoi le client
+ * ne saurait pas s'il reste du travail.
+ */
+const BACKFILL_BUDGET_MS = 240000;
+
+/**
+ * Rend rétroactif ce que la V3 apporte : les films déjà en galerie
+ * reçoivent leur position (C1), et les « Je l'ai adoré » déjà dits en
+ * séance deviennent des coups de cœur.
+ *
+ * Le goutte-à-goutte des autres points d'entrée — dix films par ouverture
+ * de l'onglet — mettrait trente visites à couvrir une galerie de trois
+ * cents films. Cette passe fait le même travail d'un bloc, bornée par un
+ * budget de temps : elle rend ce qu'elle a fait et ce qu'il reste, et le
+ * client rappelle tant qu'il reste quelque chose.
+ */
+export const backfillGallery = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 300},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const started = Date.now();
+        const a = getAdmin();
+        const db = a.firestore();
+        const userRef = db.collection('users').doc(uid);
+        const ctx = tmdb(req, res);
+
+        // Les verdicts déjà rendus. « Resté avec moi » vaut coup de cœur
+        // pour les séances à venir ; il le vaut aussi pour celles qui sont
+        // derrière, sinon la porte ignorerait ce qui a déjà été dit.
+        let hearts = 0;
+        const staySnap = await userRef.collection('recommendationHistory')
+            .where('verdict', '==', 'stayed').get();
+        for (const doc of staySnap.docs) {
+          if (doc.get('lovedApplied') === true) continue;
+          const launched = doc.get('launched') as {
+            tmdbId?: unknown; at?: unknown;
+          } | null;
+          const tmdbId = Number(launched?.tmdbId);
+          if (Number.isFinite(tmdbId)) {
+            const galleryRef = userRef.collection('gallery')
+                .doc(`movie-${tmdbId}`);
+            const snap = await galleryRef.get();
+            const already = snap.get('lovedAt');
+            if (snap.exists && !(already instanceof a.firestore.Timestamp)) {
+              // La date du lancement, pas celle du rattrapage : la demi-vie
+              // du trait doit voir la soirée où elle a eu lieu.
+              await galleryRef.set({
+                lovedAt: launched?.at instanceof a.firestore.Timestamp ?
+                  launched.at : a.firestore.Timestamp.now(),
+              }, {merge: true});
+              await bumpFilmPref(userRef, tmdbId, ELO_STAYED_BONUS);
+              hearts += 1;
+            }
+          }
+          await doc.ref.set({lovedApplied: true}, {merge: true});
+        }
+
+        // Les positions, par lots, jusqu'à épuisement ou fin du budget. On
+        // compte les films *tentés* et non les réussites : une fiche que
+        // TMDB refuse ne doit pas faire boucler le client indéfiniment.
+        const gallerySnap = await userRef.collection('gallery').get();
+        const pending = pendingGalleryPositions(gallerySnap);
+        let attempted = 0;
+        let positioned = 0;
+        while (attempted < pending.length &&
+          Date.now() - started < BACKFILL_BUDGET_MS) {
+          const chunk = pending.slice(attempted, attempted + BACKFILL_CHUNK);
+          const learned = await positionGalleryDocs(chunk, ctx, db);
+          positioned += learned.size;
+          attempted += chunk.length;
+        }
+
+        res.status(200).json({
+          done: attempted >= pending.length,
+          positioned,
+          hearts,
+          remaining: Math.max(0, pending.length - attempted),
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('backfillGallery failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
 /**
  * Une correction posée sur la Fiche. Stockée à part du calcul : un recalcul du
  * trait ne doit jamais effacer ce que quelqu'un a dit de lui-même. Une valeur
