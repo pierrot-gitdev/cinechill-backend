@@ -817,13 +817,23 @@ export const setGalleryLove = onRequest(
 
 /** TMDB genre ids (stables, documentés) utilisés pour le mapping des genres. */
 const GENRE_TMDB_IDS: Record<string, number[]> = {
-  action: [28],
-  comedy: [35],
   drama: [18],
+  comedy: [35],
   thriller: [53],
-  scifiFantasy: [878, 14],
-  horror: [27],
+  action: [28],
   romance: [10749],
+  horror: [27],
+  crime: [80],
+  adventure: [12],
+  scifi: [878],
+  fantasy: [14],
+  family: [10751],
+
+  // Anciens slugs, gardés pour les versions de l'app encore en circulation :
+  // `scifiFantasy` a été coupé en deux, `animation` est passé sous
+  // `contentFormat` et `documentary` a quitté le questionnaire. Un client à
+  // jour ne les envoie plus ; un client ancien continue de fonctionner.
+  scifiFantasy: [878, 14],
   animation: [16],
   documentary: [99],
 };
@@ -952,7 +962,15 @@ const POOL_HEALTHY_TARGET = 60;
 const POOL_HARD_FLOOR = 20;
 const ENRICH_BATCH_MAX = 60;
 const RESULT_COUNT = 3;
-const SOFTMAX_TEMPERATURE = 9;
+/**
+ * La note minimale pour qu'un film mérite d'être proposé, sur le barème de
+ * `beliefScore` (0..100). Le client tient la même barre, sur la même formule,
+ * et c'est lui qui s'en sert pour décider s'il pose une question de plus.
+ * Ici elle ne filtre rien : elle sert à mesurer, dans l'historique, à quelle
+ * hauteur les séances concluent réellement. C'est ce journal qui dira où
+ * poser la barre pour de bon.
+ */
+const ELIGIBILITY_FLOOR = 75;
 const HISTORY_WINDOW_DAYS = 30;
 const HISTORY_RUNS_CONSIDERED = 5;
 
@@ -1045,6 +1063,10 @@ interface EnrichedCandidate extends DiscoverRow {
    * par l'enrichissement seul : à la finalisation, ils ont déjà produit leur
    * effet dans les axes, qui voyagent avec le candidat. */
   keywordNames?: string[];
+  /** Classification française du film ('U', '10', '12', '16', '18'), à défaut
+   * l'américaine. `null` quand TMDB n'en connaît aucune, ce qui est le cas le
+   * plus fréquent : c'est pourquoi elle sert à EXCLURE et jamais à retenir. */
+  certification?: string | null;
   /** Position du film dans l'espace commun, et incertitude sur cette position.
    * Renseignées seulement à la finalisation, où le client les renvoie. */
   axes?: AxisVector;
@@ -1355,6 +1377,23 @@ async function fetchCandidatePool(
     }
   }
 
+  // Deux genres demandés : TMDB les combine en OU (le pipe), ce qui rend
+  // l'union de deux catalogues, où presque aucun film n'est vraiment les deux.
+  // La virgule, elle, fait un ET. On ne remplace pas le OU — exiger les deux
+  // genres serait bien plus dur que ce qui a été coché, et viderait souvent la
+  // recherche — on ajoute la tranche des films qui cochent les deux, qui sont
+  // par construction les plus proches de la demande.
+  const requestedGenres = genreIdsFor(answers.genres);
+  if (requestedGenres.length > 1) {
+    requests.push(tmdbGET('/discover/movie', {
+      ...base,
+      'with_genres': requestedGenres.join(','),
+      'sort_by': 'vote_average.desc',
+      'vote_count.gte': '100',
+      'page': '1',
+    }, ctx));
+  }
+
   // Il y avait ici une tranche qui retirait `with_genres` pour élargir le
   // vivier au-delà des genres demandés. Elle se justifiait quand les genres
   // étaient *déduits* d'un trajet d'humeur : une déduction fausse enfermait la
@@ -1372,6 +1411,209 @@ async function fetchCandidatePool(
       'vote_count.gte': '100',
       'vote_count.lte': '2000',
       'page': String(page),
+    }, ctx));
+  }
+
+  const responses = await Promise.allSettled(requests);
+  const byId = new Map<number, DiscoverRow>();
+  for (const settled of responses) {
+    if (settled.status !== 'fulfilled') continue;
+    const results = Array.isArray(settled.value.results) ?
+      settled.value.results as DiscoverRow[] : [];
+    for (const row of results) {
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+  }
+  return Array.from(byId.values());
+}
+
+/* ===================================================================== *
+ *  La réouverture du vivier (Phase A')
+ *
+ *  Le premier vivier part avant la première question : il ne connaît que le
+ *  socle — le genre, la durée, l'ambiance. C'est sa limite structurelle. Quand
+ *  la séance a tout appris qu'elle pouvait apprendre et qu'aucun film
+ *  n'atteint la note minimale, le problème n'est plus la croyance, c'est le
+ *  vivier : il ne contient rien pour ce soir, et poser une question de plus ne
+ *  l'y mettra pas.
+ *
+ *  On repart alors chercher, cette fois avec la croyance en main. Trois
+ *  angles, tous dans une seule salve : les mots-clés qui vont dans le sens de
+ *  ce qu'on a appris, la tranche bien notée mais peu vue — la perle — et le
+ *  catalogue plus loin que la première recherche n'était allée.
+ * ===================================================================== */
+
+/** Le plancher de note publique d'une réouverture. */
+const REOPEN_VOTE_AVERAGE = 6.5;
+/** Combien de mots-clés on retient pour viser la croyance. */
+const REOPEN_KEYWORD_COUNT = 6;
+/** Le doc global où l'on retient l'identifiant TMDB d'un mot-clé. */
+const KEYWORD_ID_DOC = 'catalog/keywordIds';
+
+/**
+ * À quel point un vecteur d'axes va dans le sens de la croyance.
+ *
+ * Un produit scalaire pondéré : positif quand le mot-clé pousse l'axe du même
+ * côté que la personne, et d'autant plus que cet axe pèse dans son score. Un
+ * axe sur lequel elle ne s'est pas exprimée ne compte pas — on ne cherchera
+ * pas un film « lent » parce que le lexique aime la lenteur.
+ * @param {Partial<Record<AxisKey, number>>} vector Position du mot-clé.
+ * @param {BeliefPayload} belief Croyance sur la personne.
+ * @return {number} Alignement, positif quand les deux vont dans le même sens.
+ */
+function beliefAlignment(
+    vector: Partial<Record<AxisKey, number>>, belief: BeliefPayload,
+): number {
+  let sum = 0;
+  for (const axis of AXIS_KEYS) {
+    const value = vector[axis];
+    if (typeof value !== 'number') continue;
+    sum += Math.max(0, belief.weight[axis]) * value * belief.mu[axis];
+  }
+  return sum;
+}
+
+/**
+ * Les mots-clés du lexique les mieux alignés sur la croyance du soir.
+ *
+ * C'est le lexique de positionnement (C1) lu à l'envers : il sert d'habitude à
+ * placer un film à partir de ses mots-clés ; ici il sert à trouver les mots
+ * qui décrivent le film qu'on cherche.
+ * @param {BeliefPayload} belief Croyance sur la personne.
+ * @param {number} count Combien de mots-clés au plus.
+ * @return {string[]} Les noms de mots-clés, du mieux aligné au moins bon.
+ */
+function keywordsForBelief(belief: BeliefPayload, count: number): string[] {
+  return Object.entries(KEYWORD_AXIS_WEIGHTS)
+      .map(([name, vector]) => ({name, score: beliefAlignment(vector, belief)}))
+      .filter((entry) => entry.score > 0.2)
+      .sort((lhs, rhs) => rhs.score - lhs.score)
+      .slice(0, count)
+      .map((entry) => entry.name);
+}
+
+/**
+ * Les identifiants TMDB de ces mots-clés, appris une fois pour toutes.
+ *
+ * `with_keywords` veut des identifiants, le lexique ne connaît que des noms.
+ * La correspondance ne bouge jamais : on la retient dans un document global,
+ * y compris les échecs (un 0), pour ne pas rechercher indéfiniment un mot que
+ * TMDB ne nomme pas comme nous.
+ * @param {string[]} names Noms de mots-clés.
+ * @param {FirebaseFirestore.Firestore} db Firestore.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<number[]>} Les identifiants connus, sans les introuvables.
+ */
+async function resolveKeywordIds(
+    names: string[],
+    db: FirebaseFirestore.Firestore,
+    ctx: TMDBContext,
+): Promise<number[]> {
+  if (names.length === 0) return [];
+  const ref = db.doc(KEYWORD_ID_DOC);
+  let cached: Record<string, number> = {};
+  try {
+    cached = ((await ref.get()).data() ?? {}) as Record<string, number>;
+  } catch {
+    // Sans cache, on cherche : c'est plus lent, jamais faux.
+  }
+
+  const found: number[] = [];
+  const learned: Record<string, number> = {};
+  await Promise.all(names.map(async (name) => {
+    const key = name.toLowerCase();
+    if (typeof cached[key] === 'number') {
+      if (cached[key] > 0) found.push(cached[key]);
+      return;
+    }
+    try {
+      const response = await tmdbGET('/search/keyword', {query: name}, ctx);
+      const results = Array.isArray(response.results) ?
+        response.results as {id?: number; name?: string}[] : [];
+      const exact = results.find(
+          (row) => (row.name ?? '').toLowerCase() === key,
+      );
+      const id = typeof exact?.id === 'number' ? exact.id : 0;
+      learned[key] = id;
+      if (id > 0) found.push(id);
+    } catch {
+      // Un mot-clé muet ne coûte que lui-même.
+    }
+  }));
+
+  if (Object.keys(learned).length > 0) {
+    try {
+      await ref.set(learned, {merge: true});
+    } catch {
+      // Le cache est un confort, pas une dépendance.
+    }
+  }
+  return found;
+}
+
+/**
+ * Le vivier de la seconde chance.
+ *
+ * Mêmes filtres durs que la première recherche — un genre demandé reste un
+ * genre demandé, une durée annoncée reste une contrainte — mais trois angles
+ * que la première ne pouvait pas prendre, faute de savoir ce que la personne
+ * cherchait ce soir.
+ * @param {QuestionnaireAnswersPayload} answers Réponses du socle.
+ * @param {number[]} keywordIds Mots-clés visés, éventuellement vide.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<DiscoverRow[]>} Candidats dédoublonnés.
+ */
+async function fetchReopenedPool(
+    answers: QuestionnaireAnswersPayload,
+    keywordIds: number[],
+    ctx: TMDBContext,
+): Promise<DiscoverRow[]> {
+  const base = baseDiscoverParams(
+      answers, {dealbreaker: true, platforms: false},
+  );
+  // Le plancher de note ne vaut que pour cette salve : on cherche mieux, pas
+  // seulement ailleurs. Sur le vivier ordinaire il changerait la nature du
+  // produit — un film mal noté par le public peut coller parfaitement à
+  // quelqu'un, et c'est même souvent ce qu'on appelle une perle.
+  const quality: Record<string, string> = {
+    ...base,
+    'vote_average.gte': String(REOPEN_VOTE_AVERAGE),
+    'vote_count.gte': String(Math.max(
+        80, Number(base['vote_count.gte'] ?? 0),
+    )),
+  };
+
+  const requests: Promise<Record<string, unknown>>[] = [];
+
+  // Ce que la soirée dit vouloir, mot pour mot. Le OU (pipe) plutôt que le ET :
+  // exiger six mots-clés sur un même film ne rendrait rien.
+  if (keywordIds.length > 0) {
+    for (let page = 1; page <= 2; page++) {
+      requests.push(tmdbGET('/discover/movie', {
+        ...quality,
+        'with_keywords': keywordIds.join('|'),
+        'sort_by': 'vote_average.desc',
+        'page': String(page),
+      }, ctx));
+    }
+  }
+
+  // La perle : bien notée, peu vue. La première recherche a la même tranche,
+  // mais bornée à 2000 votes et sans plancher de note.
+  for (let page = 1; page <= 2; page++) {
+    requests.push(tmdbGET('/discover/movie', {
+      ...quality,
+      'vote_count.lte': '4000',
+      'sort_by': 'vote_average.desc',
+      'page': String(page),
+    }, ctx));
+  }
+
+  // Et plus loin dans le catalogue que la première n'était allée : elle
+  // s'arrêtait à la deuxième page de chaque tri.
+  for (const page of ['3', '4']) {
+    requests.push(tmdbGET('/discover/movie', {
+      ...quality, 'sort_by': 'popularity.desc', 'page': page,
     }, ctx));
   }
 
@@ -3174,6 +3416,33 @@ function buildReasons(
   return reasons.slice(0, 4);
 }
 
+/** Classifications interdites aux mineurs, France puis États-Unis. */
+const ADULT_CERTIFICATIONS = new Set(['18', 'NC-17']);
+
+/**
+ * La classification d'âge d'un film, lue sur `release_dates`.
+ *
+ * La France d'abord, les États-Unis à défaut. TMDB renvoie plusieurs sorties
+ * par pays (salle, vidéo, streaming) et toutes ne portent pas la mention : on
+ * garde la première non vide.
+ * @param {Record<string, unknown>} detail Fiche TMDB avec `release_dates`.
+ * @return {string | null} La classification, ou null si aucune n'est connue.
+ */
+function certificationFrom(detail: Record<string, unknown>): string | null {
+  const results = (detail.release_dates as {
+    results?: {iso_3166_1?: string; release_dates?: {certification?: string}[]}[]
+  } | undefined)?.results;
+  if (!Array.isArray(results)) return null;
+  for (const code of ['FR', 'US']) {
+    const entry = results.find((r) => r.iso_3166_1 === code);
+    for (const release of entry?.release_dates ?? []) {
+      const value = (release.certification ?? '').trim();
+      if (value) return value;
+    }
+  }
+  return null;
+}
+
 /**
  * Fetch le détail TMDB (runtime, casting, collection, providers FR) pour un
  * candidat de la shortlist — une seule requête par film grâce à
@@ -3188,7 +3457,8 @@ async function enrichCandidate(
 ): Promise<EnrichedCandidate | null> {
   try {
     const detail = await tmdbGET(`/movie/${row.id}`, {
-      append_to_response: 'credits,videos,watch/providers,keywords',
+      append_to_response:
+        'credits,videos,watch/providers,keywords,release_dates',
     }, ctx);
 
     const creditsCast = (detail.credits as {cast?: unknown} | undefined)?.cast;
@@ -3212,6 +3482,8 @@ async function enrichCandidate(
       (rawKeywords as {name?: unknown}[])
           .map((k) => k.name)
           .filter((n): n is string => typeof n === 'string') : [];
+
+    const certification = certificationFrom(detail);
 
     const videosResults =
       (detail.videos as {results?: unknown} | undefined)?.results;
@@ -3246,6 +3518,7 @@ async function enrichCandidate(
       castPopularities,
       providerIds,
       trailerKey,
+      certification,
       budget: typeof detail.budget === 'number' ? detail.budget : null,
       keywordNames: keywordNames,
       finalScore: 0,
@@ -3257,63 +3530,22 @@ async function enrichCandidate(
   }
 }
 
-/**
- * Sélectionne 3 candidats parmi la shortlist enrichie, avec exploration
- * (softmax pondéré par score plutôt qu'un argmax strict) et diversité (MMR :
- * pénalité si trop proche d'un candidat déjà retenu).
- * @param {EnrichedCandidate[]} shortlist Candidats triés par score décroissant.
- * @return {EnrichedCandidate[]} Jusqu'à 3 candidats sélectionnés.
+/* Il y avait ici `selectWithExplorationAndDiversity` et son `softmaxPick` :
+ * les trois films n'étaient pas les trois premiers du classement, mais un
+ * tirage au sort pondéré parmi les huit premiers, avec des pénalités de
+ * diversité (−15 pour deux genres partagés, −5 pour une même décennie).
+ *
+ * Ils sont partis avec le trio. Depuis que le verdict propose **un** film, le
+ * mieux classé, l'exploration au moment de la sélection ne peut plus être un
+ * assouplissement du classement : c'est un désaveu. Une séance entière tourne
+ * à choisir le meilleur film, et la dernière ligne en tirait un autre au sort.
+ *
+ * L'exploration n'a pas disparu du produit, elle a changé d'étage : elle vit
+ * dans la *composition* du vivier — la tranche basse notoriété, les graines du
+ * graphe de préférence, la réouverture sur la croyance du soir — où elle
+ * apporte des films qu'on n'aurait pas vus, au lieu de dégrader un choix déjà
+ * fait.
  */
-function selectWithExplorationAndDiversity(
-    shortlist: EnrichedCandidate[],
-): EnrichedCandidate[] {
-  const picked: EnrichedCandidate[] = [];
-  const remaining = [...shortlist];
-
-  while (picked.length < RESULT_COUNT && remaining.length > 0) {
-    const pool = remaining.slice(0, Math.max(8, RESULT_COUNT));
-    const adjusted = pool.map((candidate) => {
-      const penalty = picked.reduce((sum, p) => {
-        const sharedGenres = (candidate.genre_ids ?? [])
-            .filter((g) => (p.genre_ids ?? []).includes(g)).length;
-        const sameDecade = candidate.release_date && p.release_date &&
-          Math.floor(Number(candidate.release_date.slice(0, 4)) / 10) ===
-          Math.floor(Number(p.release_date.slice(0, 4)) / 10);
-        return sum + (sharedGenres >= 2 ? 15 : 0) + (sameDecade ? 5 : 0);
-      }, 0);
-      return {
-        candidate, adjustedScore: Math.max(1, candidate.finalScore - penalty),
-      };
-    });
-
-    const chosen = softmaxPick(adjusted);
-    picked.push(chosen.candidate);
-    const idx = remaining.findIndex((c) => c.id === chosen.candidate.id);
-    if (idx >= 0) remaining.splice(idx, 1);
-  }
-
-  return picked;
-}
-
-/**
- * Weighted random pick using a softmax over the candidates' adjusted score —
- * favors high scores without being a strict, always-identical argmax.
- * @param {{candidate: EnrichedCandidate, adjustedScore: number}[]} items
- *   Candidates with their diversity-adjusted score.
- * @return {{candidate: EnrichedCandidate, adjustedScore: number}} The picked
- *   item.
- */
-function softmaxPick<T extends {adjustedScore: number}>(items: T[]): T {
-  const weights =
-    items.map((i) => Math.exp(i.adjustedScore / SOFTMAX_TEMPERATURE));
-  const total = weights.reduce((a, b) => a + b, 0);
-  let r = Math.random() * total;
-  for (let i = 0; i < items.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return items[i];
-  }
-  return items[items.length - 1];
-}
 
 /**
  * Verify the Firebase bearer token on a request, sending the appropriate
@@ -4277,15 +4509,39 @@ export const getCandidatePool = onRequest(
         const userRef = db.collection('users').doc(uid);
         const ctx = tmdb(req, res);
 
+        // La réouverture (Phase A') : le client a posé toutes ses questions
+        // sans qu'aucun film n'atteigne la note minimale, et renvoie sa
+        // croyance pour qu'on aille chercher autrement. Sans elle, on est sur
+        // le chemin normal — celui qui part avant la première question.
+        const body = req.body as Record<string, unknown> | undefined;
+        const reopenBelief =
+          body?.reopen === true ? parseBelief(body.belief) : null;
+        const rawExcluded = body?.excludeTmdbIds;
+        const alreadySeen = new Set(
+            Array.isArray(rawExcluded) ?
+              (rawExcluded as unknown[]).filter(
+                  (v): v is number =>
+                    typeof v === 'number' && Number.isFinite(v),
+              ) :
+              [],
+        );
+        const keywordIds = reopenBelief ?
+          await resolveKeywordIds(
+              keywordsForBelief(reopenBelief, REOPEN_KEYWORD_COUNT), db, ctx,
+          ) :
+          [];
+
         const [library, declared, prefsSnap, rawPool] = await Promise.all([
           fetchLibraryForPool(db, uid),
           fetchDeclaredProfile(db, uid),
           userRef.collection('taste').doc('filmPrefs').get(),
-          fetchCandidatePool(
-              answers,
-              {dealbreaker: true, platforms: false},
-              ctx,
-          ),
+          reopenBelief ?
+            fetchReopenedPool(answers, keywordIds, ctx) :
+            fetchCandidatePool(
+                answers,
+                {dealbreaker: true, platforms: false},
+                ctx,
+            ),
         ]);
 
         // Les graines personnelles (C3) : le voisinage TMDB des têtes du
@@ -4302,12 +4558,18 @@ export const getCandidatePool = onRequest(
         };
         // Les têtes du graphe seulement : un film sous le score de départ a
         // *perdu* ses duels, il ne sème rien. Les coups de cœur complètent.
-        for (const [id, rating] of
-          [...prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
-          if (rating <= ELO_START) break;
-          pushSeed(id);
+        //
+        // Une réouverture ne resème pas : ces graines ont déjà donné leur
+        // voisinage au premier vivier, et le redemander rendrait exactement
+        // les mêmes films, que le client vient d'écarter.
+        if (!reopenBelief) {
+          for (const [id, rating] of
+            [...prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
+            if (rating <= ELO_START) break;
+            pushSeed(id);
+          }
+          for (const id of library.lovedSeeds) pushSeed(id);
         }
-        for (const id of library.lovedSeeds) pushSeed(id);
 
         const seedRows = new Map<number, DiscoverRow>();
         const seedOf = new Map<number, number>();
@@ -4339,6 +4601,10 @@ export const getCandidatePool = onRequest(
         // porter l'information. La durée suit le même chemin (V3·0).
         const keep = (row: DiscoverRow): boolean =>
           !library.excluded.has(row.id) &&
+          // Ce que le client a déjà : à la réouverture, il n'attend que du
+          // neuf. Lui renvoyer son propre vivier lui ferait repayer un
+          // enrichissement pour rien.
+          !alreadySeen.has(row.id) &&
           !(row.genre_ids ?? [])
               .some((id) => declared.bannedGenreIDs.has(id)) &&
           matchesRequestedGenres(row.genre_ids, answers);
@@ -4382,7 +4648,10 @@ export const getCandidatePool = onRequest(
           filterByContentFormat(rawPool.filter(keep), answers);
         let notice: string | null = null;
 
-        if (cataloguePool.length < POOL_HARD_FLOOR &&
+        // Le repli hors plateformes ne vaut que pour le premier vivier : à la
+        // réouverture il rappellerait la recherche d'origine, dont tous les
+        // films sont déjà chez le client.
+        if (!reopenBelief && cataloguePool.length < POOL_HARD_FLOOR &&
           answers.platformIds.length > 0) {
           const relaxed = await fetchCandidatePool(
               answers, {dealbreaker: true, platforms: true}, ctx,
@@ -4401,6 +4670,11 @@ export const getCandidatePool = onRequest(
         // La provenance des graines, gardée pour la finalisation : c'est elle
         // qui permettra la raison « Proche de X » (C5) sans faire transiter
         // un champ de plus par le client.
+        //
+        // Une réouverture n'y touche pas : elle n'a semé personne, et écrire
+        // sa provenance vide effacerait celle du premier vivier — les films
+        // qui en venaient perdraient leur « Proche de X, que tu as aimé » au
+        // moment même où on les propose.
         const provenance: Record<string, string> = {};
         for (const row of pool) {
           const seedId = seedOf.get(row.id);
@@ -4408,10 +4682,12 @@ export const getCandidatePool = onRequest(
           const title = library.titles.get(seedId);
           if (title) provenance[String(row.id)] = title;
         }
-        await userRef.collection('taste').doc('lastSeeds').set({
-          byCandidate: provenance,
-          at: a.firestore.Timestamp.now(),
-        });
+        if (!reopenBelief) {
+          await userRef.collection('taste').doc('lastSeeds').set({
+            byCandidate: provenance,
+            at: a.firestore.Timestamp.now(),
+          });
+        }
 
         // Les axes sont calculés ici et nulle part ailleurs : le client les
         // rejoue tels quels pour son classement local, et les renvoie à la
@@ -4478,6 +4754,13 @@ export const enrichCandidates = onRequest(
             }))
             .filter((row) => Number.isFinite(row.id));
 
+        // Avec des enfants, on écarte ce qui leur est interdit. **Jamais au
+        // vivier** : `certification.lte` exclut aussi tout film que TMDB ne
+        // classe pas, soit 78 % du catalogue mesuré, alors que les films
+        // réellement classés 18 en pèsent moins de 1 %. Ici, sur la seule
+        // liste courte, l'exclusion est exacte et ne coûte rien.
+        const audience = typeof body.audience === 'string' ? body.audience : '';
+
         if (rows.length === 0) {
           res.status(400).json({error: 'no_candidates'});
           return;
@@ -4507,7 +4790,9 @@ export const enrichCandidates = onRequest(
             .filter((r) => r.status === 'fulfilled')
             .map((r) =>
               (r as PromiseFulfilledResult<EnrichedCandidate | null>).value)
-            .filter((c): c is EnrichedCandidate => c !== null);
+            .filter((c): c is EnrichedCandidate => c !== null)
+            .filter((c) => audience !== 'family' ||
+              !ADULT_CERTIFICATIONS.has(c.certification ?? ''));
 
         res.status(200).json({
           candidates: enriched.map((c) => {
@@ -4709,12 +4994,9 @@ export const finalizeRecommendations = onRequest(
             } : c)
             .sort((lhs, rhs) => rhs.finalScore - lhs.finalScore);
 
-        // L'exploration (softmax) choisit délibérément les 3 films dans un
-        // ordre non strictement trié — on re-trie par score pour l'affichage
-        // (#1/#2/#3) sans changer *lesquels* des 3 films ont été
-        // sélectionnés.
-        let selected = selectWithExplorationAndDiversity(shortlist)
-            .sort((lhs, rhs) => rhs.finalScore - lhs.finalScore);
+        // Le classement, et rien d'autre : le premier est le verdict, les deux
+        // suivants sont ce qu'on montrera s'il est refusé.
+        let selected = shortlist.slice(0, RESULT_COUNT);
 
         // C4 — la règle de priorité, franche : si un film de la liste arrive
         // à quelques points du n°1, c'est lui qu'on propose. La traduction
@@ -4772,7 +5054,13 @@ export const finalizeRecommendations = onRequest(
                 title: c.title ?? null,
                 rank: index + 1,
                 axes: c.axes ?? null,
+                // La note du film, gardée pour la première fois. Croisée avec
+                // ce que la soirée en a fait — lancé, passé, refusé — c'est
+                // elle qui dira si la barre est au bon endroit.
+                score: c.finalScore,
               })),
+              belowFloor:
+                (finalSelection[0]?.finalScore ?? 0) < ELIGIBILITY_FLOOR,
             });
 
         res.status(200).json({
