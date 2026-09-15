@@ -4,6 +4,7 @@ import {defineSecret, defineString} from 'firebase-functions/params';
 import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
 import * as admin from 'firebase-admin';
+import * as engine from './cinematch/engine';
 
 /**
  * Initialise l'Admin SDK une seule fois, quel que soit le nombre de fonctions
@@ -3416,6 +3417,12 @@ function buildReasons(
   return reasons.slice(0, 4);
 }
 
+/** Les sorties d'un film dans un pays, telles que `release_dates` les rend. */
+interface ReleaseDatesByCountry {
+  iso_3166_1?: string;
+  release_dates?: {certification?: string}[];
+}
+
 /** Classifications interdites aux mineurs, France puis États-Unis. */
 const ADULT_CERTIFICATIONS = new Set(['18', 'NC-17']);
 
@@ -3430,7 +3437,7 @@ const ADULT_CERTIFICATIONS = new Set(['18', 'NC-17']);
  */
 function certificationFrom(detail: Record<string, unknown>): string | null {
   const results = (detail.release_dates as {
-    results?: {iso_3166_1?: string; release_dates?: {certification?: string}[]}[]
+    results?: ReleaseDatesByCountry[]
   } | undefined)?.results;
   if (!Array.isArray(results)) return null;
   for (const code of ['FR', 'US']) {
@@ -3606,11 +3613,22 @@ function discoverRowToJSON(row: DiscoverRow) {
  * client : elles s'ajustent sans release, et la porte raconte toujours l'état
  * que le serveur mesure réellement.
  */
-const DOOR_MEMOIRE_TARGET = 30;
+const DOOR_MEMOIRE_TARGET = 20;
 const DOOR_EVENTAIL_TARGET = 6;
 const DOOR_COEUR_TARGET = 12;
+/**
+ * Décennies et pays ne gardent plus la porte (CinéMatch v2) : ils restent
+ * mesurés et renvoyés dans l'objet `horizons`, que les anciennes versions
+ * de l'app lisent encore, mais n'entrent plus dans `unlocked`.
+ */
 const DOOR_HORIZONS_DECADES_TARGET = 4;
 const DOOR_HORIZONS_COUNTRIES_TARGET = 3;
+/**
+ * « Tes préférences » : les comparaisons jouées entre films vus. Douze
+ * suffisent à dire quelles soirées on préfère ; c'est ce que les
+ * comparaisons de CinéMatch réclament pour avoir de quoi trancher.
+ */
+const DOOR_PREFERENCES_TARGET = 12;
 const DOOR_PROMESSE_TARGET = 10;
 /**
  * Films positionnés par appel, au plus. La Galerie s'enrichit paresseusement :
@@ -3823,12 +3841,14 @@ function pendingGalleryPositions(
  * @param {admin.firestore.QuerySnapshot} watchlistSnap La watchlist.
  * @param {Map<string, string[]>} freshOrigins Pays appris pendant cet appel,
  *   pas encore visibles dans le snapshot.
+ * @param {number} duelsCount Comparaisons jouées (`taste/duels.count`).
  * @return {DoorState} La porte, artéfact par artéfact.
  */
 function doorStateFrom(
     gallerySnap: admin.firestore.QuerySnapshot,
     watchlistSnap: admin.firestore.QuerySnapshot,
     freshOrigins: Map<string, string[]>,
+    duelsCount: number,
 ): DoorState {
   const genres = new Set<number>();
   const decades = new Set<number>();
@@ -3871,15 +3891,14 @@ function doorStateFrom(
     target: DOOR_COEUR_TARGET,
     done: lovedCount >= DOOR_COEUR_TARGET,
   };
-  // Les Horizons portent deux mesures : la jauge additionne les deux pour
-  // avancer d'un cran à chaque progrès, le détail garde les vrais comptes.
+  // La clé `horizons` est gardée pour ne pas casser les clients installés,
+  // mais l'artéfact est devenu « Tes préférences » : il compte les
+  // comparaisons jouées. Décennies et pays ne restent que dans le détail.
   const horizons = {
     key: 'horizons',
-    current: Math.min(decades.size, DOOR_HORIZONS_DECADES_TARGET) +
-      Math.min(countries.size, DOOR_HORIZONS_COUNTRIES_TARGET),
-    target: DOOR_HORIZONS_DECADES_TARGET + DOOR_HORIZONS_COUNTRIES_TARGET,
-    done: decades.size >= DOOR_HORIZONS_DECADES_TARGET &&
-      countries.size >= DOOR_HORIZONS_COUNTRIES_TARGET,
+    current: duelsCount,
+    target: DOOR_PREFERENCES_TARGET,
+    done: duelsCount >= DOOR_PREFERENCES_TARGET,
   };
   const promesse = {
     key: 'promesse',
@@ -3924,6 +3943,7 @@ export const getTasteProfile = onRequest(
         const userRef = db.collection('users').doc(uid);
         const [
           gallerySnap, watchlistSnap, correctionsSnap, historySnap, prefsSnap,
+          duelsSnap,
         ] = await Promise.all([
           userRef.collection('gallery').get(),
           userRef.collection('watchlist').get(),
@@ -3931,6 +3951,7 @@ export const getTasteProfile = onRequest(
           userRef.collection('recommendationHistory')
               .orderBy('createdAt', 'desc').limit(20).get(),
           userRef.collection('taste').doc('filmPrefs').get(),
+          userRef.collection('taste').doc('duels').get(),
         ]);
 
         const corrections: Partial<AxisVector> = {};
@@ -3966,7 +3987,12 @@ export const getTasteProfile = onRequest(
             parseFilmPrefs(prefsSnap),
         );
 
-        const door = doorStateFrom(gallerySnap, watchlistSnap, freshOrigins);
+        const rawDuels = duelsSnap.get('count');
+        const duelsCount = typeof rawDuels === 'number' &&
+          Number.isFinite(rawDuels) ? Math.max(0, rawDuels) : 0;
+        const door = doorStateFrom(
+            gallerySnap, watchlistSnap, freshOrigins, duelsCount,
+        );
 
         res.status(200).json({
           mu: trait.mu,
@@ -4061,15 +4087,21 @@ export const recordSessionOutcome = onRequest(
             (films as Record<string, unknown>[])
                 .find((f) => Number(f.id) === tmdbId) : undefined;
 
+          const launchedAt = admin.firestore.Timestamp.now();
           await doc.ref.set({
             launched: {
               tmdbId,
               title: film?.title ?? null,
               rank: film?.rank ?? null,
               axes: film?.axes ?? null,
-              at: admin.firestore.Timestamp.now(),
+              at: launchedAt,
             },
           }, {merge: true});
+          // Le journal d'exposition de CinéMatch : un film choisi n'est
+          // jamais mis au repos pour avoir été montré souvent. C'est ce
+          // qui distingue « montré et ignoré » de « montré et lancé ».
+          await userRef.collection('cinematchExposure').doc(String(tmdbId))
+              .set({tmdbId, chosenAt: launchedAt}, {merge: true});
           res.status(200).json({ok: true});
           return;
         }
@@ -4212,9 +4244,13 @@ export const recordFilmDuel = onRequest(
           return;
         }
 
-        const prefsRef = getAdmin().firestore()
+        const tasteRef = getAdmin().firestore()
             .collection('users').doc(uid)
-            .collection('taste').doc('filmPrefs');
+            .collection('taste');
+        const prefsRef = tasteRef.doc('filmPrefs');
+        // Le compteur de la Porte (« Tes préférences ») : tenu à part pour
+        // ne pas avoir à sommer les victoires du graphe à chaque ouverture.
+        const duelsRef = tasteRef.doc('duels');
 
         await prefsRef.firestore.runTransaction(async (txn) => {
           const snap = await txn.get(prefsRef);
@@ -4248,6 +4284,10 @@ export const recordFilmDuel = onRequest(
               l: (typeof loser.l === 'number' ? loser.l : 0) + 1,
               at: now,
             },
+          }, {merge: true});
+          txn.set(duelsRef, {
+            count: admin.firestore.FieldValue.increment(1),
+            updatedAt: now,
           }, {merge: true});
         });
 
@@ -8015,6 +8055,1004 @@ export const getPublicProfile = onRequest(
         });
       } catch (error) {
         logger.error('getPublicProfile failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/* ===================================================================== *
+ *  CinéMatch v2 : les points d'entrée
+ *
+ *  Le moteur vit dans `cinematch/engine.ts`, pur et vérifiable seul. Ce qui
+ *  suit ne fait que construire ses entrées (le vivier TMDB, la galerie
+ *  positionnée, le journal d'exposition, la watchlist, le graphe de
+ *  préférence) et écrire ce que la soirée laisse derrière elle.
+ * ===================================================================== */
+
+/** Films enrichis avant le moteur, au plus : un appel de fiche chacun. */
+const CINEMATCH_ENRICH_MAX = 60;
+/**
+ * En deçà de ce nombre de films conformes dans le catalogue, on va chercher
+ * aussi hors des plateformes et de la durée demandées. Sans ça, le moteur
+ * n'aurait rien sous la main pour élargir, et l'élargissement ne serait
+ * qu'une promesse.
+ */
+const CINEMATCH_STRICT_FLOOR = 40;
+/** Les graines personnelles : têtes du graphe puis coups de cœur récents. */
+const CINEMATCH_SEED_COUNT = 8;
+const CINEMATCH_SEED_TAKE = 12;
+/**
+ * Les lignes personnelles (graines, watchlist) admises à l'enrichissement.
+ * Elles n'ont traversé aucun filtre de plateforme ni de durée : sans
+ * plafond, elles prendraient la place de films qui, eux, conviennent.
+ */
+const CINEMATCH_PERSONAL_MAX = 20;
+/** La watchlist n'a qu'une place dans les cinq : inutile d'en enrichir plus. */
+const CINEMATCH_WATCHLIST_MAX = 8;
+/** Le plancher de votes du vivier : assez pour que la fiche soit fiable. */
+const CINEMATCH_VOTE_FLOOR = 150;
+/** La tranche peu connue : bien notée, peu vue. */
+const CINEMATCH_QUIET_VOTE_CEILING = 2000;
+/** Films par appel d'exposition, au plus. */
+const CINEMATCH_EXPOSURE_MAX_IDS = 20;
+
+const CINEMATCH_COMPANIES: readonly engine.Company[] =
+  ['alone', 'duo', 'family'];
+const CINEMATCH_DURATIONS: readonly engine.Duration[] =
+  ['short', 'medium', 'long', 'any'];
+const CINEMATCH_WANTS: readonly engine.Want[] =
+  ['light', 'soft', 'suspense', 'think', 'feelgood', 'everyone'];
+const CINEMATCH_ENERGIES: readonly engine.Energy[] = ['low', 'high'];
+
+/** La situation telle que le client l'envoie. */
+interface CineMatchSituationPayload extends engine.Situation {
+  watchRegion: string;
+}
+
+/**
+ * Une valeur parmi une liste fermée, ou null.
+ * @param {unknown} value Valeur brute.
+ * @param {T[]} allowed Valeurs admises.
+ * @return {T | null} La valeur si elle est admise.
+ */
+function oneOf<T extends string>(
+    value: unknown, allowed: readonly T[],
+): T | null {
+  return typeof value === 'string' && (allowed as readonly string[])
+      .includes(value) ? value as T : null;
+}
+
+/**
+ * Une liste d'identifiants TMDB : entiers positifs, sans doublon.
+ * @param {unknown} raw Valeur brute.
+ * @param {number} max Longueur maximale retenue.
+ * @return {number[]} Identifiants, dans l'ordre reçu.
+ */
+function parseTmdbIdList(raw: unknown, max: number): number[] {
+  if (!Array.isArray(raw)) return [];
+  const out: number[] = [];
+  for (const value of raw) {
+    const id = Number(value);
+    if (!Number.isInteger(id) || id <= 0 || out.includes(id)) continue;
+    out.push(id);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * Relit la situation de la soirée, avec des défauts sûrs.
+ * @param {unknown} raw Bloc `situation` du corps de requête.
+ * @return {CineMatchSituationPayload} Situation normalisée.
+ */
+function parseCineMatchSituation(raw: unknown): CineMatchSituationPayload {
+  const record = (typeof raw === 'object' && raw !== null) ?
+    raw as Record<string, unknown> : {};
+  const platformIds = (Array.isArray(record.platformIds) ?
+    record.platformIds : [])
+      .map((value) => String(value).trim())
+      .filter((value) => /^\d+$/.test(value));
+  const region = typeof record.watchRegion === 'string' &&
+    /^[A-Za-z]{2}$/.test(record.watchRegion) ?
+    record.watchRegion.toUpperCase() : DEFAULT_REGION;
+  return {
+    company: oneOf(record.company, CINEMATCH_COMPANIES) ?? 'alone',
+    duration: oneOf(record.duration, CINEMATCH_DURATIONS) ?? 'any',
+    platformIds: [...new Set(platformIds)],
+    watchRegion: region,
+  };
+}
+
+/**
+ * Relit les comparaisons jouées. Une comparaison malformée est ignorée
+ * plutôt que refusée : elle ne fait qu'apprendre moins.
+ * @param {unknown} raw Liste brute.
+ * @return {engine.Comparison[]} Comparaisons valides, dans l'ordre.
+ */
+function parseCineMatchComparisons(raw: unknown): engine.Comparison[] {
+  if (!Array.isArray(raw)) return [];
+  const out: engine.Comparison[] = [];
+  for (const item of raw.slice(0, 50)) {
+    if (typeof item !== 'object' || item === null) continue;
+    const record = item as Record<string, unknown>;
+    if (record.kind === 'pick') {
+      const keptId = Number(record.keptId);
+      const excludedId = Number(record.excludedId);
+      if (!Number.isInteger(keptId) || !Number.isInteger(excludedId) ||
+          keptId === excludedId) {
+        continue;
+      }
+      const latency = Number(record.latencyMs);
+      out.push({
+        kind: 'pick', keptId, excludedId,
+        latencyMs: Number.isFinite(latency) ? latency : Infinity,
+      });
+    } else if (record.kind === 'none') {
+      out.push({kind: 'none', shownIds: parseTmdbIdList(record.shownIds, 20)});
+    }
+  }
+  return out;
+}
+
+/**
+ * Un instant Firestore en millisecondes, ou null.
+ * @param {unknown} value Valeur lue sur un document.
+ * @return {number | null} Millisecondes.
+ */
+function millisOf(value: unknown): number | null {
+  return value instanceof admin.firestore.Timestamp ? value.toMillis() : null;
+}
+
+/** Un film de la galerie, positionné, et ce qu'il faut pour l'afficher. */
+interface CineMatchGalleryEntry {
+  film: engine.EngineGalleryFilm;
+  title: string | null;
+  posterPath: string | null;
+  releaseDate: string | null;
+  lovedAtMillis: number | null;
+}
+
+/** La galerie, lue pour CinéMatch. */
+interface CineMatchGallery {
+  /** Les films positionnés dans la version courante du lexique. */
+  positioned: CineMatchGalleryEntry[];
+  /** Tous les films vus, positionnés ou non : jamais proposés. */
+  seenIds: Set<number>;
+}
+
+/**
+ * Lit la galerie et positionne au passage un lot de films qui attendent
+ * encore leur position, comme le fait `getTasteProfile`. Un film sans
+ * position n'est pas perdu : il reste exclu des propositions, et il
+ * entrera dans les comparaisons à l'appel suivant.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CineMatchGallery>} La galerie lue.
+ */
+async function loadCineMatchGallery(
+    db: admin.firestore.Firestore,
+    userRef: admin.firestore.DocumentReference,
+    ctx: TMDBContext,
+): Promise<CineMatchGallery> {
+  const gallerySnap = await userRef.collection('gallery').get();
+  const pending = pendingGalleryPositions(gallerySnap);
+  let fresh = new Map<string, FilmPosition>();
+  if (pending.length > 0) {
+    fresh = await positionGalleryDocs(
+        pending.slice(0, GALLERY_POSITION_BATCH), ctx, db,
+    );
+  }
+
+  const positioned: CineMatchGalleryEntry[] = [];
+  const seenIds = new Set<number>();
+  for (const doc of gallerySnap.docs) {
+    // Les séries ont leur propre espace d'identifiants TMDB : les exclure
+    // ici écarterait des films sans rapport.
+    if (doc.get('mediaType') === 'tv') continue;
+    const tmdbId = Number(doc.get('tmdbId'));
+    if (!Number.isInteger(tmdbId) || tmdbId <= 0) continue;
+    seenIds.add(tmdbId);
+    if (doc.get('mediaType') !== 'movie') continue;
+    const position = fresh.get(doc.id);
+    if (!position && doc.get('axesV') !== AXES_VERSION) continue;
+    const genreIds = doc.get('genreIds');
+    const lovedAtMillis = millisOf(doc.get('lovedAt'));
+    const title = doc.get('title');
+    const posterPath = doc.get('posterPath');
+    const releaseDate = doc.get('releaseDate');
+    positioned.push({
+      film: {
+        id: tmdbId,
+        axes: position ? position.axes : parseAxes(doc.get('axes')),
+        genreIds: Array.isArray(genreIds) ?
+          genreIds.filter((g): g is number => typeof g === 'number') : [],
+        loved: lovedAtMillis !== null,
+        posterLastShownAt: null,
+      },
+      title: typeof title === 'string' ? title : null,
+      posterPath: typeof posterPath === 'string' ? posterPath : null,
+      releaseDate: typeof releaseDate === 'string' ? releaseDate : null,
+      lovedAtMillis,
+    });
+  }
+  return {positioned, seenIds};
+}
+
+/**
+ * La forme JSON d'un film de galerie pour le client.
+ * @param {CineMatchGalleryEntry} entry Film de galerie.
+ * @return {Object} `GalleryFilm` du contrat.
+ */
+function cineMatchGalleryFilmJSON(entry: CineMatchGalleryEntry) {
+  return {
+    id: entry.film.id,
+    title: entry.title,
+    poster_path: entry.posterPath,
+    release_date: entry.releaseDate,
+    genre_ids: entry.film.genreIds,
+  };
+}
+
+/**
+ * Prépare une comparaison entre quatre films vus.
+ *
+ * Le nombre de comparaisons suit la galerie (une par tranche de cinq films
+ * positionnés, quatre au plus). La Porte, elle, en demande douze d'affilée :
+ * elle lève la limite et recycle les films les moins récemment montrés.
+ */
+export const getCineMatchComparison = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const round = Number(body.round);
+        if (!Number.isInteger(round) || round < 1 || round > 100) {
+          res.status(400).json({error: 'invalid_round'});
+          return;
+        }
+        const shownIds = parseTmdbIdList(body.shownIds, 500);
+        const history = parseCineMatchComparisons(body.history);
+        const forDoor = body.purpose === 'door';
+
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const [gallery, posterSnap] = await Promise.all([
+          loadCineMatchGallery(db, userRef, tmdb(req, res)),
+          userRef.collection('cinematchExposure')
+              .where('posterLastShownAt', '>',
+                  admin.firestore.Timestamp.fromMillis(0))
+              .get(),
+        ]);
+
+        const total = engine.comparisonTotal(gallery.positioned.length);
+        if (!forDoor && round > total) {
+          res.status(200).json({total, round, films: [], replacements: {}});
+          return;
+        }
+
+        const posterTimes = new Map<number, number>();
+        for (const doc of posterSnap.docs) {
+          const at = millisOf(doc.get('posterLastShownAt'));
+          const id = Number(doc.get('tmdbId') ?? doc.id);
+          if (at !== null && Number.isInteger(id)) posterTimes.set(id, at);
+        }
+        const entries = new Map<number, CineMatchGalleryEntry>();
+        const films = gallery.positioned.map((entry) => {
+          entries.set(entry.film.id, entry);
+          return {
+            ...entry.film,
+            posterLastShownAt: posterTimes.get(entry.film.id) ?? null,
+          };
+        });
+
+        const plan = engine.planComparison({
+          gallery: films,
+          shownIds,
+          history,
+          round,
+          seedKey: `${uid}:${parisDay(new Date())}`,
+          recycle: forDoor,
+        });
+
+        const replacements: Record<string, unknown> = {};
+        for (const [id, film] of plan.replacements) {
+          const entry = entries.get(film.id);
+          if (entry) replacements[String(id)] = cineMatchGalleryFilmJSON(entry);
+        }
+        res.status(200).json({
+          total,
+          round,
+          films: plan.films
+              .map((film) => entries.get(film.id))
+              .filter((e): e is CineMatchGalleryEntry => e !== undefined)
+              .map(cineMatchGalleryFilmJSON),
+          replacements: plan.films.length > 0 ? replacements : {},
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCineMatchComparison failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Les paramètres `/discover/movie` d'une soirée.
+ *
+ * La durée et les plateformes sont posées dès la requête, pour ne pas
+ * remplir le vivier de films qu'on jetterait ; la garantie, elle, se joue
+ * dans le moteur, sur la durée réelle et les plateformes de la fiche.
+ * Quand on relâche, la durée s'ouvre exactement de ce que le moteur peut
+ * élargir, pas davantage.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @return {Record<string, string>} Paramètres TMDB.
+ */
+function cineMatchDiscoverParams(
+    situation: CineMatchSituationPayload, relaxed: boolean,
+): Record<string, string> {
+  const query: Record<string, string> = {
+    'include_adult': 'false',
+    'include_video': 'false',
+    'vote_count.gte': String(CINEMATCH_VOTE_FLOOR),
+  };
+  if (situation.company === 'family') {
+    query.without_genres = String(GENRE_HORROR);
+  }
+
+  const slack = relaxed ? engine.DURATION_WIDEN_MAX_MINUTES : 0;
+  if (situation.duration === 'short') {
+    query['with_runtime.lte'] = String(89 + slack);
+  } else if (situation.duration === 'medium') {
+    query['with_runtime.gte'] = String(90 - slack);
+    query['with_runtime.lte'] = String(120 + slack);
+  } else if (situation.duration === 'long') {
+    query['with_runtime.gte'] = String(121 - slack);
+  }
+
+  if (!relaxed && situation.platformIds.length > 0) {
+    query.watch_region = situation.watchRegion;
+    query.with_watch_providers = situation.platformIds.join('|');
+    // Location et achat exclus : seul compte ce que la plateforme couvre.
+    query.with_watch_monetization_types = 'flatrate|free|ads';
+  }
+  return query;
+}
+
+/**
+ * Le catalogue d'une soirée : plusieurs tris et une tranche peu connue,
+ * pour que le vivier ne soit pas fait des mêmes succès à chaque fois.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<DiscoverRow[]>} Films sans doublon.
+ */
+async function fetchCineMatchCatalogue(
+    situation: CineMatchSituationPayload,
+    relaxed: boolean,
+    ctx: TMDBContext,
+): Promise<DiscoverRow[]> {
+  const base = cineMatchDiscoverParams(situation, relaxed);
+  const today = new Date().toISOString().slice(0, 10);
+  const slices: Record<string, string>[] = [
+    {sort_by: 'popularity.desc', page: '1'},
+    {sort_by: 'popularity.desc', page: '2'},
+    {'sort_by': 'vote_average.desc', 'vote_count.gte': '500', 'page': '1'},
+    {'sort_by': 'primary_release_date.desc', 'page': '1',
+      'primary_release_date.lte': today},
+    {sort_by: 'vote_count.desc', page: '1'},
+    // La tranche peu connue : sans elle, « En forme, plus de découvertes »
+    // n'aurait aucun pari sous la main.
+    {'sort_by': 'vote_average.desc', 'page': '1',
+      'vote_count.lte': String(CINEMATCH_QUIET_VOTE_CEILING)},
+    {'sort_by': 'vote_average.desc', 'page': '2',
+      'vote_count.lte': String(CINEMATCH_QUIET_VOTE_CEILING)},
+  ];
+  const responses = await Promise.allSettled(slices.map((slice) =>
+    tmdbGET('/discover/movie', {...base, ...slice}, ctx)));
+  const byId = new Map<number, DiscoverRow>();
+  for (const settled of responses) {
+    if (settled.status !== 'fulfilled') continue;
+    const results = Array.isArray(settled.value.results) ?
+      settled.value.results as DiscoverRow[] : [];
+    for (const row of results) {
+      if (typeof row.id === 'number' && !byId.has(row.id)) {
+        byId.set(row.id, row);
+      }
+    }
+  }
+  return [...byId.values()];
+}
+
+/**
+ * Relit un document de watchlist sous la forme d'une ligne de vivier.
+ * @param {admin.firestore.QueryDocumentSnapshot} doc Document.
+ * @return {DiscoverRow | null} Ligne, ou null pour une série ou un film
+ *   sans identifiant.
+ */
+function watchlistRowFrom(
+    doc: admin.firestore.QueryDocumentSnapshot,
+): DiscoverRow | null {
+  if (doc.get('mediaType') === 'tv') return null;
+  const id = doc.get('tmdbId');
+  if (typeof id !== 'number') return null;
+  const read = <T>(key: string, type: string): T | null =>
+    typeof doc.get(key) === type ? doc.get(key) as T : null;
+  return {
+    id,
+    title: read<string>('title', 'string') ?? undefined,
+    overview: read<string>('overview', 'string'),
+    poster_path: read<string>('posterPath', 'string'),
+    vote_average: read<number>('voteAverage', 'number'),
+    vote_count: read<number>('voteCount', 'number'),
+    popularity: null,
+    genre_ids: Array.isArray(doc.get('genreIds')) ?
+      doc.get('genreIds') as number[] : [],
+    release_date: read<string>('releaseDate', 'string'),
+  };
+}
+
+/** Tout ce que la soirée sait avant d'aller chercher des films. */
+interface CineMatchSetup {
+  situation: CineMatchSituationPayload;
+  gallery: CineMatchGallery;
+  watchlistRows: DiscoverRow[];
+  watchlistIds: Set<number>;
+  prefs: Map<number, number>;
+  exposure: Map<number, engine.ExposureRecord>;
+  now: number;
+}
+
+/** Ce que la soirée demande, questions comprises. */
+interface CineMatchEvening {
+  want: engine.Want | null;
+  energy: engine.Energy | null;
+  comparisons: engine.Comparison[];
+  hesitations: number;
+}
+
+/**
+ * Lit tout ce que la soirée sait déjà : galerie, watchlist, graphe de
+ * préférence et journal d'exposition des quatorze derniers jours.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Utilisateur.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CineMatchSetup>} La soirée, prête pour le vivier.
+ */
+async function loadCineMatchSetup(
+    db: admin.firestore.Firestore,
+    uid: string,
+    situation: CineMatchSituationPayload,
+    ctx: TMDBContext,
+): Promise<CineMatchSetup> {
+  const now = Date.now();
+  const userRef = db.collection('users').doc(uid);
+  const cutoff = admin.firestore.Timestamp.fromMillis(
+      now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
+  );
+  const [gallery, watchlistSnap, prefsSnap, exposureSnap] = await Promise.all([
+    loadCineMatchGallery(db, userRef, ctx),
+    userRef.collection('watchlist').get(),
+    userRef.collection('taste').doc('filmPrefs').get(),
+    userRef.collection('cinematchExposure')
+        .where('lastShownAt', '>=', cutoff).get(),
+  ]);
+
+  const watchlistRows: DiscoverRow[] = [];
+  for (const doc of watchlistSnap.docs) {
+    const row = watchlistRowFrom(doc);
+    if (row) watchlistRows.push(row);
+  }
+  const exposure = new Map<number, engine.ExposureRecord>();
+  for (const doc of exposureSnap.docs) {
+    const id = Number(doc.get('tmdbId') ?? doc.id);
+    if (!Number.isInteger(id)) continue;
+    const count = doc.get('shownCount');
+    exposure.set(id, {
+      shownCount: typeof count === 'number' ? count : 0,
+      lastShownAt: millisOf(doc.get('lastShownAt')),
+      chosenAt: millisOf(doc.get('chosenAt')),
+    });
+  }
+  return {
+    situation,
+    gallery,
+    watchlistRows,
+    watchlistIds: new Set(watchlistRows.map((row) => row.id)),
+    prefs: parseFilmPrefs(prefsSnap),
+    exposure,
+    now,
+  };
+}
+
+/**
+ * L'année d'une date TMDB.
+ * @param {string | null | undefined} date Date `YYYY-MM-DD`.
+ * @return {number | null} Année.
+ */
+function yearOf(date: string | null | undefined): number | null {
+  const year = Number((date ?? '').slice(0, 4));
+  return Number.isInteger(year) && year > 1800 ? year : null;
+}
+
+/** Le vivier enrichi, prêt pour le moteur. */
+interface CineMatchCandidates {
+  films: engine.EngineFilm[];
+  enriched: Map<number, EnrichedCandidate>;
+  relaxed: boolean;
+}
+
+/**
+ * Compose le vivier d'une soirée et l'enrichit.
+ *
+ * Trois sources : le catalogue filtré par TMDB, les graines personnelles
+ * (voisinage des films qu'on relance et des coups de cœur récents) et la
+ * watchlist. Un classement grossier, sur les axes de liste, choisit les
+ * soixante films qui méritent une fiche complète ; seuls ceux-là passent
+ * par le moteur, qui tranche sur la durée réelle et les vraies plateformes.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {CineMatchEvening} evening Les réponses.
+ * @param {boolean} forceRelaxed Aller chercher hors durée et plateformes
+ *   même si le catalogue conforme semble suffire.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CineMatchCandidates>} Films enrichis.
+ */
+async function buildCineMatchCandidates(
+    setup: CineMatchSetup,
+    evening: CineMatchEvening,
+    forceRelaxed: boolean,
+    ctx: TMDBContext,
+): Promise<CineMatchCandidates> {
+  const {situation, gallery} = setup;
+
+  // Les têtes du graphe d'abord : un film qui a gagné ses duels dit mieux
+  // ce qu'on relance qu'un coup de cœur ancien. Les coups de cœur récents
+  // complètent.
+  const seedIds: number[] = [];
+  const positionedIds = new Set(gallery.positioned.map((e) => e.film.id));
+  for (const [id, rating] of
+    [...setup.prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
+    if (rating <= ELO_START || seedIds.length >= CINEMATCH_SEED_COUNT) break;
+    if (positionedIds.has(id)) seedIds.push(id);
+  }
+  const loved = gallery.positioned
+      .filter((entry) => entry.lovedAtMillis !== null)
+      .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0));
+  for (const entry of loved) {
+    if (seedIds.length >= CINEMATCH_SEED_COUNT) break;
+    if (!seedIds.includes(entry.film.id)) seedIds.push(entry.film.id);
+  }
+
+  const constrained =
+    situation.duration !== 'any' || situation.platformIds.length > 0;
+  const [catalogue, seedResponses] = await Promise.all([
+    fetchCineMatchCatalogue(situation, false, ctx),
+    Promise.allSettled(seedIds.map((id) => tmdbGET(
+        `/movie/${id}/recommendations`, {page: '1'}, ctx))),
+  ]);
+
+  const keep = (row: DiscoverRow): boolean =>
+    typeof row.id === 'number' && !gallery.seenIds.has(row.id) &&
+    !(situation.company === 'family' &&
+      (row.genre_ids ?? []).includes(GENRE_HORROR));
+
+  const strictRows = catalogue.filter(keep);
+  const strictIds = new Set(strictRows.map((row) => row.id));
+  let relaxedRows: DiscoverRow[] = [];
+  const relaxed = constrained &&
+    (forceRelaxed || strictRows.length < CINEMATCH_STRICT_FLOOR);
+  if (relaxed) {
+    relaxedRows = (await fetchCineMatchCatalogue(situation, true, ctx))
+        .filter((row) => keep(row) && !strictIds.has(row.id));
+  }
+
+  // Les lignes personnelles, contingentées : la watchlist d'abord (elle
+  // n'aura qu'une place, quelques films suffisent), les graines ensuite.
+  const personal = new Map<number, DiscoverRow>();
+  for (const row of setup.watchlistRows) {
+    if (personal.size >= CINEMATCH_WATCHLIST_MAX) break;
+    if (keep(row)) personal.set(row.id, row);
+  }
+  for (const settled of seedResponses) {
+    if (settled.status !== 'fulfilled') continue;
+    const results = Array.isArray(settled.value.results) ?
+      settled.value.results as DiscoverRow[] : [];
+    for (const row of results.slice(0, CINEMATCH_SEED_TAKE)) {
+      if (personal.size >= CINEMATCH_PERSONAL_MAX) break;
+      if (keep(row) && !strictIds.has(row.id)) personal.set(row.id, row);
+    }
+  }
+
+  const byId = new Map<number, DiscoverRow>();
+  for (const row of [...strictRows, ...personal.values(), ...relaxedRows]) {
+    if (!byId.has(row.id)) byId.set(row.id, row);
+  }
+  const rows = [...byId.values()];
+  if (rows.length === 0) {
+    return {films: [], enriched: new Map(), relaxed};
+  }
+
+  // Le classement grossier : le moteur lui-même, sur les axes de liste, sans
+  // durée ni plateformes (inconnues à ce stade). Les films du catalogue
+  // conforme partent devant, comme ils partiront devant dans le moteur.
+  const stats = poolStatsFor(rows);
+  const coarse = new Map<number, AxisVector>();
+  const coarseFilms: engine.EngineFilm[] = [];
+  for (const row of rows) {
+    if (engine.isResting(setup.exposure.get(row.id), setup.now)) continue;
+    const axes = coarseAxesFor(row, stats);
+    coarse.set(row.id, axes);
+    coarseFilms.push({
+      id: row.id,
+      axes,
+      genreIds: row.genre_ids ?? [],
+      year: yearOf(row.release_date),
+      voteCount: row.vote_count ?? null,
+      runtime: null,
+      providerIds: [],
+      keywordNames: [],
+      listed: setup.watchlistIds.has(row.id),
+      certification: null,
+    });
+  }
+  const lovedFilms = gallery.positioned
+      .filter((entry) => entry.film.loved)
+      .map((entry) => entry.film);
+  const ranked = engine.scoreFilms(coarseFilms, {
+    situation: {...situation, duration: 'any', platformIds: []},
+    want: evening.want,
+    energy: evening.energy,
+    hesitations: evening.hesitations,
+    loved: lovedFilms,
+    weights: engine.buildWeights(
+        lovedFilms.map((film) => film.axes),
+        coarseFilms.map((film) => film.axes),
+        evening.comparisons,
+        new Map(gallery.positioned.map((e) => [e.film.id, e.film.axes])),
+    ),
+    exposure: setup.exposure,
+    now: setup.now,
+    conforming: strictIds,
+  });
+
+  const shortlist = ranked
+      .slice(0, CINEMATCH_ENRICH_MAX)
+      .map((scored) => byId.get(scored.film.id))
+      .filter((row): row is DiscoverRow => row !== undefined);
+  const enrichedList = await Promise.all(
+      shortlist.map((row) => enrichCandidate(row, ctx)));
+
+  const enriched = new Map<number, EnrichedCandidate>();
+  const films: engine.EngineFilm[] = [];
+  for (const candidate of enrichedList) {
+    if (!candidate) continue;
+    enriched.set(candidate.id, candidate);
+    const base = coarse.get(candidate.id) ?? parseAxes(null);
+    films.push({
+      id: candidate.id,
+      axes: refineAxes(base, candidate),
+      genreIds: candidate.genre_ids ?? [],
+      year: yearOf(candidate.release_date),
+      voteCount: candidate.vote_count ?? null,
+      runtime: candidate.runtimeMinutes,
+      providerIds: candidate.providerIds,
+      keywordNames: candidate.keywordNames ?? [],
+      listed: setup.watchlistIds.has(candidate.id),
+      certification: candidate.certification ?? null,
+    });
+  }
+  return {films, enriched, relaxed};
+}
+
+/**
+ * Fait tourner le moteur sur le vivier, et retourne chercher hors durée et
+ * plateformes si le premier passage n'a pas donné assez de films.
+ *
+ * Le second passage n'a lieu que si le premier n'était pas déjà relâché :
+ * c'est le cas rare où TMDB annonçait assez de films conformes, mais où les
+ * fiches ont démenti la durée ou les plateformes.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {CineMatchEvening} evening Les réponses.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {function(engine.RecommendInput): T} run Le calcul à faire.
+ * @param {function(T): boolean} enough Vrai si le résultat suffit.
+ * @return {Promise<Object>} Le résultat et les fiches enrichies.
+ */
+async function runCineMatchEngine<T>(
+    setup: CineMatchSetup,
+    evening: CineMatchEvening,
+    ctx: TMDBContext,
+    run: (input: engine.RecommendInput) => T,
+    enough: (result: T) => boolean,
+): Promise<{result: T; enriched: Map<number, EnrichedCandidate>}> {
+  const inputFor = (films: engine.EngineFilm[]): engine.RecommendInput => ({
+    films,
+    gallery: setup.gallery.positioned.map((entry) => entry.film),
+    situation: setup.situation,
+    want: evening.want,
+    energy: evening.energy,
+    comparisons: evening.comparisons,
+    hesitations: evening.hesitations,
+    exposure: setup.exposure,
+    now: setup.now,
+  });
+
+  const first = await buildCineMatchCandidates(setup, evening, false, ctx);
+  const firstResult = run(inputFor(first.films));
+  const constrained = setup.situation.duration !== 'any' ||
+    setup.situation.platformIds.length > 0;
+  if (enough(firstResult) || first.relaxed || !constrained) {
+    return {result: firstResult, enriched: first.enriched};
+  }
+  const second = await buildCineMatchCandidates(setup, evening, true, ctx);
+  return {result: run(inputFor(second.films)), enriched: second.enriched};
+}
+
+/**
+ * La forme JSON d'un film proposé.
+ * @param {EnrichedCandidate} c Fiche enrichie.
+ * @return {Object} `FiveFilm` du contrat.
+ */
+function cineMatchFiveFilmJSON(c: EnrichedCandidate) {
+  return {
+    id: c.id,
+    title: c.title ?? null,
+    poster_path: c.poster_path ?? null,
+    overview: c.overview ?? null,
+    release_date: c.release_date ?? null,
+    genre_ids: c.genre_ids ?? [],
+    runtime_minutes: c.runtimeMinutes,
+    provider_ids: c.providerIds,
+    trailer_key: c.trailerKey,
+  };
+}
+
+/**
+ * Le bloc `films` d'un document d'historique, compatible avec
+ * `recordSessionOutcome` et la relecture du trait.
+ * @param {engine.ScoredFilm[]} picks Films proposés, dans l'ordre.
+ * @param {Map<number, EnrichedCandidate>} enriched Fiches.
+ * @return {Object[]} Films, rang à partir de 1.
+ */
+function cineMatchHistoryFilms(
+    picks: engine.ScoredFilm[], enriched: Map<number, EnrichedCandidate>,
+) {
+  return picks.map((pick, index) => ({
+    id: pick.film.id,
+    title: enriched.get(pick.film.id)?.title ?? null,
+    rank: index + 1,
+    axes: pick.film.axes,
+    score: pick.score,
+  }));
+}
+
+/**
+ * Les cinq films d'une soirée guidée.
+ *
+ * Tout le moteur tourne ici : l'app envoie la situation, les deux réponses
+ * et les comparaisons, et reçoit cinq films prêts à être montrés. La
+ * séance est écrite dans l'historique pour que le lancement, puis le
+ * verdict, puissent s'y accrocher.
+ */
+export const getCineMatchFive = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const want = oneOf(body.want, CINEMATCH_WANTS);
+        const energy = oneOf(body.energy, CINEMATCH_ENERGIES);
+        if (!want || !energy) {
+          res.status(400).json({error: 'invalid_answers'});
+          return;
+        }
+        const hesitationsRaw = Number(body.hesitations);
+        const evening: CineMatchEvening = {
+          want,
+          energy,
+          comparisons: parseCineMatchComparisons(body.comparisons),
+          hesitations: Number.isFinite(hesitationsRaw) ?
+            Math.max(0, Math.min(20, Math.floor(hesitationsRaw))) : 0,
+        };
+        const situation = parseCineMatchSituation(body.situation);
+
+        const db = getAdmin().firestore();
+        const ctx = tmdb(req, res);
+        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
+        const {result, enriched} = await runCineMatchEngine(
+            setup, evening, ctx, engine.recommendFive,
+            (r) => r.films.length >= 3,
+        );
+
+        const picks = result.films.filter((pick) => enriched.has(pick.film.id));
+        if (picks.length === 0) {
+          res.status(409).json({error: 'no_candidates'});
+          return;
+        }
+
+        const historyRef = db.collection('users').doc(uid)
+            .collection('recommendationHistory').doc();
+        await historyRef.set({
+          createdAt: admin.firestore.Timestamp.now(),
+          kind: 'five',
+          tmdbIds: picks.map((pick) => pick.film.id),
+          films: cineMatchHistoryFilms(picks, enriched),
+          answers: {situation, want, energy},
+        });
+
+        res.status(200).json({
+          films: picks.map((pick) =>
+            cineMatchFiveFilmJSON(enriched.get(pick.film.id) as
+              EnrichedCandidate)),
+          widened: result.widened,
+          sessionId: historyRef.id,
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCineMatchFive failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Le rang d'un jour dans son année, 1 = 1er janvier.
+ * @param {string} day Jour civil `YYYY-MM-DD`.
+ * @return {number} Jour de l'année.
+ */
+function dayOfYearFrom(day: string): number {
+  const [year, month, date] = day.split('-').map(Number);
+  const start = Date.UTC(year, 0, 1);
+  return Math.round((Date.UTC(year, month - 1, date) - start) / 86400000) + 1;
+}
+
+/**
+ * La proposition du jour : un film, le même toute la journée.
+ *
+ * Il est tiré des cinq d'une soirée sans questions, et mémorisé : rouvrir
+ * l'app ne doit pas le changer, sans quoi « du jour » ne voudrait rien
+ * dire. Le jour est celui de Paris, comme partout ailleurs dans l'app.
+ */
+export const getCineMatchDaily = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const situation = parseCineMatchSituation(body.situation);
+        const today = parisDay(new Date());
+
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const dailyRef = userRef.collection('cinematch').doc('daily');
+        const stored = await dailyRef.get();
+        const storedFilm = stored.get('film');
+        if (stored.get('date') === today &&
+            typeof storedFilm === 'object' && storedFilm !== null) {
+          res.status(200).json({film: storedFilm, date: today});
+          return;
+        }
+
+        const ctx = tmdb(req, res);
+        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
+        const evening: CineMatchEvening = {
+          want: null, energy: null, comparisons: [], hesitations: 0,
+        };
+        const dayOfYear = dayOfYearFrom(today);
+        const {result, enriched} = await runCineMatchEngine(
+            setup, evening, ctx,
+            (input) => engine.pickDaily(input, dayOfYear),
+            (r) => r.top.length >= 3,
+        );
+
+        const pick = result.film;
+        const candidate = pick ? enriched.get(pick.film.id) : undefined;
+        if (!pick || !candidate) {
+          // Rien n'est mémorisé : la prochaine ouverture retentera.
+          res.status(200).json({film: null, date: today});
+          return;
+        }
+
+        const film = cineMatchFiveFilmJSON(candidate);
+        const now = admin.firestore.Timestamp.now();
+        await Promise.all([
+          dailyRef.set({date: today, tmdbId: candidate.id, film}),
+          userRef.collection('recommendationHistory').add({
+            createdAt: now,
+            kind: 'daily',
+            tmdbIds: [candidate.id],
+            films: cineMatchHistoryFilms([pick], enriched),
+            answers: {situation},
+          }),
+        ]);
+        res.status(200).json({film, date: today});
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCineMatchDaily failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Le journal d'exposition : ce qui est apparu à l'écran, et quand.
+ *
+ * « Montré » veut dire apparu, pas seulement envoyé : c'est le client qui
+ * sait qu'une carte a été vue. Les cinq et la proposition du jour comptent
+ * leurs apparitions (le moteur fait reculer, puis reposer, un film montré
+ * sans être choisi) ; les affiches de comparaison ne gardent que leur date,
+ * pour que les suivantes tournent dans la galerie.
+ */
+export const recordCineMatchExposure = onRequest(
+    {invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const kind = oneOf(body.kind, ['five', 'daily', 'poster'] as const);
+        if (!kind) {
+          res.status(400).json({error: 'invalid_kind'});
+          return;
+        }
+        if (Array.isArray(body.tmdbIds) &&
+            body.tmdbIds.length > CINEMATCH_EXPOSURE_MAX_IDS) {
+          res.status(400).json({
+            error: 'too_many_ids', max: CINEMATCH_EXPOSURE_MAX_IDS,
+          });
+          return;
+        }
+        const ids = parseTmdbIdList(body.tmdbIds, CINEMATCH_EXPOSURE_MAX_IDS);
+        if (ids.length === 0) {
+          res.status(400).json({error: 'invalid_tmdb_ids'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const exposureRef = db.collection('users').doc(uid)
+            .collection('cinematchExposure');
+        const now = admin.firestore.Timestamp.now();
+        const batch = db.batch();
+        for (const tmdbId of ids) {
+          const data = kind === 'poster' ?
+            {tmdbId, posterLastShownAt: now} :
+            {
+              tmdbId,
+              shownCount: admin.firestore.FieldValue.increment(1),
+              lastShownAt: now,
+            };
+          batch.set(exposureRef.doc(String(tmdbId)), data, {merge: true});
+        }
+        await batch.commit();
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('recordCineMatchExposure failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
