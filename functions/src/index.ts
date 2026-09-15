@@ -941,7 +941,7 @@ const REASON_PROMISE:
       in: ['Court, comme demandé', 'Long format, comme demandé'],
     },
     'en-US': {
-      ch: ['Nothing heavy, as asked', 'A film that weighs, as asked'],
+      ch: ['Nothing heavy, as asked', 'A movie that weighs, as asked'],
       ry: ['A steady pace, as asked', 'Fast-paced, as asked'],
       fa: ['A safe bet', 'A real discovery, as asked'],
       de: ['Easy to follow', 'Demanding, as asked'],
@@ -3374,7 +3374,7 @@ function buildReasons(
 
   if (context?.seedTitle) {
     reasons.push(english ?
-      `Close to ${context.seedTitle}, a film you loved` :
+      `Close to ${context.seedTitle}, a movie you loved` :
       `Proche de ${context.seedTitle}, que tu as aimé`);
   }
 
@@ -6979,13 +6979,13 @@ const BADGE_DETAIL_LABELS: Record<string, {
   },
   'en-US': {
     missingDecades: (years) => `You are missing the ${years}.`,
-    actionFilms: (genre) => `${genre} films in your gallery.`,
+    actionFilms: (genre) => `${genre} movies in your gallery.`,
     genresWithTen: (n) =>
-      `${n} genres already count at least 10 films.`,
+      `${n} genres already count at least 10 movies.`,
     watchlistFloor: (peak) =>
-      `Your watchlist has to reach 15 films first (best: ${peak}).`,
+      `Your watchlist has to reach 15 movies first (best: ${peak}).`,
     watchlistLeft: (n) =>
-      `${n} film${n > 1 ? 's' : ''} left to watch.`,
+      `${n} movie${n > 1 ? 's' : ''} left to watch.`,
     bestCollection: (percent) =>
       `Your most advanced saga is ${percent}% complete.`,
   },
