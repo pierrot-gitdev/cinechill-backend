@@ -4703,7 +4703,7 @@ export const getCandidatePool = onRequest(
           );
           cataloguePool =
             filterByContentFormat(relaxed.filter(keep), answers);
-          notice = 'Résultats élargis hors de vos plateformes habituelles.';
+          notice = 'On a ajouté des films hors de tes plateformes.';
         }
         const pool = mergeRows(cataloguePool);
         if (!notice && pool.length < POOL_HEALTHY_TARGET) {
@@ -6966,16 +6966,16 @@ const BADGE_DETAIL_LABELS: Record<string, {
   bestCollection: (percent: number) => string;
 }> = {
   'fr-FR': {
-    missingDecades: (years) => `Il vous manque les années ${years}.`,
-    actionFilms: (genre) => `Films d'${genre} dans votre galerie.`,
+    missingDecades: (years) => `Il te manque les années ${years}.`,
+    actionFilms: (genre) => `Films d'${genre} dans ta galerie.`,
     genresWithTen: (n) =>
       `${n} genres comptent déjà au moins 10 films.`,
     watchlistFloor: (peak) =>
-      `Votre watchlist doit d'abord atteindre 15 films (record : ${peak}).`,
+      `Ta watchlist doit d'abord atteindre 15 films (record : ${peak}).`,
     watchlistLeft: (n) =>
       `Il reste ${n} film${n > 1 ? 's' : ''} à voir.`,
     bestCollection: (percent) =>
-      `Votre saga la plus avancée est complétée à ${percent} %.`,
+      `Ta saga la plus avancée est complète à ${percent} %.`,
   },
   'en-US': {
     missingDecades: (years) => `You are missing the ${years}.`,
