@@ -3612,8 +3612,13 @@ function discoverRowToJSON(row: DiscoverRow) {
  * Les seuils des cinq artéfacts. Des constantes serveur, pas des valeurs
  * client : elles s'ajustent sans release, et la porte raconte toujours l'état
  * que le serveur mesure réellement.
+ *
+ * La Mémoire à cent films : elle ouvre aussi les comparaisons de « Tes
+ * préférences ». Chacune consomme cinq films (quatre affiches et le remplaçant
+ * du film gardé), soit soixante sur les douze tours de la Porte ; à vingt, les
+ * mêmes affiches revenaient trois fois, à cent aucune ne revient.
  */
-const DOOR_MEMOIRE_TARGET = 20;
+const DOOR_MEMOIRE_TARGET = 100;
 const DOOR_EVENTAIL_TARGET = 6;
 const DOOR_COEUR_TARGET = 12;
 /**
@@ -8218,6 +8223,8 @@ interface CineMatchGallery {
   positioned: CineMatchGalleryEntry[];
   /** Tous les films vus, positionnés ou non : jamais proposés. */
   seenIds: Set<number>;
+  /** Documents de la galerie, comptés comme la Mémoire les compte. */
+  size: number;
 }
 
 /**
@@ -8276,7 +8283,7 @@ async function loadCineMatchGallery(
       lovedAtMillis,
     });
   }
-  return {positioned, seenIds};
+  return {positioned, seenIds, size: gallerySnap.size};
 }
 
 /**
@@ -8333,6 +8340,13 @@ export const getCineMatchComparison = onRequest(
         ]);
 
         const total = engine.comparisonTotal(gallery.positioned.length);
+        // La Porte ne compare qu'une galerie qui a déjà sa Mémoire : en
+        // dessous, le recyclage ferait revenir les mêmes affiches d'un tour
+        // à l'autre. L'app ferme l'accès, le serveur tient la même règle.
+        if (forDoor && gallery.size < DOOR_MEMOIRE_TARGET) {
+          res.status(200).json({total, round, films: [], replacements: {}});
+          return;
+        }
         if (!forDoor && round > total) {
           res.status(200).json({total, round, films: [], replacements: {}});
           return;
