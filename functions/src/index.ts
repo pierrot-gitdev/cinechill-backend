@@ -8613,6 +8613,9 @@ interface BadgeState {
 
 interface GalleryFact {
   tmdbId: number;
+  /** Pour nommer le film qui a fait tomber un badge. */
+  title: string | null;
+  posterPath: string | null;
   genreIds: number[];
   year: number | null;
   decade: number | null;
@@ -8685,6 +8688,9 @@ function toGalleryFacts(
 
     return {
       tmdbId: typeof doc.get('tmdbId') === 'number' ? doc.get('tmdbId') : 0,
+      title: typeof doc.get('title') === 'string' ? doc.get('title') : null,
+      posterPath: typeof doc.get('posterPath') === 'string' ?
+        doc.get('posterPath') : null,
       genreIds: Array.isArray(doc.get('genreIds')) ? doc.get('genreIds') : [],
       year: year !== null && Number.isFinite(year) ? year : null,
       decade: year !== null && Number.isFinite(year) ?
@@ -8885,6 +8891,76 @@ function computeBadgeStates(
 }
 
 /**
+ * Les badges qui se comptent sur la galerie. Les autres (`clean_list`,
+ * `sorter`) tombent sur un geste qui n'ajoute aucun film.
+ */
+const GALLERY_BADGES = new Set([
+  'first_reel', 'centenary', 'cinematheque', 'archaeologist', 'traveler',
+  'steel_heart', 'sleepless', 'panoramic', 'marathon', 'ritual', 'signature',
+  'integral', 'night_owl',
+]);
+/** Films récents examinés pour trouver celui qui a fait tomber un badge. */
+const BADGE_TRIGGER_LOOKBACK = 10;
+
+/** Le film qui a fait tomber un badge, tel que l'app le montre. */
+interface BadgeTrigger {
+  tmdbId: number;
+  title: string | null;
+  posterPath: string | null;
+}
+
+/**
+ * Le film qui a fait tomber ce badge : le plus récent dont le retrait le
+ * referme. Sans lui, la félicitation arrive quelques cartes plus loin et ne
+ * dit pas ce qui l'a méritée.
+ * @param {string} badgeId Le badge tout juste obtenu.
+ * @param {GalleryFact[]} facts La galerie.
+ * @param {function(GalleryFact[]): BadgeState[]} evaluate Les règles, sur
+ *   une galerie donnée.
+ * @return {?BadgeTrigger} Le film, ou null s'il n'est pas parmi les récents.
+ */
+function badgeTriggerFor(
+    badgeId: string,
+    facts: GalleryFact[],
+    evaluate: (facts: GalleryFact[]) => BadgeState[],
+): BadgeTrigger | null {
+  if (!GALLERY_BADGES.has(badgeId)) return null;
+  const recent = facts
+      .filter((fact) => fact.addedAt !== null)
+      .sort((a, b) =>
+        (b.addedAt?.getTime() ?? 0) - (a.addedAt?.getTime() ?? 0))
+      .slice(0, BADGE_TRIGGER_LOOKBACK);
+  let remaining = facts;
+  for (const fact of recent) {
+    remaining = remaining.filter((other) => other !== fact);
+    const state = evaluate(remaining).find((s) => s.id === badgeId);
+    if (!state?.unlocked) {
+      return {
+        tmdbId: fact.tmdbId, title: fact.title, posterPath: fact.posterPath,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Relit le film déclencheur gardé sur un badge déjà obtenu.
+ * @param {unknown} raw Champ `unlockedBy` du document.
+ * @return {?BadgeTrigger} Le film, ou null.
+ */
+function parseBadgeTrigger(raw: unknown): BadgeTrigger | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.tmdbId !== 'number') return null;
+  return {
+    tmdbId: record.tmdbId,
+    title: typeof record.title === 'string' ? record.title : null,
+    posterPath: typeof record.posterPath === 'string' ?
+      record.posterPath : null,
+  };
+}
+
+/**
  * Renvoie l'état complet des badges et persiste les nouvelles obtentions.
  */
 export const evaluateBadges = onRequest(
@@ -8930,19 +9006,22 @@ export const evaluateBadges = onRequest(
             watchlistSnap.size,
         );
 
-        const states = computeBadgeStates(
-            toGalleryFacts(gallerySnap.docs),
-            watchlistSnap.size,
-            watchlistPeak,
-            totalDecisions,
-            requestedLanguage(req, res),
-        );
+        const facts = toGalleryFacts(gallerySnap.docs);
+        const language = requestedLanguage(req, res);
+        const evaluate = (subset: GalleryFact[]): BadgeState[] =>
+          computeBadgeStates(
+              subset, watchlistSnap.size, watchlistPeak, totalDecisions,
+              language,
+          );
+        const states = evaluate(facts);
 
         const alreadyUnlocked = new Map<string, admin.firestore.Timestamp>();
+        const triggers = new Map<string, BadgeTrigger | null>();
         for (const doc of badgesSnap.docs) {
           const at = doc.get('unlockedAt');
           if (at instanceof admin.firestore.Timestamp) {
             alreadyUnlocked.set(doc.id, at);
+            triggers.set(doc.id, parseBadgeTrigger(doc.get('unlockedBy')));
           }
         }
 
@@ -8959,14 +9038,20 @@ export const evaluateBadges = onRequest(
               unlocked: true,
               unlockedAt: existing.toDate().toISOString(),
               current: state.target,
+              unlockedBy: triggers.get(state.id) ?? null,
             };
           }
           if (state.unlocked) {
+            const trigger = badgeTriggerFor(state.id, facts, evaluate);
             batch.set(userRef.collection('badges').doc(state.id), {
-              id: state.id, unlockedAt: now,
+              id: state.id, unlockedAt: now, unlockedBy: trigger,
             });
             writes++;
-            return {...state, unlockedAt: now.toDate().toISOString()};
+            return {
+              ...state,
+              unlockedAt: now.toDate().toISOString(),
+              unlockedBy: trigger,
+            };
           }
           return state;
         });
