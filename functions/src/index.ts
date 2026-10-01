@@ -4114,6 +4114,20 @@ const DOOR_HORIZONS_COUNTRIES_TARGET = 3;
  */
 const DOOR_PREFERENCES_TARGET = 12;
 const DOOR_PROMESSE_TARGET = 10;
+
+/**
+ * La Porte des séries : les cinq mêmes étapes, à l'échelle des séries.
+ *
+ * Moins que pour les films, et pour deux raisons. On regarde bien moins de
+ * séries que de films : un cinéphile en connaît rarement plus de trente. Et
+ * les goûts de cinéma servent d'a priori au moteur des séries tant que leur
+ * profil est mince : il n'a pas besoin de cent séries pour savoir où chercher.
+ */
+const SERIES_DOOR_MEMOIRE_TARGET = 15;
+const SERIES_DOOR_EVENTAIL_TARGET = 4;
+const SERIES_DOOR_COEUR_TARGET = 4;
+const SERIES_DOOR_PREFERENCES_TARGET = 6;
+const SERIES_DOOR_PROMESSE_TARGET = 3;
 /**
  * Films positionnés par appel, au plus. La Galerie s'enrichit paresseusement :
  * quelques fiches par ouverture de l'onglet, persistées sur les documents, et
@@ -4412,6 +4426,48 @@ function doorStateFrom(
 }
 
 /**
+ * La Porte des séries, sur la bibliothèque telle qu'elle est.
+ *
+ * La Mémoire compte des séries, pas des saisons : avoir vu une saison de
+ * Dark, c'est connaître Dark. Le Cœur compte des saisons, parce que c'est là
+ * qu'il se pose. La Promesse compte les saisons dans la file.
+ * @param {admin.firestore.QuerySnapshot} tvGallerySnap Saisons vues.
+ * @param {admin.firestore.QuerySnapshot} tvWatchlistSnap Saisons à voir.
+ * @param {number} duelsCount Comparaisons entre séries jouées.
+ * @return {Object} La Porte, au même format que celle des films.
+ */
+function seriesDoorStateFrom(
+    tvGallerySnap: admin.firestore.QuerySnapshot,
+    tvWatchlistSnap: admin.firestore.QuerySnapshot,
+    duelsCount: number,
+): Omit<DoorState, 'horizons'> {
+  const seriesIds = new Set<number>();
+  const genres = new Set<number>();
+  let loved = 0;
+  for (const doc of tvGallerySnap.docs) {
+    const id = Number(doc.get('tmdbId'));
+    if (Number.isFinite(id)) seriesIds.add(id);
+    const genreIds = doc.get('genreIds');
+    if (Array.isArray(genreIds)) {
+      for (const genreId of genreIds) {
+        if (typeof genreId === 'number') genres.add(genreId);
+      }
+    }
+    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) loved++;
+  }
+  const artifact = (key: string, current: number, target: number) =>
+    ({key, current, target, done: current >= target});
+  const artifacts = [
+    artifact('memoire', seriesIds.size, SERIES_DOOR_MEMOIRE_TARGET),
+    artifact('eventail', genres.size, SERIES_DOOR_EVENTAIL_TARGET),
+    artifact('coeur', loved, SERIES_DOOR_COEUR_TARGET),
+    artifact('horizons', duelsCount, SERIES_DOOR_PREFERENCES_TARGET),
+    artifact('promesse', tvWatchlistSnap.size, SERIES_DOOR_PROMESSE_TARGET),
+  ];
+  return {unlocked: artifacts.every((a) => a.done), artifacts};
+}
+
+/**
  * Le trait : ce que la bibliothèque raconte, traduit dans l'espace commun.
  *
  * Recalculé à chaque appel plutôt que mis en cache — une Galerie tient en une
@@ -4434,7 +4490,7 @@ export const getTasteProfile = onRequest(
         const userRef = db.collection('users').doc(uid);
         const [
           gallerySnap, watchlistSnap, correctionsSnap, historySnap, prefsSnap,
-          duelsSnap,
+          duelsSnap, tvGallerySnap, tvWatchlistSnap, seriesDuelsSnap,
         ] = await Promise.all([
           filmsIn(userRef.collection('gallery')).get(),
           filmsIn(userRef.collection('watchlist')).get(),
@@ -4443,6 +4499,9 @@ export const getTasteProfile = onRequest(
               .orderBy('createdAt', 'desc').limit(20).get(),
           userRef.collection('taste').doc('filmPrefs').get(),
           userRef.collection('taste').doc('duels').get(),
+          userRef.collection('gallery').where('mediaType', '==', 'tv').get(),
+          userRef.collection('watchlist').where('mediaType', '==', 'tv').get(),
+          userRef.collection('taste').doc('seriesDuels').get(),
         ]);
 
         const corrections: Partial<AxisVector> = {};
@@ -4484,6 +4543,12 @@ export const getTasteProfile = onRequest(
         const door = doorStateFrom(
             gallerySnap, watchlistSnap, freshOrigins, duelsCount,
         );
+        const rawSeriesDuels = seriesDuelsSnap.get('count');
+        const seriesDoor = seriesDoorStateFrom(
+            tvGallerySnap, tvWatchlistSnap,
+            typeof rawSeriesDuels === 'number' && rawSeriesDuels > 0 ?
+              rawSeriesDuels : 0,
+        );
 
         res.status(200).json({
           mu: trait.mu,
@@ -4494,6 +4559,7 @@ export const getTasteProfile = onRequest(
           verdict_count: outcomes.verdicts.length,
           pending_verdict: outcomes.pending,
           door,
+          series_door: seriesDoor,
         });
       } catch (error) {
         logger.error('getTasteProfile failed', {error});
