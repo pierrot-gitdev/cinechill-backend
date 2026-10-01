@@ -4617,8 +4617,12 @@ export const recordSessionOutcome = onRequest(
           return;
         }
 
+        // Les séances de séries ont leur propre historique : un identifiant
+        // de série retrouverait sinon la séance d'un film homonyme.
+        const format = cineMatchFormatOf(body.format);
+        const store = cineMatchStoreFor(format);
         const userRef = getAdmin().firestore().collection('users').doc(uid);
-        const historySnap = await userRef.collection('recommendationHistory')
+        const historySnap = await userRef.collection(store.history)
             .orderBy('createdAt', 'desc').limit(20).get();
 
         if (body.kind === 'rejection') {
@@ -4678,7 +4682,7 @@ export const recordSessionOutcome = onRequest(
           // Le journal d'exposition de CinéMatch : un film choisi n'est
           // jamais mis au repos pour avoir été montré souvent. C'est ce
           // qui distingue « montré et ignoré » de « montré et lancé ».
-          await userRef.collection('cinematchExposure').doc(String(tmdbId))
+          await userRef.collection(store.exposure).doc(String(tmdbId))
               .set({tmdbId, chosenAt: launchedAt}, {merge: true});
           res.status(200).json({ok: true});
           return;
@@ -4707,7 +4711,12 @@ export const recordSessionOutcome = onRequest(
           // la soirée, ne doit pas rester enfermé dans la séance. On le pose
           // sur le film si la Galerie le connaît ; sinon on n'invente pas une
           // entrée sans métadonnées.
-          if (value === 'stayed' && previousVerdict !== 'stayed') {
+          if (value === 'stayed' && previousVerdict !== 'stayed' &&
+            format === 'series') {
+            // Une série se range saison par saison : on ne sait pas laquelle
+            // porterait le cœur. Le graphe, lui, compte la série entière.
+            await bumpFilmPref(userRef, tmdbId, ELO_STAYED_BONUS, store.prefs);
+          } else if (value === 'stayed' && previousVerdict !== 'stayed') {
             const galleryRef = userRef.collection('gallery')
                 .doc(`movie-${tmdbId}`);
             const gallerySnap = await galleryRef.get();
@@ -4773,13 +4782,15 @@ const ELO_STAYED_BONUS = 40;
  * @param {admin.firestore.DocumentReference} userRef Le document utilisateur.
  * @param {number} tmdbId Le film.
  * @param {number} delta Les points à ajouter.
+ * @param {string} prefsDoc Le graphe : `filmPrefs` ou `seriesPrefs`.
  */
 async function bumpFilmPref(
     userRef: admin.firestore.DocumentReference,
     tmdbId: number,
     delta: number,
+    prefsDoc = 'filmPrefs',
 ): Promise<void> {
-  const prefsRef = userRef.collection('taste').doc('filmPrefs');
+  const prefsRef = userRef.collection('taste').doc(prefsDoc);
   await prefsRef.firestore.runTransaction(async (txn) => {
     const snap = await txn.get(prefsRef);
     const entry = (snap.get(String(tmdbId)) ?? {}) as Record<string, unknown>;
@@ -4825,10 +4836,12 @@ export const recordFilmDuel = onRequest(
         const tasteRef = getAdmin().firestore()
             .collection('users').doc(uid)
             .collection('taste');
-        const prefsRef = tasteRef.doc('filmPrefs');
+        // Deux graphes : un duel entre séries ne dit rien des films.
+        const store = cineMatchStoreFor(cineMatchFormatOf(body.format));
+        const prefsRef = tasteRef.doc(store.prefs);
         // Le compteur de la Porte (« Tes préférences ») : tenu à part pour
         // ne pas avoir à sommer les victoires du graphe à chaque ouverture.
-        const duelsRef = tasteRef.doc('duels');
+        const duelsRef = tasteRef.doc(store.duels);
 
         await prefsRef.firestore.runTransaction(async (txn) => {
           const snap = await txn.get(prefsRef);
@@ -9871,6 +9884,56 @@ const CINEMATCH_DURATIONS: readonly engine.Duration[] =
 const CINEMATCH_WANTS: readonly engine.Want[] =
   ['light', 'soft', 'suspense', 'think', 'feelgood', 'everyone'];
 const CINEMATCH_ENERGIES: readonly engine.Energy[] = ['low', 'high'];
+const CINEMATCH_ENGAGEMENTS: readonly engine.Engagement[] =
+  ['mini', 'season', 'long', 'any'];
+
+/**
+ * Films ou séries : deux profils qui ne se mêlent pas. Chacun a son journal
+ * d'exposition, son graphe de duels, son historique et sa proposition du
+ * jour. Les identifiants TMDB des films et des séries se recoupent : un
+ * stockage commun prendrait l'un pour l'autre.
+ */
+type CineMatchFormat = 'film' | 'series';
+
+/** Où vit chaque profil, document ou collection. */
+interface CineMatchStore {
+  exposure: string;
+  prefs: string;
+  duels: string;
+  history: string;
+  daily: string;
+}
+
+/**
+ * Le format d'une requête. Absent, c'est un film : les versions de l'app
+ * qui ne connaissent pas les séries ne l'envoient pas.
+ * @param {unknown} raw Valeur brute.
+ * @return {CineMatchFormat} Le format.
+ */
+function cineMatchFormatOf(raw: unknown): CineMatchFormat {
+  return raw === 'series' ? 'series' : 'film';
+}
+
+/**
+ * Les noms de stockage d'un format.
+ * @param {CineMatchFormat} format Films ou séries.
+ * @return {CineMatchStore} Collections et documents.
+ */
+function cineMatchStoreFor(format: CineMatchFormat): CineMatchStore {
+  return format === 'series' ? {
+    exposure: 'cinematchSeriesExposure',
+    prefs: 'seriesPrefs',
+    duels: 'seriesDuels',
+    history: 'seriesHistory',
+    daily: 'dailySeries',
+  } : {
+    exposure: 'cinematchExposure',
+    prefs: 'filmPrefs',
+    duels: 'duels',
+    history: 'recommendationHistory',
+    daily: 'daily',
+  };
+}
 
 /** La situation telle que le client l'envoie. */
 interface CineMatchSituationPayload extends engine.Situation {
@@ -10050,6 +10113,105 @@ async function loadCineMatchGallery(
 }
 
 /**
+ * Avoir vu ce qui est sorti vaut un « j'aime ». C'est la note que les séries
+ * ont et que le cinéma n'a pas : on ne regarde pas six saisons d'une série
+ * qu'on n'aime pas. Au-dessous de deux saisons, le compte ne dit rien.
+ */
+const SERIES_COMPLETION_LOVED = 0.8;
+/** Fiches de séries payées par lecture de la galerie, au plus. */
+const SERIES_GALLERY_META_BATCH = 15;
+
+/**
+ * La galerie des séries, lue pour CinéMatch : une entrée par série, pas par
+ * saison, placée sur les huit axes par sa fiche.
+ *
+ * Une série compte comme aimée si une de ses saisons porte un cœur, ou si
+ * l'on a vu presque tout ce qui est sorti. Une série sans fiche encore n'est
+ * pas perdue : elle reste écartée des propositions, et entrera dans les
+ * comparaisons à l'appel suivant.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CineMatchGallery>} La galerie des séries.
+ */
+async function loadSeriesGallery(
+    db: admin.firestore.Firestore,
+    userRef: admin.firestore.DocumentReference,
+    ctx: TMDBContext,
+): Promise<CineMatchGallery> {
+  const snap = await userRef.collection('gallery')
+      .where('mediaType', '==', 'tv').get();
+  const bySeries =
+    new Map<number, {seasons: Set<number>; lovedAt: number | null}>();
+  for (const doc of snap.docs) {
+    const id = Number(doc.get('tmdbId'));
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const entry = bySeries.get(id) ??
+      {seasons: new Set<number>(), lovedAt: null};
+    const season = doc.get('season');
+    if (typeof season === 'number') entry.seasons.add(season);
+    const loved = millisOf(doc.get('lovedAt'));
+    if (loved !== null && (entry.lovedAt === null || loved > entry.lovedAt)) {
+      entry.lovedAt = loved;
+    }
+    bySeries.set(id, entry);
+  }
+
+  const metas = await loadTvMeta(
+      db, [...bySeries.keys()], ctx, SERIES_GALLERY_META_BATCH);
+  const positioned: CineMatchGalleryEntry[] = [];
+  for (const [id, entry] of bySeries) {
+    const meta = metas.get(id);
+    if (!meta) continue;
+    const completion = entry.seasons.size / Math.max(1, meta.seasonCount);
+    const loved = entry.lovedAt !== null ||
+      (meta.seasonCount >= 2 && completion >= SERIES_COMPLETION_LOVED);
+    positioned.push({
+      film: {
+        id,
+        axes: meta.axes,
+        genreIds: meta.genreIds,
+        loved,
+        posterLastShownAt: null,
+      },
+      title: meta.name,
+      posterPath: meta.posterPath,
+      releaseDate: meta.firstAirDate,
+      lovedAtMillis: entry.lovedAt,
+    });
+  }
+  return {
+    positioned,
+    seenIds: new Set(bySeries.keys()),
+    size: bySeries.size,
+  };
+}
+
+/**
+ * Les séries lâchées en route : identifiants et positions.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Object>} Ce que le moteur écarte et ce dont il s'éloigne.
+ */
+async function loadSeriesAbandons(
+    db: admin.firestore.Firestore,
+    userRef: admin.firestore.DocumentReference,
+    ctx: TMDBContext,
+): Promise<{ids: number[]; axes: engine.EngineAxes[]}> {
+  const snap = await userRef.collection('taste').doc('seriesAbandons').get();
+  const ids = Object.keys(snap.exists ? snap.data() ?? {} : {})
+      .map(Number)
+      .filter((id) => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) return {ids: [], axes: []};
+  const metas = await loadTvMeta(db, ids, ctx, SERIES_GALLERY_META_BATCH);
+  return {
+    ids,
+    axes: [...metas.values()].map((meta) => meta.axes),
+  };
+}
+
+/**
  * La forme JSON d'un film de galerie pour le client.
  * @param {CineMatchGalleryEntry} entry Film de galerie.
  * @return {Object} `GalleryFilm` du contrat.
@@ -10091,12 +10253,18 @@ export const getCineMatchComparison = onRequest(
         const shownIds = parseTmdbIdList(body.shownIds, 500);
         const history = parseCineMatchComparisons(body.history);
         const forDoor = body.purpose === 'door';
+        const format = cineMatchFormatOf(body.format);
+        const memoireTarget = format === 'series' ?
+          SERIES_DOOR_MEMOIRE_TARGET : DOOR_MEMOIRE_TARGET;
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
+        const ctx = tmdb(req, res);
         const [gallery, posterSnap] = await Promise.all([
-          loadCineMatchGallery(db, userRef, tmdb(req, res)),
-          userRef.collection('cinematchExposure')
+          format === 'series' ?
+            loadSeriesGallery(db, userRef, ctx) :
+            loadCineMatchGallery(db, userRef, ctx),
+          userRef.collection(cineMatchStoreFor(format).exposure)
               .where('posterLastShownAt', '>',
                   admin.firestore.Timestamp.fromMillis(0))
               .get(),
@@ -10106,7 +10274,7 @@ export const getCineMatchComparison = onRequest(
         // La Porte ne compare qu'une galerie qui a déjà sa Mémoire : en
         // dessous, le recyclage ferait revenir les mêmes affiches d'un tour
         // à l'autre. L'app ferme l'accès, le serveur tient la même règle.
-        if (forDoor && gallery.size < DOOR_MEMOIRE_TARGET) {
+        if (forDoor && gallery.size < memoireTarget) {
           res.status(200).json({
             total, round, films: [], replacements: {}, excludeFilms: [],
           });
@@ -10296,12 +10464,20 @@ interface CineMatchSetup {
   prefs: Map<number, number>;
   exposure: Map<number, engine.ExposureRecord>;
   now: number;
+  /** Séries : les positions des séries abandonnées. */
+  avoided?: engine.EngineAxes[];
+  /** Séries : les séries abandonnées, jamais reproposées. */
+  extraExcludedIds?: number[];
+  /** Séries : les films aimés, tant que le profil de séries est mince. */
+  priorAnchors?: {axes: engine.EngineAxes; genreIds: number[]}[];
 }
 
 /** Ce que la soirée demande, questions comprises. */
 interface CineMatchEvening {
   want: engine.Want | null;
   energy: engine.Energy | null;
+  /** Séries : le temps total accepté, à la place de l'énergie. */
+  engagement?: engine.Engagement | null;
   comparisons: engine.Comparison[];
   hesitations: number;
 }
@@ -10549,18 +10725,21 @@ async function buildCineMatchCandidates(
  * fiches ont démenti la durée ou les plateformes.
  * @param {CineMatchSetup} setup La soirée.
  * @param {CineMatchEvening} evening Les réponses.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {function(boolean): Promise} build Compose le vivier, relâché ou
+ *   non : celui des films ou celui des séries.
  * @param {function(engine.RecommendInput): T} run Le calcul à faire.
  * @param {function(T): boolean} enough Vrai si le résultat suffit.
  * @return {Promise<Object>} Le résultat et les fiches enrichies.
  */
-async function runCineMatchEngine<T>(
+async function runCineMatchEngine<T, E>(
     setup: CineMatchSetup,
     evening: CineMatchEvening,
-    ctx: TMDBContext,
+    build: (forceRelaxed: boolean) => Promise<{
+      films: engine.EngineFilm[]; enriched: Map<number, E>; relaxed: boolean;
+    }>,
     run: (input: engine.RecommendInput) => T,
     enough: (result: T) => boolean,
-): Promise<{result: T; enriched: Map<number, EnrichedCandidate>}> {
+): Promise<{result: T; enriched: Map<number, E>}> {
   const inputFor = (films: engine.EngineFilm[]): engine.RecommendInput => ({
     films,
     gallery: setup.gallery.positioned.map((entry) => entry.film),
@@ -10571,16 +10750,20 @@ async function runCineMatchEngine<T>(
     hesitations: evening.hesitations,
     exposure: setup.exposure,
     now: setup.now,
+    engagement: evening.engagement ?? null,
+    avoided: setup.avoided ?? [],
+    priorAnchors: setup.priorAnchors ?? [],
+    extraExcludedIds: setup.extraExcludedIds ?? [],
   });
 
-  const first = await buildCineMatchCandidates(setup, evening, false, ctx);
+  const first = await build(false);
   const firstResult = run(inputFor(first.films));
   const constrained = setup.situation.duration !== 'any' ||
     setup.situation.platformIds.length > 0;
   if (enough(firstResult) || first.relaxed || !constrained) {
     return {result: firstResult, enriched: first.enriched};
   }
-  const second = await buildCineMatchCandidates(setup, evening, true, ctx);
+  const second = await build(true);
   return {result: run(inputFor(second.films)), enriched: second.enriched};
 }
 
@@ -10622,6 +10805,382 @@ function cineMatchHistoryFilms(
   }));
 }
 
+/* ===================================================================== *
+ *  CinéMatch des séries
+ *
+ *  Le même moteur, sur un autre vivier : `/discover/tv` filtré sur la durée
+ *  d'un épisode, le voisinage des séries qu'on relance, la watchlist des
+ *  séries. La galerie compte des séries et non des saisons, et les films
+ *  aimés prêtent leur goût tant que le profil de séries est mince.
+ * ===================================================================== */
+
+/** Plancher de votes d'une série proposée : on en vote bien moins. */
+const SERIES_CINEMATCH_VOTE_FLOOR = 100;
+/** La tranche peu connue des séries. */
+const SERIES_QUIET_VOTE_CEILING = 1500;
+/** Séries qui méritent une fiche complète, par passage. */
+const SERIES_ENRICH_MAX = 40;
+/** En deçà de tant de séries conformes, on relâche durée et plateformes. */
+const SERIES_STRICT_FLOOR = 25;
+/** Graines de voisinage tirées des séries relancées ou aimées. */
+const SERIES_CINEMATCH_SEEDS = 5;
+/** Séries de la watchlist entrées dans le vivier, au plus. */
+const SERIES_WATCHLIST_MAX = 8;
+/**
+ * Tant qu'on aime moins de séries que cela, les films aimés servent d'ancres
+ * au goût. Au-delà, le profil de séries parle seul.
+ */
+const SERIES_PRIOR_UNTIL = 15;
+/** Films aimés prêtés au profil de séries, les plus récents d'abord. */
+const SERIES_PRIOR_MAX = 30;
+
+/**
+ * Tout ce que la soirée sait déjà, côté séries : galerie des séries,
+ * séries dans la file, duels, exposition, abandons, et les films aimés tant
+ * qu'il le faut.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Utilisateur.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CineMatchSetup>} La soirée, prête pour le vivier.
+ */
+async function loadSeriesSetup(
+    db: admin.firestore.Firestore,
+    uid: string,
+    situation: CineMatchSituationPayload,
+    ctx: TMDBContext,
+): Promise<CineMatchSetup> {
+  const now = Date.now();
+  const userRef = db.collection('users').doc(uid);
+  const store = cineMatchStoreFor('series');
+  const cutoff = admin.firestore.Timestamp.fromMillis(
+      now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
+  );
+  const [gallery, watchlistSnap, prefsSnap, exposureSnap, abandons] =
+    await Promise.all([
+      loadSeriesGallery(db, userRef, ctx),
+      userRef.collection('watchlist').where('mediaType', '==', 'tv').get(),
+      userRef.collection('taste').doc(store.prefs).get(),
+      userRef.collection(store.exposure)
+          .where('lastShownAt', '>=', cutoff).get(),
+      loadSeriesAbandons(db, userRef, ctx),
+    ]);
+
+  const exposure = new Map<number, engine.ExposureRecord>();
+  for (const doc of exposureSnap.docs) {
+    const id = Number(doc.get('tmdbId') ?? doc.id);
+    if (!Number.isInteger(id)) continue;
+    const count = doc.get('shownCount');
+    exposure.set(id, {
+      shownCount: typeof count === 'number' ? count : 0,
+      lastShownAt: millisOf(doc.get('lastShownAt')),
+      chosenAt: millisOf(doc.get('chosenAt')),
+    });
+  }
+  const watchlistIds = new Set<number>();
+  for (const doc of watchlistSnap.docs) {
+    const id = Number(doc.get('tmdbId'));
+    if (Number.isInteger(id) && id > 0) watchlistIds.add(id);
+  }
+
+  // Les films aimés, en prêt : sans eux, quelqu'un qui a rangé quinze
+  // séries sans en aimer aucune n'aurait pas de goût du tout.
+  let priorAnchors: {axes: engine.EngineAxes; genreIds: number[]}[] = [];
+  const lovedSeries = gallery.positioned.filter((e) => e.film.loved).length;
+  if (lovedSeries < SERIES_PRIOR_UNTIL) {
+    const films = await loadCineMatchGallery(db, userRef, ctx);
+    priorAnchors = films.positioned
+        .filter((entry) => entry.lovedAtMillis !== null)
+        .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0))
+        .slice(0, SERIES_PRIOR_MAX)
+        .map((entry) => ({
+          axes: entry.film.axes, genreIds: entry.film.genreIds,
+        }));
+  }
+
+  return {
+    situation: {...situation, kind: 'series'},
+    gallery,
+    watchlistRows: [],
+    watchlistIds,
+    prefs: parseFilmPrefs(prefsSnap),
+    exposure,
+    now,
+    avoided: abandons.axes,
+    extraExcludedIds: abandons.ids,
+    priorAnchors,
+  };
+}
+
+/**
+ * Les paramètres `/discover/tv` d'une soirée. La durée est celle d'un
+ * épisode, sur les mêmes paliers que le moteur.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @return {Record<string, string>} Paramètres TMDB.
+ */
+function seriesDiscoverParams(
+    situation: CineMatchSituationPayload, relaxed: boolean,
+): Record<string, string> {
+  const query: Record<string, string> = {
+    'include_adult': 'false',
+    'with_type': '2|4',
+    'without_genres': TV_EXCLUDED_GENRES.join('|'),
+    'vote_count.gte': String(SERIES_CINEMATCH_VOTE_FLOOR),
+  };
+  const slack = relaxed ? engine.SERIES_DURATION_WIDEN_MAX_MINUTES : 0;
+  if (situation.duration === 'short') {
+    query['with_runtime.lte'] = String(35 + slack);
+  } else if (situation.duration === 'medium') {
+    query['with_runtime.gte'] = String(Math.max(1, 30 - slack));
+    query['with_runtime.lte'] = String(60 + slack);
+  } else if (situation.duration === 'long') {
+    query['with_runtime.gte'] = String(55 - slack);
+  }
+  if (!relaxed && situation.platformIds.length > 0) {
+    query.watch_region = situation.watchRegion;
+    query.with_watch_providers = situation.platformIds.join('|');
+    query.with_watch_monetization_types = 'flatrate|free|ads';
+  }
+  return query;
+}
+
+/**
+ * Le catalogue des séries d'une soirée : plusieurs tris et une tranche peu
+ * connue.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<DiscoverRow[]>} Séries sans doublon.
+ */
+async function fetchSeriesCatalogue(
+    situation: CineMatchSituationPayload,
+    relaxed: boolean,
+    ctx: TMDBContext,
+): Promise<DiscoverRow[]> {
+  const base = seriesDiscoverParams(situation, relaxed);
+  const today = new Date().toISOString().slice(0, 10);
+  const slices: Record<string, string>[] = [
+    {sort_by: 'popularity.desc', page: '1'},
+    {sort_by: 'popularity.desc', page: '2'},
+    {'sort_by': 'vote_average.desc', 'vote_count.gte': '500', 'page': '1'},
+    {'sort_by': 'first_air_date.desc', 'page': '1',
+      'first_air_date.lte': today},
+    {sort_by: 'vote_count.desc', page: '1'},
+    {sort_by: 'vote_count.desc', page: '2'},
+    {'sort_by': 'vote_average.desc', 'page': '1',
+      'vote_count.lte': String(SERIES_QUIET_VOTE_CEILING)},
+  ];
+  const responses = await Promise.allSettled(slices.map((slice) =>
+    tmdbGET('/discover/tv', {...base, ...slice}, ctx)));
+  const byId = new Map<number, DiscoverRow>();
+  for (const settled of responses) {
+    for (const raw of rowsFrom(settled, 'results')) {
+      const row = seriesRowFrom(raw as unknown as Record<string, unknown>);
+      if (row && !byId.has(row.id)) byId.set(row.id, row);
+    }
+  }
+  return [...byId.values()];
+}
+
+/**
+ * Une série, dans la langue du moteur.
+ * @param {TvMeta} meta Fiche de la série.
+ * @param {boolean} listed Vrai si une de ses saisons est dans la file.
+ * @return {engine.EngineFilm} La série.
+ */
+function engineSeriesFrom(meta: TvMeta, listed: boolean): engine.EngineFilm {
+  return {
+    id: meta.id,
+    axes: meta.axes,
+    genreIds: meta.genreIds,
+    year: yearOf(meta.firstAirDate),
+    voteCount: meta.voteCount,
+    runtime: meta.episodeRuntime,
+    providerIds: meta.providerIds,
+    keywordNames: meta.keywordNames,
+    listed,
+    certification: meta.certification,
+    seasonCount: meta.seasonCount,
+    episodeCount: meta.episodeCount,
+    status: meta.status,
+  };
+}
+
+/**
+ * Compose le vivier des séries d'une soirée et l'enrichit. Le même
+ * principe que celui des films : catalogue, graines, watchlist ; un
+ * classement grossier choisit les séries qui méritent une fiche.
+ * @param {admin.firestore.Firestore} db Firestore, pour le cache des fiches.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {CineMatchEvening} evening Les réponses.
+ * @param {boolean} forceRelaxed Aller chercher hors durée et plateformes.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Object>} Séries enrichies, et leurs fiches.
+ */
+async function buildSeriesCandidates(
+    db: admin.firestore.Firestore,
+    setup: CineMatchSetup,
+    evening: CineMatchEvening,
+    forceRelaxed: boolean,
+    ctx: TMDBContext,
+): Promise<{
+  films: engine.EngineFilm[]; enriched: Map<number, TvMeta>; relaxed: boolean;
+}> {
+  const {situation, gallery} = setup;
+  const abandoned = new Set(setup.extraExcludedIds ?? []);
+
+  const seedIds: number[] = [];
+  const positionedIds = new Set(gallery.positioned.map((e) => e.film.id));
+  for (const [id, rating] of
+    [...setup.prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
+    if (rating <= ELO_START || seedIds.length >= SERIES_CINEMATCH_SEEDS) break;
+    if (positionedIds.has(id)) seedIds.push(id);
+  }
+  const loved = gallery.positioned
+      .filter((entry) => entry.film.loved)
+      .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0));
+  for (const entry of loved) {
+    if (seedIds.length >= SERIES_CINEMATCH_SEEDS) break;
+    if (!seedIds.includes(entry.film.id)) seedIds.push(entry.film.id);
+  }
+
+  const constrained =
+    situation.duration !== 'any' || situation.platformIds.length > 0;
+  const [catalogue, seedResponses] = await Promise.all([
+    fetchSeriesCatalogue(situation, false, ctx),
+    Promise.allSettled(seedIds.map((id) => tmdbGET(
+        `/tv/${id}/recommendations`, {page: '1'}, ctx))),
+  ]);
+  const keep = (row: DiscoverRow): boolean =>
+    !gallery.seenIds.has(row.id) && !abandoned.has(row.id) &&
+    !(row.genre_ids ?? []).some((id) => TV_EXCLUDED_GENRES.includes(id));
+
+  const strictRows = catalogue.filter(keep);
+  const strictIds = new Set(strictRows.map((row) => row.id));
+  let relaxedRows: DiscoverRow[] = [];
+  const relaxed = constrained &&
+    (forceRelaxed || strictRows.length < SERIES_STRICT_FLOOR);
+  if (relaxed) {
+    relaxedRows = (await fetchSeriesCatalogue(situation, true, ctx))
+        .filter((row) => keep(row) && !strictIds.has(row.id));
+  }
+  const personal: DiscoverRow[] = [];
+  for (const settled of seedResponses) {
+    for (const raw of rowsFrom(settled, 'results').slice(0, 12)) {
+      const row = seriesRowFrom(raw as unknown as Record<string, unknown>);
+      if (row && keep(row) && !strictIds.has(row.id)) personal.push(row);
+    }
+  }
+
+  const byId = new Map<number, DiscoverRow>();
+  for (const row of [...strictRows, ...personal, ...relaxedRows]) {
+    if (!byId.has(row.id)) byId.set(row.id, row);
+  }
+  const rows = [...byId.values()];
+
+  // Le classement grossier, comme pour les films, sur ce que `/discover`
+  // dit d'une série : genres, notoriété, date.
+  const stats = poolStatsFor(rows);
+  const coarseFilms: engine.EngineFilm[] = rows
+      .filter((row) => !engine.isResting(setup.exposure.get(row.id), setup.now))
+      .map((row) => ({
+        id: row.id,
+        axes: coarseAxesFor(row, stats),
+        genreIds: row.genre_ids ?? [],
+        year: yearOf(row.release_date),
+        voteCount: row.vote_count ?? null,
+        runtime: null,
+        providerIds: [],
+        keywordNames: [],
+        listed: setup.watchlistIds.has(row.id),
+        certification: null,
+      }));
+  const lovedAxes = [
+    ...gallery.positioned.filter((e) => e.film.loved).map((e) => e.film),
+    ...(setup.priorAnchors ?? []),
+  ];
+  const ranked = engine.scoreFilms(coarseFilms, {
+    situation: {...situation, duration: 'any', platformIds: []},
+    want: evening.want,
+    energy: null,
+    hesitations: evening.hesitations,
+    loved: lovedAxes,
+    weights: engine.buildWeights(
+        lovedAxes.map((film) => film.axes),
+        coarseFilms.map((film) => film.axes),
+        evening.comparisons,
+        new Map(gallery.positioned.map((e) => [e.film.id, e.film.axes])),
+    ),
+    exposure: setup.exposure,
+    now: setup.now,
+    conforming: strictIds,
+  });
+
+  // La watchlist entre d'office : elle n'a pas de ligne `/discover`, mais
+  // c'est là que le moteur trouve ce qu'on s'était promis de commencer.
+  const listed = [...setup.watchlistIds]
+      .filter((id) => !gallery.seenIds.has(id) && !abandoned.has(id))
+      .slice(0, SERIES_WATCHLIST_MAX);
+  const shortlist = [...new Set([
+    ...listed,
+    ...ranked.slice(0, SERIES_ENRICH_MAX).map((scored) => scored.film.id),
+  ])];
+  const metas = await loadTvMeta(db, shortlist, ctx, shortlist.length);
+
+  const enriched = new Map<number, TvMeta>();
+  const films: engine.EngineFilm[] = [];
+  for (const id of shortlist) {
+    const meta = metas.get(id);
+    if (!meta || !isKeptSeries(meta)) continue;
+    enriched.set(id, meta);
+    films.push(engineSeriesFrom(meta, setup.watchlistIds.has(id)));
+  }
+  return {films, enriched, relaxed};
+}
+
+/**
+ * La forme JSON d'une série proposée : celle d'un film, plus ce qu'il faut
+ * pour dire dans quoi on s'engage.
+ * @param {TvMeta} meta Fiche de la série.
+ * @return {Object} `FiveFilm` du contrat, côté séries.
+ */
+function cineMatchSeriesJSON(meta: TvMeta) {
+  return {
+    id: meta.id,
+    title: meta.name,
+    poster_path: meta.posterPath,
+    overview: meta.overview,
+    release_date: meta.firstAirDate,
+    genre_ids: meta.genreIds,
+    runtime_minutes: meta.episodeRuntime,
+    provider_ids: meta.providerIds,
+    trailer_key: meta.trailerKey,
+    media_type: 'tv',
+    season_count: meta.seasonCount,
+    episode_count: meta.episodeCount,
+    status: meta.status,
+  };
+}
+
+/**
+ * Le bloc `films` d'un document d'historique des séries.
+ * @param {engine.ScoredFilm[]} picks Séries proposées, dans l'ordre.
+ * @param {Map<number, TvMeta>} metas Fiches.
+ * @return {Object[]} Séries, rang à partir de 1.
+ */
+function seriesHistoryFilms(
+    picks: engine.ScoredFilm[], metas: Map<number, TvMeta>,
+) {
+  return picks.map((pick, index) => ({
+    id: pick.film.id,
+    title: metas.get(pick.film.id)?.name ?? null,
+    rank: index + 1,
+    axes: pick.film.axes,
+    score: pick.score,
+  }));
+}
+
 /**
  * Les cinq films d'une soirée guidée.
  *
@@ -10642,9 +11201,15 @@ export const getCineMatchFive = onRequest(
         if (!uid) return;
 
         const body = (req.body ?? {}) as Record<string, unknown>;
+        const format = cineMatchFormatOf(body.format);
         const want = oneOf(body.want, CINEMATCH_WANTS);
-        const energy = oneOf(body.energy, CINEMATCH_ENERGIES);
-        if (!want || !energy) {
+        // Une série ne se choisit pas pour une soirée : la seconde question
+        // demande dans quoi on s'engage, pas l'énergie qu'on a.
+        const energy = format === 'film' ?
+          oneOf(body.energy, CINEMATCH_ENERGIES) : null;
+        const engagement = format === 'series' ?
+          oneOf(body.engagement, CINEMATCH_ENGAGEMENTS) : null;
+        if (!want || (format === 'film' ? !energy : !engagement)) {
           res.status(400).json({error: 'invalid_answers'});
           return;
         }
@@ -10652,6 +11217,7 @@ export const getCineMatchFive = onRequest(
         const evening: CineMatchEvening = {
           want,
           energy,
+          engagement,
           comparisons: parseCineMatchComparisons(body.comparisons),
           hesitations: Number.isFinite(hesitationsRaw) ?
             Math.max(0, Math.min(20, Math.floor(hesitationsRaw))) : 0,
@@ -10660,10 +11226,44 @@ export const getCineMatchFive = onRequest(
 
         const db = getAdmin().firestore();
         const ctx = tmdb(req, res);
+
+        if (format === 'series') {
+          const setup = await loadSeriesSetup(db, uid, situation, ctx);
+          const {result, enriched} = await runCineMatchEngine(
+              setup, evening,
+              (relaxed) =>
+                buildSeriesCandidates(db, setup, evening, relaxed, ctx),
+              engine.recommendFive, (r) => r.films.length >= 3,
+          );
+          const picks =
+            result.films.filter((pick) => enriched.has(pick.film.id));
+          if (picks.length === 0) {
+            res.status(409).json({error: 'no_candidates'});
+            return;
+          }
+          const historyRef = db.collection('users').doc(uid)
+              .collection(cineMatchStoreFor('series').history).doc();
+          await historyRef.set({
+            createdAt: admin.firestore.Timestamp.now(),
+            kind: 'five',
+            tmdbIds: picks.map((pick) => pick.film.id),
+            films: seriesHistoryFilms(picks, enriched),
+            answers: {situation, want, engagement},
+          });
+          res.status(200).json({
+            films: picks.map((pick) =>
+              cineMatchSeriesJSON(enriched.get(pick.film.id) as TvMeta)),
+            widened: result.widened,
+            sessionId: historyRef.id,
+          });
+          return;
+        }
+
         const setup = await loadCineMatchSetup(db, uid, situation, ctx);
         const {result, enriched} = await runCineMatchEngine(
-            setup, evening, ctx, engine.recommendFive,
-            (r) => r.films.length >= 3,
+            setup, evening,
+            (relaxed) => buildCineMatchCandidates(setup, evening, relaxed, ctx),
+            engine.recommendFive, (r) => r.films.length >= 3,
         );
 
         const picks = result.films.filter((pick) => enriched.has(pick.film.id));
@@ -10728,11 +11328,13 @@ export const getCineMatchDaily = onRequest(
 
         const body = (req.body ?? {}) as Record<string, unknown>;
         const situation = parseCineMatchSituation(body.situation);
+        const format = cineMatchFormatOf(body.format);
+        const store = cineMatchStoreFor(format);
         const today = parisDay(new Date());
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
-        const dailyRef = userRef.collection('cinematch').doc('daily');
+        const dailyRef = userRef.collection('cinematch').doc(store.daily);
         const stored = await dailyRef.get();
         const storedFilm = stored.get('film');
         if (stored.get('date') === today &&
@@ -10742,13 +11344,45 @@ export const getCineMatchDaily = onRequest(
         }
 
         const ctx = tmdb(req, res);
-        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
         const evening: CineMatchEvening = {
           want: null, energy: null, comparisons: [], hesitations: 0,
         };
         const dayOfYear = dayOfYearFrom(today);
+
+        if (format === 'series') {
+          const setup = await loadSeriesSetup(db, uid, situation, ctx);
+          const {result, enriched} = await runCineMatchEngine(
+              setup, evening,
+              (relaxed) =>
+                buildSeriesCandidates(db, setup, evening, relaxed, ctx),
+              (input) => engine.pickDaily(input, dayOfYear),
+              (r) => r.top.length >= 3,
+          );
+          const pick = result.film;
+          const meta = pick ? enriched.get(pick.film.id) : undefined;
+          if (!pick || !meta) {
+            res.status(200).json({film: null, date: today});
+            return;
+          }
+          const film = cineMatchSeriesJSON(meta);
+          await Promise.all([
+            dailyRef.set({date: today, tmdbId: meta.id, film}),
+            userRef.collection(store.history).add({
+              createdAt: admin.firestore.Timestamp.now(),
+              kind: 'daily',
+              tmdbIds: [meta.id],
+              films: seriesHistoryFilms([pick], enriched),
+              answers: {situation},
+            }),
+          ]);
+          res.status(200).json({film, date: today});
+          return;
+        }
+
+        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
         const {result, enriched} = await runCineMatchEngine(
-            setup, evening, ctx,
+            setup, evening,
+            (relaxed) => buildCineMatchCandidates(setup, evening, relaxed, ctx),
             (input) => engine.pickDaily(input, dayOfYear),
             (r) => r.top.length >= 3,
         );
@@ -10823,7 +11457,8 @@ export const recordCineMatchExposure = onRequest(
 
         const db = getAdmin().firestore();
         const exposureRef = db.collection('users').doc(uid)
-            .collection('cinematchExposure');
+            .collection(cineMatchStoreFor(cineMatchFormatOf(body.format))
+                .exposure);
         const now = admin.firestore.Timestamp.now();
         const batch = db.batch();
         for (const tmdbId of ids) {
