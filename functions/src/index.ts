@@ -1515,6 +1515,10 @@ interface QuestionnaireAnswersPayload {
 
 interface DiscoverRow {
   id: number;
+  /** Absent partout sauf là où films et séries se côtoient. Absent = film. */
+  media_type?: 'movie' | 'tv';
+  /** Saisons déjà sorties, pour une série uniquement. */
+  season_count?: number;
   title?: string;
   overview?: string | null;
   poster_path?: string | null;
@@ -7023,29 +7027,121 @@ async function fetchSwipeExclusions(
     uid: string,
 ): Promise<{
   excluded: Set<number>;
+  tvExcluded: Set<number>;
   galleryDocs: admin.firestore.QueryDocumentSnapshot[];
 }> {
   const userRef = db.collection('users').doc(uid);
   const now = admin.firestore.Timestamp.now();
 
-  const [gallerySnap, watchlistSnap, skipsSnap] = await Promise.all([
-    userRef.collection('gallery').get(),
-    userRef.collection('watchlist').get(),
+  const [
+    gallerySnap, watchlistSnap, tvGallerySnap, tvWatchlistSnap, skipsSnap,
+  ] = await Promise.all([
+    filmsIn(userRef.collection('gallery')).get(),
+    filmsIn(userRef.collection('watchlist')).get(),
+    userRef.collection('gallery').where('mediaType', '==', 'tv').get(),
+    userRef.collection('watchlist').where('mediaType', '==', 'tv').get(),
     userRef.collection('swipeSkips')
         .where('resurfaceAt', '>', now)
         .limit(SWIPE_MAX_ACTIVE_SKIPS)
         .get(),
   ]);
 
+  // Deux ensembles, jamais un : la série 1399 et le film 1399 n'ont rien à
+  // voir. Une série est écartée dès qu'une de ses saisons est rangée — le
+  // deck demande si on la connaît, et cette question a déjà sa réponse.
   const excluded = new Set<number>();
-  for (const snap of [gallerySnap, watchlistSnap, skipsSnap]) {
-    for (const doc of snap.docs) {
-      const id = doc.get('tmdbId');
-      if (typeof id === 'number') excluded.add(id);
-    }
+  const tvExcluded = new Set<number>();
+  const add = (target: Set<number>, doc: admin.firestore.DocumentSnapshot) => {
+    const id = doc.get('tmdbId');
+    if (typeof id === 'number') target.add(id);
+  };
+  for (const doc of gallerySnap.docs) add(excluded, doc);
+  for (const doc of watchlistSnap.docs) add(excluded, doc);
+  for (const doc of tvGallerySnap.docs) add(tvExcluded, doc);
+  for (const doc of tvWatchlistSnap.docs) add(tvExcluded, doc);
+  // Les écarts antérieurs aux séries n'ont pas de `mediaType` : ce sont tous
+  // des films.
+  for (const doc of skipsSnap.docs) {
+    add(doc.get('mediaType') === 'tv' ? tvExcluded : excluded, doc);
   }
 
-  return {excluded, galleryDocs: gallerySnap.docs};
+  return {excluded, tvExcluded, galleryDocs: gallerySnap.docs};
+}
+
+/**
+ * Cartes de série servies par lot, au plus, une fois la Mémoire pleine.
+ *
+ * Le deck a une mission : remplir la galerie de films assez variés pour
+ * ouvrir CinéMatch. Les séries en sont tenues à l'écart, donc une carte de
+ * série avant la Mémoire est une carte qui ne fait pas avancer la Porte. Elles
+ * arrivent une fois la Porte nourrie, en petite part.
+ */
+const SWIPE_TV_CARDS = 3;
+/** Notoriété minimale d'une série proposée au deck. */
+const SWIPE_TV_VOTE_COUNT_FLOOR = 1500;
+
+/**
+ * Les cartes de série d'un lot.
+ *
+ * Même logique que les piliers des films : les séries les plus vues, parce
+ * qu'on ne peut demander « tu la connais ? » que sur ce que tout le monde a
+ * vu. Le nombre de saisons sorties voyage avec la carte : c'est lui que l'app
+ * propose de ranger d'un tap.
+ * @param {Set<number>} blocked Séries rangées, écartées ou déjà servies.
+ * @param {DeclaredProfile} declared Genres bannis.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Record<string, unknown>[]>} Cartes prêtes à envoyer.
+ */
+async function fetchTvCards(
+    blocked: Set<number>, declared: DeclaredProfile, ctx: TMDBContext,
+): Promise<Record<string, unknown>[]> {
+  const data = await tmdbGET('/discover/tv', {
+    'include_adult': 'false',
+    'vote_count.gte': String(SWIPE_TV_VOTE_COUNT_FLOOR),
+    'sort_by': 'vote_count.desc',
+    'page': String(1 + Math.floor(Math.random() * 5)),
+  }, ctx).catch(() => null);
+  const rows = data && Array.isArray(data.results) ?
+    data.results as Record<string, unknown>[] : [];
+
+  const picked = shuffled(rows.filter((row) =>
+    typeof row.id === 'number' && !blocked.has(row.id) &&
+    typeof row.poster_path === 'string' &&
+    !series.normalizeTvGenres(row.genre_ids)
+        .some((id) => declared.bannedGenreIDs.has(id)),
+  )).slice(0, SWIPE_TV_CARDS);
+
+  const today = todayISO();
+  const details = await Promise.allSettled(picked.map((row) =>
+    tmdbGET(`/tv/${row.id}`, {append_to_response: TV_DETAIL_APPEND}, ctx)));
+  return picked.flatMap((row, index) => {
+    const detail = details[index];
+    if (detail.status !== 'fulfilled') return [];
+    const seasonCount = series.airedSeasonCount(
+        series.listSeasons(detail.value.seasons), today,
+    );
+    if (seasonCount === 0) return [];
+    return [{
+      id: row.id,
+      title: typeof row.name === 'string' ? row.name : null,
+      overview: typeof row.overview === 'string' ? row.overview : null,
+      poster_path: row.poster_path,
+      vote_average: typeof row.vote_average === 'number' ?
+        row.vote_average : null,
+      vote_count: typeof row.vote_count === 'number' ? row.vote_count : null,
+      popularity: typeof row.popularity === 'number' ? row.popularity : null,
+      genre_ids: series.normalizeTvGenres(row.genre_ids),
+      release_date: typeof row.first_air_date === 'string' &&
+        row.first_air_date ? row.first_air_date : null,
+      origin_country: Array.isArray(row.origin_country) ?
+        row.origin_country : [],
+      media_type: 'tv',
+      season_count: seasonCount,
+      source: 'series',
+      collection_id: null,
+      collection_total: null,
+    }];
+  });
 }
 
 /**
@@ -7080,9 +7176,11 @@ export const getSwipeFeed = onRequest(
 
         const a = getAdmin();
         const db = a.firestore();
-        const sessionExcluded = parseExcludeIds(
-            (req.body as Record<string, unknown> | undefined)?.excludeIds,
-        );
+        const body = req.body as Record<string, unknown> | undefined;
+        const sessionExcluded = parseExcludeIds(body?.excludeIds);
+        // Les séries déjà servies dans la session, à part : leurs
+        // identifiants recoupent ceux des films.
+        const sessionTvExcluded = parseExcludeIds(body?.excludeTvIds);
 
         const [exclusions, countersSnap, declared] = await Promise.all([
           fetchSwipeExclusions(db, uid),
@@ -7114,7 +7212,33 @@ export const getSwipeFeed = onRequest(
             db, selectSwipeDeck(scored, profile), blocked, tmdb(req, res),
         );
 
-        if (deck.length === 0) {
+        const cards: Record<string, unknown>[] = deck.map((candidate) => ({
+          ...discoverRowToJSON(candidate),
+          media_type: 'movie',
+          source: candidate.source,
+          collection_id: candidate.collectionId ?? null,
+          collection_total: candidate.collectionTotal ?? null,
+        }));
+
+        // `gallerySize` ne compte que les films (`filmsIn`) : c'est bien la
+        // Mémoire de la Porte qui ouvre le deck aux séries.
+        // Une version de l'app antérieure aux séries lirait une carte de série
+        // comme un film : elle ne reçoit que des films.
+        const seriesAware = body?.series === true;
+        if (seriesAware && profile.gallerySize >= DOOR_MEMOIRE_TARGET) {
+          const tvBlocked = new Set<number>(exclusions.tvExcluded);
+          for (const id of sessionTvExcluded) tvBlocked.add(id);
+          const tvCards = await fetchTvCards(
+              tvBlocked, declared, tmdb(req, res),
+          );
+          // Espacées dans le lot, jamais groupées : trois séries d'affilée
+          // changeraient la nature de l'écran pendant quinze secondes.
+          tvCards.forEach((card, index) => {
+            cards.splice(Math.min(cards.length, 4 + index * 8), 0, card);
+          });
+        }
+
+        if (cards.length === 0) {
           logger.info('getSwipeFeed: empty deck', {
             uid,
             poolSize: pool.size,
@@ -7124,14 +7248,9 @@ export const getSwipeFeed = onRequest(
         }
 
         res.status(200).json({
-          cards: deck.map((candidate) => ({
-            ...discoverRowToJSON(candidate),
-            source: candidate.source,
-            collection_id: candidate.collectionId ?? null,
-            collection_total: candidate.collectionTotal ?? null,
-          })),
+          cards,
           gallery_size: profile.gallerySize,
-          exhausted: deck.length === 0,
+          exhausted: cards.length === 0,
         });
       } catch (error) {
         if (sendTMDBError(error, res)) return;
@@ -7166,9 +7285,22 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
     const decision = entry.decision;
     if (decision !== 'seen' && decision !== 'skipped' &&
       decision !== 'watchlist') continue;
-    const item =
+    let item =
       entry.item as SwipeDecisionPayload['item'] | undefined;
     if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
+      continue;
+    }
+    if (item.mediaType === 'tv') {
+      if (decision === 'skipped') {
+        // « Pas vue » vaut pour la série entière : le deck ne demande jamais
+        // une saison, il demande si on connaît la série.
+        item = {...item, id: `tv-${item.tmdbId}`};
+      } else {
+        // « Vue » et « à voir » rangent une saison, jamais la série entière.
+        const parsed = series.parseSeasonEntryId(item.id);
+        if (!parsed || parsed.tvId !== item.tmdbId) continue;
+      }
+    } else if (item.mediaType !== 'movie') {
       continue;
     }
     decisions.push({
@@ -7284,6 +7416,24 @@ export const recordSwipes = onRequest(
                 .map((d) => ({id: d.item.id, tmdbId: d.item.tmdbId})),
         );
 
+        // Les saisons rangées depuis le deck reçoivent leurs épisodes et leurs
+        // plateformes ici : le deck ne les connaît pas, et « J'ai vu les 8 »
+        // en envoie huit d'un coup.
+        const seasonExtras = new Map<string, Record<string, unknown>>();
+        await Promise.all(decisions
+            .filter((d) =>
+              d.item.mediaType === 'tv' && d.decision !== 'skipped')
+            .map(async (d) => {
+              const parsed = series.parseSeasonEntryId(d.item.id);
+              if (!parsed) return;
+              const fields = await seasonFields(
+                  parsed.tvId, parsed.season, tmdb(req, res),
+              ).catch(() => null);
+              seasonExtras.set(
+                  d.item.id, seasonDocFields(parsed.season, fields, d.item),
+              );
+            }));
+
         const counters = {
           genreSeen: {} as Record<string, admin.firestore.FieldValue>,
           genreWanted: {} as Record<string, admin.firestore.FieldValue>,
@@ -7306,21 +7456,30 @@ export const recordSwipes = onRequest(
           const skipRef = userRef.collection('swipeSkips').doc(item.id);
           const decade = decadeOf(item.releaseDate);
           const genreIds = item.genreIds ?? [];
+          // Les compteurs nourrissent le profil du deck, qui est un profil de
+          // films : une série n'y entre pas, comme elle n'entre pas dans
+          // CinéMatch.
+          const isFilm = item.mediaType === 'movie';
 
           if (decision === 'skipped') {
             const skipCount = (previousSkipCounts.get(item.id) ?? 0) + 1;
             batch.set(skipRef, {
               tmdbId: item.tmdbId,
+              // Sans lui, un « pas vue » sur la série 1399 écarterait le film
+              // 1399 : les deux espaces d'identifiants se recoupent.
+              mediaType: item.mediaType,
               skipCount,
               lastSkippedAt: now,
               resurfaceAt: a.firestore.Timestamp.fromMillis(
                   now.toMillis() + skipCooldownMillis(skipCount),
               ),
             }, {merge: true});
-            for (const genreId of genreIds) {
-              bump('genreSkipped', String(genreId));
+            if (isFilm) {
+              for (const genreId of genreIds) {
+                bump('genreSkipped', String(genreId));
+              }
+              if (decade !== null) bump('decadeSkipped', String(decade));
             }
-            if (decade !== null) bump('decadeSkipped', String(decade));
             continue;
           }
 
@@ -7339,6 +7498,7 @@ export const recordSwipes = onRequest(
             genreIds,
             releaseDate: item.releaseDate ?? null,
             addedAt: now,
+            ...(seasonExtras.get(item.id) ?? {}),
           };
 
           // Un film ne peut pas être à la fois vu et à voir : le classement
@@ -7354,8 +7514,12 @@ export const recordSwipes = onRequest(
               ...(previous?.originCountry ?
                 {originCountry: previous.originCountry} : {}),
             });
-            for (const genreId of genreIds) bump('genreSeen', String(genreId));
-            if (decade !== null) bump('decadeSeen', String(decade));
+            if (isFilm) {
+              for (const genreId of genreIds) {
+                bump('genreSeen', String(genreId));
+              }
+              if (decade !== null) bump('decadeSeen', String(decade));
+            }
           } else {
             // Reclasser un film vu en « à voir » emporte son coup de cœur, et
             // c'est voulu : le cœur ne vit que sur un film de la Galerie, et
@@ -7363,8 +7527,10 @@ export const recordSwipes = onRequest(
             // d'origine repart aussi ; l'enrichissement le rapprendra.
             batch.delete(galleryRef);
             batch.set(watchlistRef, data);
-            for (const genreId of genreIds) {
-              bump('genreWanted', String(genreId));
+            if (isFilm) {
+              for (const genreId of genreIds) {
+                bump('genreWanted', String(genreId));
+              }
             }
           }
         }
@@ -7700,12 +7866,72 @@ const TRENDING_MAX_PAGES = 6;
 async function fetchTrendingPages(
     pages: number[], ctx: TMDBContext,
 ): Promise<DiscoverRow[]> {
+  // Films et séries ensemble, dans le classement que TMDB établit pour les
+  // deux : « ce qui se regarde cette semaine » ne se demande pas de quel
+  // format il s'agit. Les personnes, que la même liste renvoie, sont écartées.
   const settled = await Promise.allSettled(pages.map((page) => tmdbGET(
-      '/trending/movie/week',
+      '/trending/all/week',
       {page: String(page)},
       ctx,
   )));
-  return settled.flatMap((result) => rowsFrom(result, 'results'));
+  return settled.flatMap((result) => rowsFrom(result, 'results'))
+      .flatMap((row): DiscoverRow[] => {
+        const raw = row as DiscoverRow & {
+          name?: string; first_air_date?: string; media_type?: string;
+        };
+        if (raw.media_type === 'movie') return [{...raw, media_type: 'movie'}];
+        if (raw.media_type !== 'tv') return [];
+        return [{
+          ...raw,
+          media_type: 'tv',
+          title: raw.name,
+          release_date: raw.first_air_date ?? null,
+          genre_ids: series.normalizeTvGenres(raw.genre_ids),
+        }];
+      });
+}
+
+/**
+ * Ajoute à chaque série d'une rangée son nombre de saisons sorties : c'est
+ * ce que la plaque de l'affiche écrit à la place du mot « série ».
+ * @param {DiscoverRow[]} rows Rangée déjà nettoyée.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<DiscoverRow[]>} La même rangée, séries complétées.
+ */
+async function withSeasonCounts(
+    rows: DiscoverRow[], ctx: TMDBContext,
+): Promise<DiscoverRow[]> {
+  const today = todayISO();
+  return Promise.all(rows.map(async (row) => {
+    if (row.media_type !== 'tv') return row;
+    try {
+      const detail = await tmdbGET(
+          `/tv/${row.id}`, {append_to_response: TV_DETAIL_APPEND}, ctx,
+      );
+      return {
+        ...row,
+        season_count: series.airedSeasonCount(
+            series.listSeasons(detail.seasons), today,
+        ),
+      };
+    } catch {
+      return row;
+    }
+  }));
+}
+
+/**
+ * Une ligne d'accueil, avec son format : l'app ouvre une fiche de film ou un
+ * dossier de série selon lui.
+ * @param {DiscoverRow} row Ligne nettoyée.
+ * @return {Record<string, unknown>} La ligne, prête à envoyer.
+ */
+function homeRowToJSON(row: DiscoverRow): Record<string, unknown> {
+  return {
+    ...discoverRowToJSON(row),
+    media_type: row.media_type ?? 'movie',
+    season_count: row.season_count ?? null,
+  };
 }
 
 /**
@@ -7756,16 +7982,22 @@ function cleanHomeRow(
     declared: DeclaredProfile,
     excluded: Set<number>,
 ): DiscoverRow[] {
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   const out: DiscoverRow[] = [];
   for (const row of rows) {
-    if (typeof row.id !== 'number' || seen.has(row.id)) continue;
+    if (typeof row.id !== 'number') continue;
+    // La clé porte le format : la série 1399 et le film 1399 sont deux
+    // lignes, et les exclusions — des films à l'affiche, la graine — ne
+    // concernent que les films.
+    const isFilm = (row.media_type ?? 'movie') === 'movie';
+    const key = `${isFilm ? 'movie' : 'tv'}-${row.id}`;
+    if (seen.has(key)) continue;
     if (!row.poster_path) continue;
-    if (excluded.has(row.id)) continue;
+    if (isFilm && excluded.has(row.id)) continue;
     const isBanned =
       (row.genre_ids ?? []).some((id) => declared.bannedGenreIDs.has(id));
     if (isBanned) continue;
-    seen.add(row.id);
+    seen.add(key);
     out.push(row);
     if (out.length >= HOME_ROW_SIZE) break;
   }
@@ -7795,6 +8027,10 @@ export const getHomeRows = onRequest(
         // s'en servaient rangent désormais par popularité et par date d'ajout.
         // Il coûtait une lecture de `preferences/swipeProfile` à chaque
         // ouverture de l'accueil, pour un score que plus personne ne lit.
+        // Une version de l'app antérieure aux séries ouvrirait la série 1399
+        // comme le film 1399 : sans la marque, les tendances restent des films.
+        const seriesAware =
+          (req.body as Record<string, unknown> | undefined)?.series === true;
         const [gallerySnap, declared] = await Promise.all([
           filmsIn(userRef.collection('gallery')).get(),
           fetchDeclaredProfile(db, uid),
@@ -7874,16 +8110,24 @@ export const getHomeRows = onRequest(
             trendingInitial, declared, theatricalExclusion, tmdb(req, res),
         );
 
+        const trendingRow = await withSeasonCounts(
+            cleanHomeRow(
+                seriesAware ? trending :
+                  trending.filter((row) => row.media_type !== 'tv'),
+                declared, theatricalExclusion,
+            ),
+            tmdb(req, res),
+        );
+
         res.status(200).json({
           in_theaters: cleanHomeRow(rankedTheaters, declared, noExclusion)
-              .map(discoverRowToJSON),
-          trending: cleanHomeRow(trending, declared, theatricalExclusion)
-              .map(discoverRowToJSON),
+              .map(homeRowToJSON),
+          trending: trendingRow.map(homeRowToJSON),
           because_you_watched: seedId === null ? null : {
             seed_id: seedId,
             seed_title: titleById.get(seedId) ?? null,
             items: cleanHomeRow(seededRaw, declared, seededExclusion)
-                .map(discoverRowToJSON),
+                .map(homeRowToJSON),
           },
         });
       } catch (error) {
