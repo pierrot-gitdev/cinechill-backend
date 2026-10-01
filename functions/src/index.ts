@@ -1161,7 +1161,28 @@ export const setMediaStatus = onRequest(
         const previousLovedAt = previousSnap?.get('lovedAt');
         const previousOrigin = previousSnap?.get('originCountry');
 
+        // L'abandon : retirer de la file une saison commencée. Rien n'en
+        // reste dans la bibliothèque — on l'a décidé, un abandon n'est pas un
+        // souvenir — mais le moteur des séries s'en souvient comme d'un « pas
+        // pour moi ». Reprendre la série plus tard efface le signal.
+        const abandonsRef = userRef.collection('taste').doc('seriesAbandons');
+        let abandoned = false;
+        if (item.mediaType === 'tv' && status === 'none') {
+          const queued = await watchlistRef.get();
+          const next = queued.exists ? queued.get('nextEpisode') : null;
+          abandoned = typeof next === 'number' && next >= 2;
+        }
+
         const batch = db.batch();
+        if (abandoned) {
+          batch.set(abandonsRef, {
+            [String(item.tmdbId)]: a.firestore.Timestamp.now(),
+          }, {merge: true});
+        } else if (item.mediaType === 'tv' && status !== 'none') {
+          batch.set(abandonsRef, {
+            [String(item.tmdbId)]: a.firestore.FieldValue.delete(),
+          }, {merge: true});
+        }
         batch.delete(watchlistRef);
         batch.delete(galleryRef);
 
