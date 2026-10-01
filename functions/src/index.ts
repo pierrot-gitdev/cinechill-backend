@@ -10827,11 +10827,12 @@ const SERIES_CINEMATCH_SEEDS = 5;
 /** Séries de la watchlist entrées dans le vivier, au plus. */
 const SERIES_WATCHLIST_MAX = 8;
 /**
- * Tant qu'on aime moins de séries que cela, les films aimés servent d'ancres
- * au goût. Au-delà, le profil de séries parle seul.
+ * Les films aimés servent d'ancres au goût des séries, de moins en moins à
+ * mesure qu'on aime des séries : leur part s'éteint à quinze séries aimées,
+ * où le profil de séries parle seul.
  */
 const SERIES_PRIOR_UNTIL = 15;
-/** Films aimés prêtés au profil de séries, les plus récents d'abord. */
+/** Films aimés prêtés à un profil de séries vide, les plus récents d'abord. */
 const SERIES_PRIOR_MAX = 30;
 
 /**
@@ -10887,12 +10888,14 @@ async function loadSeriesSetup(
   // séries sans en aimer aucune n'aurait pas de goût du tout.
   let priorAnchors: {axes: engine.EngineAxes; genreIds: number[]}[] = [];
   const lovedSeries = gallery.positioned.filter((e) => e.film.loved).length;
-  if (lovedSeries < SERIES_PRIOR_UNTIL) {
+  const priorCount = Math.round(SERIES_PRIOR_MAX *
+    Math.max(0, 1 - lovedSeries / SERIES_PRIOR_UNTIL));
+  if (priorCount > 0) {
     const films = await loadCineMatchGallery(db, userRef, ctx);
     priorAnchors = films.positioned
         .filter((entry) => entry.lovedAtMillis !== null)
         .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0))
-        .slice(0, SERIES_PRIOR_MAX)
+        .slice(0, priorCount)
         .map((entry) => ({
           axes: entry.film.axes, genreIds: entry.film.genreIds,
         }));
