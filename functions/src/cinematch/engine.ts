@@ -34,12 +34,33 @@ export interface EngineFilm {
   genreIds: number[];
   year: number | null;
   voteCount: number | null;
+  /** La durée du film, ou celle d'un épisode pour une série. */
   runtime: number | null;
   providerIds: number[];
   keywordNames: string[];
   listed: boolean;
   certification: string | null;
+  /** Séries seulement : saisons sorties. */
+  seasonCount?: number | null;
+  /** Séries seulement : épisodes de ces saisons. */
+  episodeCount?: number | null;
+  /** Séries seulement : terminée, en cours, annulée. */
+  status?: SeriesStatus | null;
 }
+
+/**
+ * Le moteur des séries est le moteur des films, avec trois différences : on
+ * choisit dans quoi s'engager et non une soirée, une série peut ne pas avoir
+ * de fin, et essayer ne coûte qu'un épisode. Tout ce qui suit est optionnel :
+ * absent, le moteur rend exactement ce qu'il rendait pour un film.
+ */
+export type SeriesStatus = 'ended' | 'returning' | 'canceled';
+
+/**
+ * Le temps total qu'on accepte de donner à une série. Il remplace l'énergie,
+ * qui règle une soirée : une série ne se choisit pas pour une soirée.
+ */
+export type Engagement = 'mini' | 'season' | 'long' | 'any';
 
 /** Un film de la galerie, vu, positionné. */
 export interface EngineGalleryFilm {
@@ -59,9 +80,12 @@ export type Energy = 'low' | 'high';
 
 export interface Situation {
   company: Company;
+  /** La durée du film, ou celle d'un épisode quand `kind` vaut `series`. */
   duration: Duration;
   /** Identifiants de plateformes TMDB, en chaîne. Vide = pas de filtre. */
   platformIds: string[];
+  /** Absent : un film. */
+  kind?: 'film' | 'series';
 }
 
 export type Comparison =
@@ -247,6 +271,33 @@ const PRIOR_SCALE = 0.9;
 const LEARNING_RATE = 0.8;
 
 const DAY_MS = 24 * 3600 * 1000;
+
+/** Ce que pèse l'accord avec l'engagement demandé, en unités brutes. */
+const ENGAGEMENT_WEIGHT = 1.0;
+/**
+ * Une histoire qui s'arrête sans fin. On la pénalise franchement quand on
+ * cherche à s'engager ; à peine quand on veut « une saison pour voir ».
+ */
+const CANCELED_PENALTY = 0.8;
+const CANCELED_PENALTY_TRIAL = 0.3;
+/** Une histoire qui a sa fin, un peu plus quand on cherche à durer. */
+const ENDED_BONUS = 0.2;
+const ENDED_BONUS_LONG = 0.4;
+/**
+ * La part de découverte des séries : essayer coûte un épisode et non deux
+ * heures, le moteur peut donc proposer moins connu que pour un film.
+ */
+const SERIES_BET_BONUS = 0.3;
+/** Ce que coûte une ressemblance à une série abandonnée, au plus. */
+const AVOID_WEIGHT = 0.8;
+/** En deçà, une ressemblance à un abandon ne dit rien. */
+const AVOID_FROM = 0.6;
+/** Au-delà, une mini-série n'en est plus une. */
+const MINI_MAX_HOURS = 8;
+/** Une longue histoire, en saisons sorties. */
+const LONG_MIN_SEASONS = 3;
+/** Le pas d'élargissement de la durée d'un épisode, en minutes. */
+const SERIES_WIDEN_STEP = 10;
 const GENRE_HORROR = 27;
 /** Les classifications écartées quand on regarde en famille. */
 const FAMILY_BLOCKED_CERTIFICATIONS = new Set(['16', '18']);
@@ -383,6 +434,9 @@ const WIDEN_DURATION_STEPS = 4;
  */
 export const DURATION_WIDEN_MAX_MINUTES =
   WIDEN_DURATION_STEP * WIDEN_DURATION_STEPS;
+/** La même chose pour la durée d'un épisode. */
+export const SERIES_DURATION_WIDEN_MAX_MINUTES =
+  SERIES_WIDEN_STEP * WIDEN_DURATION_STEPS;
 
 /**
  * Vrai si un film montré trop souvent doit se reposer : deux apparitions,
@@ -409,13 +463,24 @@ export function isResting(
  * @param {number | null} runtime Durée du film, en minutes.
  * @param {Duration} duration Durée demandée.
  * @param {number} steps Pas d'élargissement.
+ * @param {string} kind `series` pour la durée d'un épisode.
  * @return {boolean} Vrai si le film convient.
  */
 function fitsDuration(
     runtime: number | null, duration: Duration, steps: number,
+    kind?: 'film' | 'series',
 ): boolean {
   if (duration === 'any') return true;
   if (runtime === null || !(runtime > 0)) return false;
+  if (kind === 'series') {
+    // La durée d'un épisode : moins d'une demi-heure, autour de trois quarts
+    // d'heure, une heure et plus. Le pas d'élargissement est de dix minutes :
+    // un épisode de 40 minutes un soir « court » déborde déjà.
+    const seriesSlack = steps * SERIES_WIDEN_STEP;
+    if (duration === 'short') return runtime <= 35 + seriesSlack;
+    if (duration === 'long') return runtime >= 55 - seriesSlack;
+    return runtime >= 30 - seriesSlack && runtime <= 60 + seriesSlack;
+  }
   const slack = steps * WIDEN_DURATION_STEP;
   if (duration === 'short') return runtime < 90 + slack;
   if (duration === 'long') return runtime > 120 - slack;
@@ -454,9 +519,11 @@ export function applyFilters(
     if (isResting(ctx.exposure.get(film.id), ctx.now)) return false;
     if (situation.company === 'family') {
       if (film.genreIds.includes(GENRE_HORROR)) return false;
-      if (FAMILY_BLOCKED_CERTIFICATIONS.has(film.certification ?? '')) {
-        return false;
-      }
+      // Les classifications TV françaises s'écrivent parfois « -16 » : seuls
+      // les chiffres comptent. Pour un film (« U », « 12 », « 16 »), rien
+      // ne change.
+      const certification = (film.certification ?? '').replace(/[^0-9]/g, '');
+      if (FAMILY_BLOCKED_CERTIFICATIONS.has(certification)) return false;
     }
     return true;
   });
@@ -466,7 +533,7 @@ export function applyFilters(
     film.providerIds.some((id) => platforms.has(id));
   const pass = (steps: number, anyPlatform: boolean): EngineFilm[] =>
     base.filter((film) =>
-      fitsDuration(film.runtime, situation.duration, steps) &&
+      fitsDuration(film.runtime, situation.duration, steps, situation.kind) &&
       (anyPlatform || onPlatform(film)));
 
   const strict = pass(0, false);
@@ -523,6 +590,10 @@ export interface ScoreContext {
   now: number;
   /** Les films qui passaient le filtre d'origine, quand on a élargi. */
   conforming?: Set<number> | null;
+  /** Séries seulement : le temps total accepté. */
+  engagement?: Engagement | null;
+  /** Séries seulement : les positions des séries abandonnées. */
+  avoided?: EngineAxes[];
 }
 
 /** Le détail d'un score, pour le journal et les vérifications. */
@@ -537,6 +608,12 @@ export interface ScoreTerms {
   novelty: number;
   conservatism: number;
   conforming: number;
+  /** Séries : l'accord avec l'engagement demandé. Zéro pour un film. */
+  engagement: number;
+  /** Séries : une histoire qui a sa fin, ou qui n'en aura pas. */
+  status: number;
+  /** Séries : la ressemblance à une série abandonnée. */
+  avoid: number;
 }
 
 export interface ScoredFilm {
@@ -643,6 +720,73 @@ function exposurePenalty(
 }
 
 /**
+ * Le temps total d'une série, en heures. Sans durée d'épisode, trois quarts
+ * d'heure : c'est la durée la plus courante d'une fiction.
+ * @param {EngineFilm} film La série.
+ * @return {number} Heures.
+ */
+function seriesHours(film: EngineFilm): number {
+  return ((film.episodeCount ?? 0) * (film.runtime ?? 45)) / 60;
+}
+
+/**
+ * L'accord d'une série avec l'engagement demandé.
+ * @param {EngineFilm} film La série.
+ * @param {?Engagement} engagement Le temps total accepté.
+ * @return {number} Positif si elle tient, négatif sinon.
+ */
+function engagementFit(
+    film: EngineFilm, engagement: Engagement | null | undefined,
+): number {
+  if (!engagement || engagement === 'any' || engagement === 'season') return 0;
+  const seasons = film.seasonCount ?? 0;
+  if (engagement === 'mini') {
+    const oneShot = seasons === 1 && film.status !== 'returning';
+    const hours = seriesHours(film);
+    if (oneShot || (hours > 0 && hours <= MINI_MAX_HOURS)) {
+      return ENGAGEMENT_WEIGHT;
+    }
+    return -ENGAGEMENT_WEIGHT * (hours > 20 ? 1 : 0.5);
+  }
+  return seasons >= LONG_MIN_SEASONS ?
+    ENGAGEMENT_WEIGHT : -0.6 * ENGAGEMENT_WEIGHT;
+}
+
+/**
+ * Ce que le statut d'une série change : une histoire annulée recule, une
+ * histoire terminée avance un peu.
+ * @param {EngineFilm} film La série.
+ * @param {?Engagement} engagement Le temps total accepté.
+ * @return {number} Décalage brut.
+ */
+function statusTerm(
+    film: EngineFilm, engagement: Engagement | null | undefined,
+): number {
+  if (film.status === 'canceled') {
+    return engagement === 'season' || engagement === 'mini' ?
+      -CANCELED_PENALTY_TRIAL : -CANCELED_PENALTY;
+  }
+  if (film.status === 'ended') {
+    return engagement === 'long' ? ENDED_BONUS_LONG : ENDED_BONUS;
+  }
+  return 0;
+}
+
+/**
+ * Ce que coûte la ressemblance à une série qu'on a lâchée en route.
+ * @param {EngineFilm} film La série.
+ * @param {EngineAxes[]} avoided Positions des séries abandonnées.
+ * @return {number} Pénalité, positive.
+ */
+function avoidPenalty(film: EngineFilm, avoided: EngineAxes[]): number {
+  let closest = 0;
+  for (const axes of avoided) {
+    closest = Math.max(closest, filmSimilarity(film.axes, axes));
+  }
+  return AVOID_WEIGHT * clamp01((closest - AVOID_FROM) / (1 - AVOID_FROM));
+}
+
+/**
  * Classe les films éligibles.
  *
  * Les termes de goût et de soirée sont standardisés sur les éligibles
@@ -666,6 +810,7 @@ export function scoreFilms(
   const energy = ctx.energy ? ENERGY_WEIGHTS[ctx.energy] : null;
   const hesitation = Math.min(1, Math.max(0, ctx.hesitations) / 4);
   const tasteBound = 1 + TASTE_GENRE_BONUS;
+  const isSeries = ctx.situation.kind === 'series';
 
   const rawTaste = eligible.map((film) => tasteOf(film, ctx.loved));
   const rawLearned = eligible.map((film) => {
@@ -705,7 +850,13 @@ export function scoreFilms(
       conservatism: CONSERVATISM_WEIGHT * hesitation * (bet ? -1 : 1),
       conforming: ctx.conforming && ctx.conforming.has(film.id) ?
         CONFORMING_BONUS : 0,
+      engagement: isSeries ? engagementFit(film, ctx.engagement) : 0,
+      status: isSeries ? statusTerm(film, ctx.engagement) : 0,
+      avoid: isSeries && ctx.avoided && ctx.avoided.length > 0 ?
+        -avoidPenalty(film, ctx.avoided) : 0,
     };
+    // Une série peu connue est une découverte qu'on paie d'un seul épisode.
+    if (isSeries && !energy && bet) terms.novelty = SERIES_BET_BONUS;
     const score = Object.values(terms).reduce((sum, v) => sum + v, 0);
     return {film, score, terms};
   });
@@ -783,6 +934,18 @@ export interface RecommendInput {
   hesitations: number;
   exposure: Map<number, ExposureRecord>;
   now: number;
+  /** Séries seulement : le temps total accepté. */
+  engagement?: Engagement | null;
+  /** Séries seulement : les positions des séries abandonnées. */
+  avoided?: EngineAxes[];
+  /**
+   * Séries seulement : des goûts venus d'ailleurs — les films aimés — tant
+   * que le profil de séries est mince. Ils servent d'ancres au goût, jamais
+   * de candidats.
+   */
+  priorAnchors?: {axes: EngineAxes; genreIds: number[]}[];
+  /** Ce qu'on écarte en plus de la galerie : les séries abandonnées. */
+  extraExcludedIds?: number[];
 }
 
 export interface Recommendation {
@@ -799,13 +962,17 @@ export interface Recommendation {
  */
 export function recommendFive(input: RecommendInput): Recommendation {
   const excludedIds = new Set(input.gallery.map((film) => film.id));
+  for (const id of input.extraExcludedIds ?? []) excludedIds.add(id);
   const filtered = applyFilters(input.films, {
     situation: input.situation,
     excludedIds,
     exposure: input.exposure,
     now: input.now,
   });
-  const loved = input.gallery.filter((film) => film.loved);
+  const loved: {axes: EngineAxes; genreIds: number[]}[] = [
+    ...input.gallery.filter((film) => film.loved),
+    ...(input.priorAnchors ?? []),
+  ];
   const axesById = new Map(input.gallery.map((film) => [film.id, film.axes]));
   const weights = buildWeights(
       loved.map((film) => film.axes),
@@ -823,6 +990,8 @@ export function recommendFive(input: RecommendInput): Recommendation {
     exposure: input.exposure,
     now: input.now,
     conforming: filtered.widened ? filtered.conforming : null,
+    engagement: input.engagement ?? null,
+    avoided: input.avoided ?? [],
   });
   return {
     films: composeFive(ranked),
