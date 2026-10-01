@@ -953,6 +953,13 @@ export interface ComparisonPlan {
   films: EngineGalleryFilm[];
   /** Pour chacun des quatre, le film qui prend sa place s'il est gardé. */
   replacements: Map<number, EngineGalleryFilm>;
+  /**
+   * Les films de la seconde question (« lequel tu n'as pas envie de
+   * revoir ? »), tous différents des quatre de la première. Vide quand la
+   * galerie n'en a pas trois de plus : l'app retombe alors sur les
+   * remplaçants.
+   */
+  excludeFilms: EngineGalleryFilm[];
 }
 
 /** La part des films les moins récemment montrés qu'on garde, au moins 8. */
@@ -960,6 +967,8 @@ const PLAN_FRESH_SHARE = 0.6;
 const PLAN_FRESH_MIN = 8;
 /** La tranche de chaque extrémité de l'axe, au moins deux films. */
 const PLAN_TAIL_SHARE = 0.2;
+/** En dessous, la seconde question reprendrait les films de la première. */
+const PLAN_EXCLUDE_MIN = 3;
 
 /**
  * Prépare une comparaison : quatre films vus, deux à chaque extrémité de
@@ -974,7 +983,7 @@ const PLAN_TAIL_SHARE = 0.2;
  */
 export function planComparison(input: PlanInput): ComparisonPlan {
   const empty: ComparisonPlan = {
-    axis: null, films: [], replacements: new Map(),
+    axis: null, films: [], replacements: new Map(), excludeFilms: [],
   };
   const shown = new Set(input.shownIds);
   const byRecency = (a: EngineGalleryFilm, b: EngineGalleryFilm): number => {
@@ -1070,5 +1079,26 @@ export function planComparison(input: PlanInput): ComparisonPlan {
     replacements.set(film.id, best);
   }
 
-  return {axis, films, replacements};
+  // La seconde question porte sur quatre autres films. Reprendre trois des
+  // quatre de la première faisait passer le changement de question
+  // inaperçu : la grille restait presque la même, seul le titre changeait.
+  // Ils sont tirés comme les premiers, deux à chaque bout de l'axe, pour que
+  // le film écarté reste lisible sur ce qu'on cherche à trancher.
+  const restFresh = fresh.filter((film) => !chosenIds.has(film.id));
+  const rest = (restFresh.length >= 4 ? restFresh : fallback)
+      .slice()
+      .sort((a, b) => a.axes[axis] - b.axes[axis] || a.id - b.id);
+  let excludeFilms: EngineGalleryFilm[] = [];
+  if (rest.length >= PLAN_EXCLUDE_MIN) {
+    const restTail = Math.min(
+        Math.floor(rest.length / 2),
+        Math.max(2, Math.ceil(rest.length * PLAN_TAIL_SHARE)));
+    const restPicked = rest.length <= 4 ? rest : [
+      ...drawDistinct(rest.slice(0, restTail), 2, random),
+      ...drawDistinct(rest.slice(rest.length - restTail), 2, random),
+    ];
+    excludeFilms = drawDistinct(restPicked, restPicked.length, random);
+  }
+
+  return {axis, films, replacements, excludeFilms};
 }

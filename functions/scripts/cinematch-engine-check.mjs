@@ -280,6 +280,7 @@ for (const [index, profile] of PROFILES.entries()) {
   const history = [];
   let planOk = true;
   let planDetail = '';
+  let replacementsOk = true;
   for (let round = 1; round <= 4; round++) {
     const plan = E.planComparison({
       gallery, shownIds: [...shown], history, round,
@@ -293,18 +294,44 @@ for (const [index, profile] of PROFILES.entries()) {
       [...plan.replacements].every(([id, film]) => fourSet.has(id) &&
         !fourSet.has(film.id) && !shown.includes(film.id) &&
         galleryIds.has(film.id));
-    if (!valid || !replacementsValid) {
+    const others = plan.excludeFilms.map((f) => f.id);
+    const excludeValid = others.length === 4 &&
+      new Set(others).size === 4 &&
+      others.every((id) => galleryIds.has(id) && !fourSet.has(id) &&
+        !shown.includes(id));
+    if (!replacementsValid) replacementsOk = false;
+    if (!valid || !excludeValid) {
       planOk = false;
-      planDetail = `tour ${round} : ${four.join(', ')}`;
+      planDetail = `tour ${round} : ${four.join(', ')} / ${others.join(', ')}`;
     }
     const keptFilm = plan.films[0];
-    const replacement = plan.replacements.get(keptFilm.id);
-    shown.push(...four, replacement.id);
+    shown.push(...four, ...others);
     history.push({kind: 'pick', keptId: keptFilm.id,
-      excludedId: plan.films[1].id, latencyMs: 1500});
+      excludedId: plan.excludeFilms[0].id, latencyMs: 1500});
   }
-  check('planComparison : 4 films distincts non montrés, remplaçants valides',
+  check('planComparison : 4 films distincts non montrés, puis 4 autres',
       planOk, planDetail);
+
+  // Une galerie trop courte pour huit films : la seconde question se
+  // contente des remplaçants, elle ne reprend jamais un film de la première.
+  const short = E.planComparison({
+    gallery: gallery.slice(0, 6), shownIds: [], history: [], round: 1,
+    seedKey: `uid-${index}:2026-09-15`, recycle: false,
+  });
+  const shortFour = new Set(short.films.map((f) => f.id));
+  check('planComparison : galerie de 6, pas de seconde grille',
+      short.films.length === 4 && short.excludeFilms.length === 0);
+  const seven = E.planComparison({
+    gallery: gallery.slice(0, 7), shownIds: [], history: [], round: 1,
+    seedKey: `uid-${index}:2026-09-15`, recycle: false,
+  });
+  check('planComparison : galerie de 7, seconde grille de 3 films neufs',
+      seven.excludeFilms.length === 3 &&
+      seven.excludeFilms.every((f) =>
+        !seven.films.some((g) => g.id === f.id)) &&
+      shortFour.size === 4);
+  check('planComparison : remplaçants valides (ancienne app)',
+      replacementsOk);
 
   const again = E.planComparison({
     gallery, shownIds: [], history: [], round: 1,

@@ -8344,11 +8344,15 @@ export const getCineMatchComparison = onRequest(
         // dessous, le recyclage ferait revenir les mêmes affiches d'un tour
         // à l'autre. L'app ferme l'accès, le serveur tient la même règle.
         if (forDoor && gallery.size < DOOR_MEMOIRE_TARGET) {
-          res.status(200).json({total, round, films: [], replacements: {}});
+          res.status(200).json({
+            total, round, films: [], replacements: {}, excludeFilms: [],
+          });
           return;
         }
         if (!forDoor && round > total) {
-          res.status(200).json({total, round, films: [], replacements: {}});
+          res.status(200).json({
+            total, round, films: [], replacements: {}, excludeFilms: [],
+          });
           return;
         }
 
@@ -8389,6 +8393,12 @@ export const getCineMatchComparison = onRequest(
               .filter((e): e is CineMatchGalleryEntry => e !== undefined)
               .map(cineMatchGalleryFilmJSON),
           replacements: plan.films.length > 0 ? replacements : {},
+          excludeFilms: plan.films.length > 0 ?
+            plan.excludeFilms
+                .map((film) => entries.get(film.id))
+                .filter((e): e is CineMatchGalleryEntry => e !== undefined)
+                .map(cineMatchGalleryFilmJSON) :
+            [],
         });
       } catch (error) {
         if (sendTMDBError(error, res)) return;
