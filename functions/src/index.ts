@@ -3802,12 +3802,19 @@ async function positionGalleryDocs(
             `/movie/${tmdbId}`, {append_to_response: 'keywords'}, ctx,
         );
         position = positionFilmFromDetail(detail);
+        // La saga voyage dans la même fiche : la noter ici ne coûte pas un
+        // appel, et c'est autant que le deck n'aura pas à résoudre.
+        const collection = detail.belongs_to_collection as
+          {id?: number} | null | undefined;
         await cacheRef.set({
           v: AXES_VERSION,
           axes: position.axes,
           sigma: position.sigma,
           runtimeMinutes: position.runtimeMinutes,
           originCountry: position.originCountry,
+          collectionId: collection && typeof collection.id === 'number' ?
+            collection.id : null,
+          sagaAt: admin.firestore.Timestamp.now(),
           updatedAt: admin.firestore.Timestamp.now(),
         });
       }
@@ -5202,6 +5209,16 @@ const SWIPE_COVERAGE_PROBES = 3;
  * respirer un goût marqué et coupe net la série de huit thrillers d'affilée.
  */
 const SWIPE_GENRE_CAP = 8;
+/**
+ * Sagas résolues par lot quand le cache global ne les connaît pas encore.
+ *
+ * `/discover` et `/recommendations` ne disent pas à quelle saga appartient un
+ * film : seule la fiche le dit. On n'en paie que les manques, une fois par
+ * film et pour tous les comptes, et le cache se remplit de lui-même.
+ */
+const SWIPE_SAGA_RESOLVE_PER_BATCH = 12;
+/** Sagas dont on propage un « pas vu » dans un même appel, au plus. */
+const SWIPE_SAGA_SKIP_PROPAGATION = 3;
 
 /** D'où vient un candidat — sert aux quotas de mix et au debug. */
 type SwipeSource =
@@ -5216,6 +5233,10 @@ type SwipeSource =
 interface SwipeCandidate extends DiscoverRow {
   source: SwipeSource;
   score: number;
+  /** Saga du film, quand elle est connue. `null` = film isolé, confirmé. */
+  collectionId?: number | null;
+  /** Nombre d'opus de cette saga, pour que le client sache quoi proposer. */
+  collectionTotal?: number | null;
 }
 
 /**
@@ -6154,6 +6175,363 @@ function orderForDeck(cards: SwipeCandidate[]): SwipeCandidate[] {
   return ordered;
 }
 
+/* ===================================================================== *
+ *  Les sagas — le premier opus d'abord
+ *
+ *  Deux règles, et elles font gagner plus de temps que tout le reste du
+ *  moteur réuni.
+ *
+ *  1. Un opus de milieu de saga ne se demande pas. « Tu as vu le
+ *     Prisonnier d'Azkaban ? » est une mauvaise question : si la réponse est
+ *     oui, les sept autres restent à demander un par un ; si c'est non, on
+ *     ne sait pas si la personne connaît la saga. Le premier opus, lui,
+ *     tranche les deux d'un coup — c'est le plus vu de sa saga, et sa
+ *     réponse vaut pour la suite.
+ *  2. Une saga ne paraît qu'une fois par lot. Trois Harry Potter dans
+ *     vingt-cinq cartes, c'est trois cartes pour une information.
+ *
+ *  Le coût : `/discover` et `/recommendations` ne disent pas à quelle saga
+ *  appartient un film, seule la fiche le dit. On le résout donc une fois par
+ *  film, dans un cache global partagé par tous les comptes — le même
+ *  `filmAxes` qui porte déjà les axes.
+ * ===================================================================== */
+
+/** Une saga et ses opus, triés par date de sortie. */
+interface SagaCache {
+  id: number;
+  name: string;
+  parts: DiscoverRow[];
+}
+
+/**
+ * Normalise une partie de saga pour Firestore : pas d'`undefined`, et rien
+ * de plus que ce dont une carte a besoin.
+ * @param {Record<string, unknown>} raw Partie brute de `/collection/{id}`.
+ * @return {?DiscoverRow} Ligne exploitable, ou null si l'id manque.
+ */
+function sagaPartFrom(raw: Record<string, unknown>): DiscoverRow | null {
+  const id = Number(raw.id);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return {
+    id,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    overview: typeof raw.overview === 'string' ? raw.overview : null,
+    poster_path: typeof raw.poster_path === 'string' ? raw.poster_path : null,
+    vote_average: typeof raw.vote_average === 'number' ?
+      raw.vote_average : null,
+    vote_count: typeof raw.vote_count === 'number' ? raw.vote_count : null,
+    popularity: typeof raw.popularity === 'number' ? raw.popularity : null,
+    genre_ids: Array.isArray(raw.genre_ids) ?
+      (raw.genre_ids as unknown[])
+          .filter((g): g is number => typeof g === 'number') : [],
+    release_date: typeof raw.release_date === 'string' && raw.release_date ?
+      raw.release_date : null,
+    origin_country: [],
+  };
+}
+
+/**
+ * Charge une saga, du cache Firestore ou de TMDB.
+ *
+ * Le cache n'a pas de date d'expiration : le nombre d'opus d'une saga bouge
+ * au mieux une fois par décennie, et une suite annoncée n'a rien à faire
+ * dans un deck tant qu'elle n'est pas sortie.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {number} collectionId Identifiant TMDB de la saga.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<?SagaCache>} La saga, ou null si TMDB ne la rend pas.
+ */
+async function loadSaga(
+    db: admin.firestore.Firestore,
+    collectionId: number,
+    ctx: TMDBContext,
+): Promise<SagaCache | null> {
+  const ref = db.collection('collections').doc(String(collectionId));
+  const cached = await ref.get();
+  if (cached.exists && Array.isArray(cached.get('parts'))) {
+    return {
+      id: collectionId,
+      name: typeof cached.get('name') === 'string' ? cached.get('name') : '',
+      parts: cached.get('parts') as DiscoverRow[],
+    };
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = await tmdbGET(`/collection/${collectionId}`, {}, ctx);
+  } catch {
+    return null;
+  }
+  const raw = Array.isArray(payload.parts) ?
+    payload.parts as Record<string, unknown>[] : [];
+  const parts = raw
+      .map(sagaPartFrom)
+      .filter((part): part is DiscoverRow => part !== null)
+      // Sans date de sortie, un opus ne peut pas prétendre être le premier :
+      // il passe derrière ceux qui en ont une.
+      .sort((a, b) =>
+        (a.release_date ?? '9999').localeCompare(b.release_date ?? '9999'));
+  if (parts.length === 0) return null;
+
+  const saga: SagaCache = {
+    id: collectionId,
+    name: typeof payload.name === 'string' ? payload.name : '',
+    parts,
+  };
+  await ref.set({
+    name: saga.name,
+    parts: saga.parts,
+    updatedAt: admin.firestore.Timestamp.now(),
+  });
+  return saga;
+}
+
+/**
+ * À quelle saga appartient chacun de ces films.
+ *
+ * Lit le cache global d'abord, ne paie TMDB que pour les manques, et plafonne
+ * ce qu'il paie : un lot ne doit pas doubler son coût réseau parce que le
+ * cache est froid. Les manques non résolus ce tour-ci le seront au suivant.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {number[]} tmdbIds Films à résoudre.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Map<number, ?number>>} Saga de chaque film, null si isolé.
+ */
+async function resolveSagaIds(
+    db: admin.firestore.Firestore,
+    tmdbIds: number[],
+    ctx: TMDBContext,
+): Promise<Map<number, number | null>> {
+  const resolved = new Map<number, number | null>();
+  const unique = Array.from(new Set(tmdbIds));
+  if (unique.length === 0) return resolved;
+
+  const refs = unique.map((id) =>
+    db.collection('filmAxes').doc(String(id)));
+  const snaps = await db.getAll(...refs);
+  const missing: number[] = [];
+  snaps.forEach((snap, index) => {
+    const id = unique[index];
+    // `sagaAt` est le témoin de résolution, et non `collectionId` : un film
+    // isolé y vaut `null`, qu'on ne saurait pas distinguer d'un champ absent.
+    if (snap.exists && snap.get('sagaAt') !== undefined) {
+      const value = snap.get('collectionId');
+      resolved.set(id, typeof value === 'number' ? value : null);
+    } else {
+      missing.push(id);
+    }
+  });
+
+  const now = admin.firestore.Timestamp.now();
+  await Promise.all(
+      missing.slice(0, SWIPE_SAGA_RESOLVE_PER_BATCH).map(async (id) => {
+        try {
+          const detail = await tmdbGET(`/movie/${id}`, {}, ctx);
+          const collection = detail.belongs_to_collection as
+            {id?: number} | null | undefined;
+          const collectionId = collection && typeof collection.id === 'number' ?
+            collection.id : null;
+          resolved.set(id, collectionId);
+          await db.collection('filmAxes').doc(String(id))
+              .set({collectionId, sagaAt: now}, {merge: true});
+        } catch {
+          // Une fiche injoignable laisse le film tel quel : il sera servi
+          // sans sa saga, et résolu au prochain passage.
+        }
+      }),
+  );
+  return resolved;
+}
+
+/**
+ * Le premier opus encore à demander d'une saga.
+ * @param {SagaCache} saga La saga.
+ * @param {Set<number>} blocked Films déjà classés, en attente ou déjà servis.
+ * @param {string} today Date du jour au format `YYYY-MM-DD`.
+ * @return {?DiscoverRow} L'opus à servir, ou null s'il n'en reste aucun.
+ */
+function sagaHead(
+    saga: SagaCache, blocked: Set<number>, today: string,
+): DiscoverRow | null {
+  for (const part of saga.parts) {
+    if (blocked.has(part.id)) continue;
+    if (!part.poster_path) continue;
+    // Une suite annoncée n'est pas une carte : personne ne peut l'avoir vue.
+    if (!part.release_date || part.release_date > today) continue;
+    return part;
+  }
+  return null;
+}
+
+/**
+ * Applique les deux règles de saga au lot composé.
+ *
+ * Un opus de milieu de saga est **remplacé** par le premier qui reste à
+ * demander, à la même place et avec le même score ; les doublons de saga
+ * disparaissent. Le lot peut donc rendre moins de cartes qu'il n'en avait :
+ * c'est voulu, et le client recharge bien avant d'être à sec.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {SwipeCandidate[]} deck Lot composé, dans l'ordre d'affichage.
+ * @param {Set<number>} blocked Films déjà classés, en attente ou déjà servis.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<SwipeCandidate[]>} Lot corrigé.
+ */
+async function applySagaRule(
+    db: admin.firestore.Firestore,
+    deck: SwipeCandidate[],
+    blocked: Set<number>,
+    ctx: TMDBContext,
+): Promise<SwipeCandidate[]> {
+  if (deck.length === 0) return deck;
+
+  const sagaByFilm = await resolveSagaIds(db, deck.map((c) => c.id), ctx);
+  const sagaIds = Array.from(new Set(
+      Array.from(sagaByFilm.values())
+          .filter((id): id is number => typeof id === 'number'),
+  ));
+  const sagas = new Map<number, SagaCache>();
+  await Promise.all(sagaIds.map(async (id) => {
+    const saga = await loadSaga(db, id, ctx);
+    if (saga) sagas.set(id, saga);
+  }));
+
+  const today = new Date().toISOString().slice(0, 10);
+  const out: SwipeCandidate[] = [];
+  const served = new Set<number>();
+  const shown = new Set<number>();
+
+  for (const card of deck) {
+    const sagaId = sagaByFilm.get(card.id) ?? null;
+    if (sagaId === null) {
+      out.push(card);
+      shown.add(card.id);
+      continue;
+    }
+    if (served.has(sagaId)) continue;
+    served.add(sagaId);
+
+    const saga = sagas.get(sagaId);
+    if (!saga) {
+      out.push({...card, collectionId: sagaId});
+      shown.add(card.id);
+      continue;
+    }
+    const head = sagaHead(saga, blocked, today);
+    if (!head || head.id === card.id || shown.has(head.id)) {
+      out.push({
+        ...card, collectionId: sagaId, collectionTotal: saga.parts.length,
+      });
+      shown.add(card.id);
+      continue;
+    }
+    out.push({
+      ...head,
+      // La carte vient désormais de la règle de saga, et le dire sert à lire
+      // les logs : un lot où tout est `franchise` est un lot de rattrapage.
+      source: 'franchise',
+      score: card.score,
+      collectionId: sagaId,
+      collectionTotal: saga.parts.length,
+    });
+    shown.add(head.id);
+  }
+  return out;
+}
+
+/**
+ * Les opus à mettre en cooldown après un « pas vu » sur une tête de saga.
+ *
+ * Ne lit que le cache, jamais TMDB : un film ne peut être écarté que s'il a
+ * été servi, et le deck a donc déjà résolu sa saga en le servant. Si le cache
+ * ne sait rien, on ne propage rien — c'est un raccourci, pas une obligation.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {{id: string, tmdbId: number}[]} skipped Films écartés dans ce lot.
+ * @return {Promise<number[]>} ids TMDB des autres opus à refroidir.
+ */
+async function sagaSiblingsToCool(
+    db: admin.firestore.Firestore,
+    skipped: {id: string; tmdbId: number}[],
+): Promise<number[]> {
+  if (skipped.length === 0) return [];
+
+  const refs = skipped.map((entry) =>
+    db.collection('filmAxes').doc(String(entry.tmdbId)));
+  const snaps = await db.getAll(...refs);
+
+  const heads: {tmdbId: number; collectionId: number}[] = [];
+  snaps.forEach((snap, index) => {
+    const collectionId = snap.exists ? snap.get('collectionId') : null;
+    if (typeof collectionId !== 'number') return;
+    heads.push({tmdbId: skipped[index].tmdbId, collectionId});
+  });
+  if (heads.length === 0) return [];
+
+  const chosen = heads.slice(0, SWIPE_SAGA_SKIP_PROPAGATION);
+  const sagaSnaps = await db.getAll(
+      ...chosen.map((entry) =>
+        db.collection('collections').doc(String(entry.collectionId))),
+  );
+
+  const skippedIds = new Set(skipped.map((entry) => entry.tmdbId));
+  const siblings = new Set<number>();
+  sagaSnaps.forEach((snap, index) => {
+    const parts = snap.exists ? snap.get('parts') : null;
+    if (!Array.isArray(parts) || parts.length < 2) return;
+    const released = (parts as DiscoverRow[])
+        .filter((part) => typeof part.release_date === 'string');
+    // Seul le premier opus parle pour les autres. « Pas vu Fury Road » ne dit
+    // rien de « Mad Max 1 », et un deuxième opus ne dit rien du premier.
+    if (released[0]?.id !== chosen[index].tmdbId) return;
+    for (const part of released.slice(1)) {
+      if (!skippedIds.has(part.id)) siblings.add(part.id);
+    }
+  });
+  return Array.from(siblings);
+}
+
+/**
+ * Les opus d'une saga, pour la feuille qui propose d'ajouter les autres.
+ *
+ * Même cache que le deck, donc le plus souvent aucun appel TMDB.
+ */
+export const getCollection = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'GET') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        if (!await passesAppCheck(req, res)) return;
+
+        const id = Number(req.query.id);
+        if (!Number.isFinite(id) || id <= 0) {
+          res.status(400).json({error: 'invalid_id'});
+          return;
+        }
+
+        const saga = await loadSaga(getAdmin().firestore(), id, tmdb(req, res));
+        if (!saga) {
+          res.status(404).json({error: 'collection_not_found'});
+          return;
+        }
+
+        const today = new Date().toISOString().slice(0, 10);
+        res.status(200).json({
+          id: saga.id,
+          name: saga.name,
+          parts: saga.parts
+              .filter((part) => part.release_date && part.release_date <= today)
+              .map(discoverRowToJSON),
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCollection failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
 /**
  * Charge les ids à exclure : galerie, watchlist, et films écartés dont le
  * cooldown court encore. `resurfaceAt` étant calculé à l'écriture, l'exclusion
@@ -6251,7 +6629,14 @@ export const getSwipeFeed = onRequest(
             }))
             .sort((a, b) => b.score - a.score);
 
-        const deck = selectSwipeDeck(scored, profile);
+        // La règle de saga passe **après** la composition : elle corrige un
+        // lot déjà équilibré par les quotas plutôt que de peser dans le
+        // vivier, où une saga de huit opus écraserait les autres sources.
+        const blocked = new Set<number>(exclusions.excluded);
+        for (const id of sessionExcluded) blocked.add(id);
+        const deck = await applySagaRule(
+            db, selectSwipeDeck(scored, profile), blocked, tmdb(req, res),
+        );
 
         if (deck.length === 0) {
           logger.info('getSwipeFeed: empty deck', {
@@ -6266,6 +6651,8 @@ export const getSwipeFeed = onRequest(
           cards: deck.map((candidate) => ({
             ...discoverRowToJSON(candidate),
             source: candidate.source,
+            collection_id: candidate.collectionId ?? null,
+            collection_total: candidate.collectionTotal ?? null,
           })),
           gallery_size: profile.gallerySize,
           exhausted: deck.length === 0,
@@ -6408,6 +6795,19 @@ export const recordSwipes = onRequest(
           }
         }
 
+        // Un « pas vu » sur le premier opus d'une saga vaut pour la suite :
+        // qui n'a pas vu le premier Harry Potter n'a pas vu les sept autres,
+        // et les lui demander un par un coûte sept cartes pour rien. Les
+        // autres opus prennent le cooldown de base, sans escalade — c'est une
+        // déduction, pas une déclaration, et elle doit s'oublier vite.
+        const sagaCooldown = await sagaSiblingsToCool(
+            db,
+            decisions
+                .filter((d) => d.decision === 'skipped' &&
+                  d.item.mediaType === 'movie')
+                .map((d) => ({id: d.item.id, tmdbId: d.item.tmdbId})),
+        );
+
         const counters = {
           genreSeen: {} as Record<string, admin.firestore.FieldValue>,
           genreWanted: {} as Record<string, admin.firestore.FieldValue>,
@@ -6491,6 +6891,24 @@ export const recordSwipes = onRequest(
               bump('genreWanted', String(genreId));
             }
           }
+        }
+
+        // Les opus déduits : `merge` et pas de `skipCount`, pour qu'un vrai
+        // « pas vu » plus tard reparte de un et garde son escalade à lui.
+        for (const tmdbId of sagaCooldown) {
+          batch.set(
+              userRef.collection('swipeSkips').doc(`movie-${tmdbId}`),
+              {
+                tmdbId,
+                viaSaga: true,
+                lastSkippedAt: now,
+                resurfaceAt: a.firestore.Timestamp.fromMillis(
+                    now.toMillis() +
+                    skipCooldownMillis(1),
+                ),
+              },
+              {merge: true},
+          );
         }
 
         for (const [bucket, inner] of increments) {

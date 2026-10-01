@@ -120,5 +120,15 @@ service cloud.firestore {
     match /usernames/{handle} {
       allow read, write: if false;
     }
+
+    // -----------------------------------------------------------------
+    // Les sagas — cache global, partagé par tous les comptes et écrit
+    // uniquement par le serveur (getSwipeFeed, getCollection). Le client
+    // ne le lit jamais en direct : il passe par getCollection, qui sait
+    // retomber sur TMDB quand le cache ne connaît pas encore la saga.
+    // -----------------------------------------------------------------
+    match /collections/{collectionId} {
+      allow read, write: if false;
+    }
   }
 }
