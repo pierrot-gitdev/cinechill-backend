@@ -5,6 +5,7 @@ import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
 import * as admin from 'firebase-admin';
 import * as engine from './cinematch/engine';
+import * as series from './series';
 
 /**
  * Initialise l'Admin SDK une seule fois, quel que soit le nombre de fonctions
@@ -209,6 +210,14 @@ function filmsIn(
     ref: admin.firestore.CollectionReference,
 ): admin.firestore.Query {
   return ref.where('mediaType', '==', 'movie');
+}
+
+/**
+ * La date du jour au format TMDB, `YYYY-MM-DD`.
+ * @return {string} La date, en UTC.
+ */
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 /**
@@ -596,6 +605,423 @@ export const getMovieDetails = onRequest(
     },
 );
 
+/* ===================================================================== *
+ *  Les séries — fiches, saisons, et ce que la bibliothèque en retient
+ *
+ *  Voir `series.ts` pour le modèle. Ici, seulement ce qui parle à TMDB et à
+ *  Firestore.
+ * ===================================================================== */
+
+/**
+ * Ce que TMDB rattache à une série, chargé en un seul appel et partagé par
+ * toutes les lectures : la fiche, l'enrichissement de la watchlist et
+ * l'écriture d'une saison passent par la même clé de cache.
+ */
+const TV_DETAIL_APPEND = 'aggregate_credits,videos,watch/providers';
+/** Saisons enrichies en un seul appel, au plus. */
+const SEASONS_ENRICH_MAX = 30;
+
+/**
+ * La bande-annonce YouTube d'une fiche TMDB, comme pour un film.
+ * @param {unknown} videos Champ `videos` de la fiche.
+ * @return {?string} Clé YouTube, ou null.
+ */
+function trailerKeyFrom(videos: unknown): string | null {
+  const results = (videos as {results?: unknown})?.results;
+  if (!Array.isArray(results)) return null;
+  const rows = results as {type?: string; site?: string; key?: string}[];
+  const trailer =
+    rows.find((v) => v.type === 'Trailer' && v.site === 'YouTube') ??
+    rows.find((v) => v.site === 'YouTube');
+  return typeof trailer?.key === 'string' ? trailer.key : null;
+}
+
+/**
+ * Les plateformes françaises d'abonnement d'une fiche TMDB.
+ * @param {unknown} providers Champ `watch/providers` de la fiche.
+ * @return {Record<string, unknown>[]} Plateformes, au format de la fiche film.
+ */
+function frenchProvidersFrom(providers: unknown): Record<string, unknown>[] {
+  const flatrate = (providers as {results?: {FR?: {flatrate?: unknown}}})
+      ?.results?.FR?.flatrate;
+  if (!Array.isArray(flatrate)) return [];
+  return (flatrate as Record<string, unknown>[]).map((p) => ({
+    provider_id: p.provider_id,
+    provider_name: p.provider_name,
+    logo_path: p.logo_path ?? null,
+  }));
+}
+
+/**
+ * Un entier strictement positif, ou null.
+ * @param {unknown} raw Valeur reçue.
+ * @return {?number} L'entier, ou null.
+ */
+function positiveInt(raw: unknown): number | null {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+/** Ce que la bibliothèque retient d'une saison, calculé côté serveur. */
+interface SeasonFields {
+  seriesTitle: string | null;
+  seriesPosterPath: string | null;
+  genreIds: number[];
+  seasonName: string | null;
+  seasonPosterPath: string | null;
+  seasonOverview: string | null;
+  seasonVote: number | null;
+  seasonAirDate: string | null;
+  episodes: number;
+  episodeRuntime: number | null;
+  airedEpisodes: number;
+  nextAirDate: string | null;
+  providerIds: number[];
+  trailerKey: string | null;
+}
+
+/**
+ * Charge ce qu'il faut savoir d'une saison pour la ranger.
+ *
+ * Le serveur le calcule lui-même plutôt que de croire le client : une saison
+ * peut entrer par la fiche, par le deck ou par la feuille « j'ai vu les
+ * autres », et seule la première connaît ses épisodes.
+ * @param {number} tvId Identifiant TMDB de la série.
+ * @param {number} season Numéro de la saison.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<SeasonFields>} La saison, prête à ranger.
+ */
+async function seasonFields(
+    tvId: number, season: number, ctx: TMDBContext,
+): Promise<SeasonFields> {
+  const [seriesData, seasonData] = await Promise.all([
+    tmdbGET(`/tv/${tvId}`, {append_to_response: TV_DETAIL_APPEND}, ctx),
+    tmdbGET(`/tv/${tvId}/season/${season}`, {}, ctx),
+  ]);
+  const summary = series.summarizeSeason(seasonData.episodes, todayISO());
+  const providers = frenchProvidersFrom(seriesData['watch/providers']);
+  const text = (value: unknown) =>
+    typeof value === 'string' && value.length > 0 ? value : null;
+  return {
+    seriesTitle: text(seriesData.name),
+    seriesPosterPath: text(seriesData.poster_path),
+    genreIds: series.normalizeTvGenres(seriesData.genres),
+    seasonName: text(seasonData.name),
+    seasonPosterPath: text(seasonData.poster_path),
+    seasonOverview: text(seasonData.overview),
+    seasonVote: typeof seasonData.vote_average === 'number' &&
+      seasonData.vote_average > 0 ? seasonData.vote_average : null,
+    seasonAirDate: text(seasonData.air_date),
+    episodes: summary.episodes,
+    episodeRuntime: summary.episodeRuntime,
+    airedEpisodes: summary.airedEpisodes,
+    nextAirDate: summary.nextAirDate,
+    providerIds: providers
+        .map((p) => Number(p.provider_id))
+        .filter((id) => Number.isFinite(id)),
+    trailerKey: trailerKeyFrom(seriesData.videos),
+  };
+}
+
+/**
+ * Les champs d'un document de saison, à partir de ce que le serveur sait et,
+ * à défaut, de ce que le client a envoyé.
+ * @param {number} season Numéro de la saison.
+ * @param {?SeasonFields} fields Ce que TMDB a rendu, ou null s'il a échoué.
+ * @param {MediaItemPayload} item Ce que le client a envoyé.
+ * @return {Record<string, unknown>} Champs à fusionner dans le document.
+ */
+function seasonDocFields(
+    season: number, fields: SeasonFields | null, item: MediaItemPayload,
+): Record<string, unknown> {
+  return {
+    // Le titre reste celui de la série : « Severance », jamais
+    // « Severance S2 ». La saison a son propre champ.
+    title: fields?.seriesTitle ?? item.title,
+    posterPath: fields?.seasonPosterPath ?? fields?.seriesPosterPath ??
+      item.posterPath ?? null,
+    seriesPosterPath: fields?.seriesPosterPath ?? item.posterPath ?? null,
+    overview: fields?.seasonOverview ?? item.overview ?? null,
+    voteAverage: fields?.seasonVote ?? item.voteAverage ?? null,
+    genreIds: fields ? fields.genreIds :
+      series.normalizeTvGenres(item.genreIds ?? []),
+    releaseDate: fields?.seasonAirDate ?? item.releaseDate ?? null,
+    season,
+    seasonName: fields?.seasonName ?? null,
+    episodes: fields?.episodes ?? null,
+    episodeRuntime: fields?.episodeRuntime ?? null,
+    airedEpisodes: fields?.airedEpisodes ?? null,
+    nextAirDate: fields?.nextAirDate ?? null,
+    providerIds: fields?.providerIds ?? [],
+  };
+}
+
+/**
+ * La fiche d'une série : le dossier de ses saisons.
+ *
+ * Même forme que la fiche film partout où c'est possible — casting,
+ * plateformes, bande-annonce, noms de genres — pour que l'app la lise avec
+ * les mêmes types.
+ */
+export const getTvDetails = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'GET') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        if (!await passesAppCheck(req, res)) return;
+
+        const id = positiveInt(req.query.id);
+        if (id === null) {
+          res.status(400).json({error: 'invalid_id'});
+          return;
+        }
+
+        const data = await tmdbGET(
+            `/tv/${id}`, {append_to_response: TV_DETAIL_APPEND}, tmdb(req, res),
+        );
+        const today = todayISO();
+        const seasons = series.listSeasons(data.seasons);
+        // `episode_run_time` seul. Le dernier épisode diffusé est le plus
+        // souvent un final, plus long que les autres : 80 minutes pour une
+        // série qui en fait 53. Mieux vaut pas de durée qu'une durée fausse ;
+        // la fiche d'une saison, elle, la calcule sur tous ses épisodes.
+        const runtimes = Array.isArray(data.episode_run_time) ?
+          (data.episode_run_time as unknown[])
+              .filter((v): v is number => typeof v === 'number') : [];
+
+        const aggregate = data.aggregate_credits as
+          {cast?: unknown} | undefined;
+        const cast = Array.isArray(aggregate?.cast) ?
+          (aggregate?.cast as Record<string, unknown>[]).slice(0, 15)
+              .map((member) => {
+                const roles = Array.isArray(member.roles) ?
+                  member.roles as {character?: unknown}[] : [];
+                return {
+                  name: typeof member.name === 'string' ? member.name : '',
+                  character: typeof roles[0]?.character === 'string' ?
+                    roles[0].character : null,
+                  profile_path: typeof member.profile_path === 'string' ?
+                    member.profile_path : null,
+                };
+              }) : [];
+
+        const names = (raw: unknown) => Array.isArray(raw) ?
+          (raw as {name?: unknown}[])
+              .map((entry) => entry.name)
+              .filter((name): name is string =>
+                typeof name === 'string' && name.length > 0) : [];
+
+        res.status(200).json({
+          id: data.id,
+          name: data.name ?? null,
+          overview: data.overview ?? null,
+          tagline: typeof data.tagline === 'string' && data.tagline ?
+            data.tagline : null,
+          poster_path: data.poster_path ?? null,
+          backdrop_path: data.backdrop_path ?? null,
+          vote_average: data.vote_average ?? null,
+          vote_count: data.vote_count ?? null,
+          first_air_date: data.first_air_date ?? null,
+          status: data.status ?? null,
+          genre_names: names(data.genres),
+          genre_ids: series.normalizeTvGenres(data.genres),
+          creators: names(data.created_by),
+          networks: names(data.networks),
+          episode_run_time: series.median(runtimes),
+          seasons,
+          aired_season_count: series.airedSeasonCount(seasons, today),
+          trailer_key: trailerKeyFrom(data.videos),
+          credits: {cast},
+          watch_providers_fr: frenchProvidersFrom(data['watch/providers']),
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getTvDetails failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * La fiche d'une saison : ses épisodes, leurs durées et leurs dates.
+ */
+export const getTvSeason = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'GET') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        if (!await passesAppCheck(req, res)) return;
+
+        const id = positiveInt(req.query.id);
+        const season = positiveInt(req.query.season);
+        if (id === null || season === null) {
+          res.status(400).json({error: 'invalid_season'});
+          return;
+        }
+
+        const data = await tmdbGET(
+            `/tv/${id}/season/${season}`, {}, tmdb(req, res),
+        );
+        const summary = series.summarizeSeason(data.episodes, todayISO());
+        const episodes = Array.isArray(data.episodes) ?
+          (data.episodes as Record<string, unknown>[]).map((episode) => ({
+            episode_number: episode.episode_number ?? null,
+            name: typeof episode.name === 'string' ? episode.name : '',
+            runtime: typeof episode.runtime === 'number' ?
+              episode.runtime : null,
+            air_date: typeof episode.air_date === 'string' &&
+              episode.air_date ? episode.air_date : null,
+          })) : [];
+
+        res.status(200).json({
+          tv_id: id,
+          season_number: season,
+          name: data.name ?? null,
+          overview: typeof data.overview === 'string' && data.overview ?
+            data.overview : null,
+          poster_path: data.poster_path ?? null,
+          air_date: data.air_date ?? null,
+          vote_average: typeof data.vote_average === 'number' &&
+            data.vote_average > 0 ? data.vote_average : null,
+          episodes,
+          episode_count: summary.episodes,
+          episode_run_time: summary.episodeRuntime,
+          aired_episodes: summary.airedEpisodes,
+          next_air_date: summary.nextAirDate,
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getTvSeason failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Rafraîchit ce que la watchlist doit savoir de ses saisons : la durée d'un
+ * épisode, les plateformes, et surtout ce qui est déjà sorti.
+ *
+ * Une saison en cours de diffusion change de semaine en semaine : ce qui
+ * était rangé au moment de l'ajout ne dit plus si l'épisode à lancer est
+ * sorti. Ce point d'accès est le pendant de `enrichCandidates`, qui reste
+ * réservé aux films parce que CinéMatch s'en sert.
+ */
+export const enrichSeasons = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const raw = (req.body as Record<string, unknown> | undefined)?.seasons;
+        const wanted = (Array.isArray(raw) ? raw : [])
+            .map((entry) => ({
+              tvId: positiveInt((entry as Record<string, unknown>)?.tvId),
+              season: positiveInt((entry as Record<string, unknown>)?.season),
+            }))
+            .filter((entry): entry is {tvId: number; season: number} =>
+              entry.tvId !== null && entry.season !== null);
+        if (wanted.length === 0) {
+          res.status(400).json({error: 'no_seasons'});
+          return;
+        }
+        if (wanted.length > SEASONS_ENRICH_MAX) {
+          res.status(400).json({
+            error: 'too_many_seasons', max: SEASONS_ENRICH_MAX,
+          });
+          return;
+        }
+
+        const ctx = tmdb(req, res);
+        const settled = await Promise.allSettled(
+            wanted.map((entry) => seasonFields(entry.tvId, entry.season, ctx)),
+        );
+        const seasons = settled.flatMap((result, index) => {
+          if (result.status !== 'fulfilled') return [];
+          const fields = result.value;
+          return [{
+            tv_id: wanted[index].tvId,
+            season: wanted[index].season,
+            episodes: fields.episodes,
+            episode_runtime: fields.episodeRuntime,
+            aired_episodes: fields.airedEpisodes,
+            next_air_date: fields.nextAirDate,
+            provider_ids: fields.providerIds,
+            trailer_key: fields.trailerKey,
+          }];
+        });
+        res.status(200).json({seasons});
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('enrichSeasons failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Pose l'épisode à lancer d'une saison de la watchlist.
+ *
+ * Ce n'est pas un état : la saison reste « à voir » tant qu'elle n'est pas
+ * vue. Le champ dit seulement quoi lancer ce soir. Il n'existe que dans la
+ * watchlist ; marquer la saison vue passe par `setMediaStatus`, qui le perd
+ * en la rangeant en galerie.
+ */
+export const setNextEpisode = onRequest(
+    {invoker: 'public', timeoutSeconds: 20},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const parsed = series.parseSeasonEntryId(body.itemId);
+        const next = positiveInt(body.nextEpisode);
+        if (!parsed || next === null) {
+          res.status(400).json({error: 'invalid_request'});
+          return;
+        }
+
+        const ref = getAdmin().firestore().collection('users').doc(uid)
+            .collection('watchlist').doc(body.itemId as string);
+        const snap = await ref.get();
+        if (!snap.exists) {
+          res.status(404).json({error: 'not_in_watchlist'});
+          return;
+        }
+        const episodes = snap.get('episodes');
+        if (typeof episodes === 'number' && episodes > 0 && next > episodes) {
+          res.status(400).json({error: 'episode_out_of_range', episodes});
+          return;
+        }
+
+        await ref.set({
+          nextEpisode: next,
+          nextEpisodeAt: admin.firestore.Timestamp.now(),
+        }, {merge: true});
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('setNextEpisode failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
 export const getMovieGenres = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
@@ -667,6 +1093,9 @@ interface MediaItemPayload {
   collectionTotal?: number;
   genreIds: number[];
   releaseDate?: string;
+  /** L'épisode à lancer, pour une saison mise dans la file depuis la liste de
+   * ses épisodes. Ignoré partout ailleurs. */
+  nextEpisode?: number;
 }
 
 export const setMediaStatus = onRequest(
@@ -690,6 +1119,31 @@ export const setMediaStatus = onRequest(
         }
         if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
           res.status(400).json({error: 'invalid_item'});
+          return;
+        }
+
+        // Une série se range saison par saison, jamais entière : `tv-1399`
+        // seul est refusé, `tv-1399-s2` est accepté. Les champs de la saison
+        // viennent de TMDB, pas du client.
+        let seasonExtras: Record<string, unknown> = {};
+        if (item.mediaType === 'tv') {
+          const parsed = series.parseSeasonEntryId(item.id);
+          if (!parsed || parsed.tvId !== item.tmdbId) {
+            res.status(400).json({error: 'invalid_season'});
+            return;
+          }
+          const fields = status === 'none' ? null :
+            await seasonFields(parsed.tvId, parsed.season, tmdb(req, res))
+                .catch(() => null);
+          seasonExtras = seasonDocFields(parsed.season, fields, item);
+          const next = positiveInt(item.nextEpisode);
+          const episodes = fields?.episodes ?? 0;
+          if (status === 'toWatch' && next !== null &&
+            (episodes === 0 || next <= episodes)) {
+            seasonExtras.nextEpisode = next;
+          }
+        } else if (item.mediaType !== 'movie') {
+          res.status(400).json({error: 'invalid_media_type'});
           return;
         }
 
@@ -726,6 +1180,7 @@ export const setMediaStatus = onRequest(
           genreIds: item.genreIds ?? [],
           releaseDate: item.releaseDate ?? null,
           addedAt: now,
+          ...seasonExtras,
         };
 
         if (status === 'toWatch') {
