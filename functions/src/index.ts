@@ -192,6 +192,26 @@ async function tmdbGET(
 }
 
 /**
+ * Les films seuls d'une collection de bibliothèque.
+ *
+ * Les séries sont tenues à l'écart de CinéMatch, de la Porte, des badges et
+ * de tout ce qui lit `tmdbId` comme l'identifiant d'un film. Ce n'est pas
+ * qu'une décision de produit : les espaces d'identifiants TMDB des films et
+ * des séries se recoupent, et la série 1399 serait lue comme le film 1399.
+ *
+ * Le filtre est posé à la requête plutôt qu'à chaque boucle, pour qu'aucune
+ * lecture ne puisse l'oublier. Il est sûr : les quatre écrivains de la galerie
+ * et de la watchlist posent `mediaType` et refusent un objet qui n'en a pas.
+ * @param {admin.firestore.CollectionReference} ref Galerie ou watchlist.
+ * @return {admin.firestore.Query} Les seuls films.
+ */
+function filmsIn(
+    ref: admin.firestore.CollectionReference,
+): admin.firestore.Query {
+  return ref.where('mediaType', '==', 'movie');
+}
+
+/**
  * Return TMDB error to client when available.
  * @param {unknown} error Caught error.
  * @param {Object} res HTTP response object.
@@ -1663,8 +1683,8 @@ async function fetchLibraryForPool(
   );
 
   const [watchlistSnap, gallerySnap, historySnap] = await Promise.all([
-    userRef.collection('watchlist').get(),
-    userRef.collection('gallery').get(),
+    filmsIn(userRef.collection('watchlist')).get(),
+    filmsIn(userRef.collection('gallery')).get(),
     userRef.collection('recommendationHistory')
         .where('createdAt', '>=', cutoff)
         .orderBy('createdAt', 'desc')
@@ -3957,8 +3977,8 @@ export const getTasteProfile = onRequest(
           gallerySnap, watchlistSnap, correctionsSnap, historySnap, prefsSnap,
           duelsSnap,
         ] = await Promise.all([
-          userRef.collection('gallery').get(),
-          userRef.collection('watchlist').get(),
+          filmsIn(userRef.collection('gallery')).get(),
+          filmsIn(userRef.collection('watchlist')).get(),
           userRef.collection('taste').doc('corrections').get(),
           userRef.collection('recommendationHistory')
               .orderBy('createdAt', 'desc').limit(20).get(),
@@ -4331,8 +4351,9 @@ export const getGalleryAxes = onRequest(
         if (!uid) return;
 
         const db = getAdmin().firestore();
-        const gallerySnap = await db.collection('users').doc(uid)
-            .collection('gallery').get();
+        const gallerySnap = await filmsIn(
+            db.collection('users').doc(uid).collection('gallery'),
+        ).get();
 
         const pending = pendingGalleryPositions(gallerySnap);
         let fresh = new Map<string, FilmPosition>();
@@ -4461,7 +4482,7 @@ export const backfillGallery = onRequest(
         // Les positions, par lots, jusqu'à épuisement ou fin du budget. On
         // compte les films *tentés* et non les réussites : une fiche que
         // TMDB refuse ne doit pas faire boucler le client indéfiniment.
-        const gallerySnap = await userRef.collection('gallery').get();
+        const gallerySnap = await filmsIn(userRef.collection('gallery')).get();
         const pending = pendingGalleryPositions(gallerySnap);
         let attempted = 0;
         let positioned = 0;
@@ -4898,7 +4919,7 @@ export const finalizeRecommendations = onRequest(
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
         const [watchlistSnap, seedsSnap] = await Promise.all([
-          userRef.collection('watchlist').get(),
+          filmsIn(userRef.collection('watchlist')).get(),
           userRef.collection('taste').doc('lastSeeds').get(),
         ]);
         const watchlistIds = new Set<number>();
@@ -7320,7 +7341,7 @@ export const getHomeRows = onRequest(
         // Il coûtait une lecture de `preferences/swipeProfile` à chaque
         // ouverture de l'accueil, pour un score que plus personne ne lit.
         const [gallerySnap, declared] = await Promise.all([
-          userRef.collection('gallery').get(),
+          filmsIn(userRef.collection('gallery')).get(),
           fetchDeclaredProfile(db, uid),
         ]);
 
@@ -7739,8 +7760,8 @@ export const evaluateBadges = onRequest(
           gallerySnap, watchlistSnap, swipeSnap, badgesSnap, stateSnap,
           publicProfileSnap,
         ] = await Promise.all([
-          userRef.collection('gallery').get(),
-          userRef.collection('watchlist').get(),
+          filmsIn(userRef.collection('gallery')).get(),
+          filmsIn(userRef.collection('watchlist')).get(),
           userRef.collection('preferences').doc('swipeProfile').get(),
           userRef.collection('badges').get(),
           userRef.collection('preferences').doc('badgeState').get(),
@@ -8589,7 +8610,9 @@ export const getPublicProfile = onRequest(
         const db = getAdmin().firestore();
         const [profileSnap, gallerySnap] = await Promise.all([
           db.collection('publicProfiles').doc(targetUid).get(),
-          db.collection('users').doc(targetUid).collection('gallery').get(),
+          filmsIn(
+              db.collection('users').doc(targetUid).collection('gallery'),
+          ).get(),
         ]);
 
         if (!profileSnap.exists) {
@@ -8848,7 +8871,7 @@ async function loadCineMatchGallery(
     userRef: admin.firestore.DocumentReference,
     ctx: TMDBContext,
 ): Promise<CineMatchGallery> {
-  const gallerySnap = await userRef.collection('gallery').get();
+  const gallerySnap = await filmsIn(userRef.collection('gallery')).get();
   const pending = pendingGalleryPositions(gallerySnap);
   let fresh = new Map<string, FilmPosition>();
   if (pending.length > 0) {
@@ -9171,7 +9194,7 @@ async function loadCineMatchSetup(
   );
   const [gallery, watchlistSnap, prefsSnap, exposureSnap] = await Promise.all([
     loadCineMatchGallery(db, userRef, ctx),
-    userRef.collection('watchlist').get(),
+    filmsIn(userRef.collection('watchlist')).get(),
     userRef.collection('taste').doc('filmPrefs').get(),
     userRef.collection('cinematchExposure')
         .where('lastShownAt', '>=', cutoff).get(),
