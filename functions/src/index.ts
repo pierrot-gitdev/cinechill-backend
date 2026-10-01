@@ -10878,10 +10878,21 @@ async function loadSeriesSetup(
       chosenAt: millisOf(doc.get('chosenAt')),
     });
   }
+  // On propose des séries à commencer, jamais à reprendre : une série dont
+  // la file sait déjà quel épisode lancer n'attend aucune décision.
   const watchlistIds = new Set<number>();
+  const startedIds = new Set<number>();
   for (const doc of watchlistSnap.docs) {
     const id = Number(doc.get('tmdbId'));
-    if (Number.isInteger(id) && id > 0) watchlistIds.add(id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const next = doc.get('nextEpisode');
+    const season = doc.get('season');
+    if ((typeof next === 'number' && next >= 2) ||
+        (typeof season === 'number' && season >= 2)) {
+      startedIds.add(id);
+    } else {
+      watchlistIds.add(id);
+    }
   }
 
   // Les films aimés, en prêt : sans eux, quelqu'un qui a rangé quinze
@@ -10910,7 +10921,7 @@ async function loadSeriesSetup(
     exposure,
     now,
     avoided: abandons.axes,
-    extraExcludedIds: abandons.ids,
+    extraExcludedIds: [...abandons.ids, ...startedIds],
     priorAnchors,
   };
 }
