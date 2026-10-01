@@ -243,6 +243,18 @@ const SMW_GENRE: Record<number, number> = {
   12: -0.80, 878: -0.67, 14: -0.70, 10751: -0.90, 16: -0.90,
   99: 0.60, 36: 0.50, 10752: 0.40,
 };
+/**
+ * Le devoir côté séries, sur les genres ramenés à ceux des films. Les grandes
+ * séries dramatiques en sont le cœur : on se promet The Wire comme on se
+ * promet un classique. La comédie, l'action et la famille se lancent sans
+ * se promettre ; la science-fiction et le mystère, moins nettement qu'au
+ * cinéma, parce que les séries qui comptent y sont nombreuses.
+ */
+const SMW_GENRE_SERIES: Record<number, number> = {
+  18: 0.6, 80: 0.2, 36: 0.5, 10752: 0.4, 99: 0.5,
+  35: -0.8, 28: -0.9, 12: -0.7, 10751: -0.9, 16: -0.6,
+  878: -0.3, 14: -0.4, 9648: -0.2, 10749: -0.4,
+};
 /** Ce qu'une année d'âge ajoute au devoir. */
 const SMW_PER_YEAR = 0.0216;
 
@@ -693,11 +705,15 @@ function weightedFeatures(f: Features, weights: FeatureWeights): number {
  * Le devoir d'un film, avant la part du goût.
  * @param {EngineFilm} film Le film.
  * @param {number} currentYear Année en cours.
+ * @param {boolean} isSeries Vrai pour lire la table des séries.
  * @return {number} Devoir brut, positif = plutôt un devoir.
  */
-function smwOf(film: EngineFilm, currentYear: number): number {
+function smwOf(
+    film: EngineFilm, currentYear: number, isSeries = false,
+): number {
   const genre = film.genreIds[0];
-  const byGenre = genre !== undefined ? SMW_GENRE[genre] ?? 0 : 0;
+  const table = isSeries ? SMW_GENRE_SERIES : SMW_GENRE;
+  const byGenre = genre !== undefined ? table[genre] ?? 0 : 0;
   const age = film.year !== null ? Math.max(0, currentYear - film.year) : 0;
   return byGenre + age * SMW_PER_YEAR;
 }
@@ -827,7 +843,7 @@ export function scoreFilms(
   // Un pari est exempté du devoir : un film peu connu n'est pas « le
   // classique qu'on se doit de voir », c'est une découverte.
   const rawDuty = eligible.map((film, i) => feats[i].bet ? 0 :
-    Math.max(0, smwOf(film, currentYear)) *
+    Math.max(0, smwOf(film, currentYear, isSeries)) *
       (1 - clamp01(rawTaste[i] / tasteBound)));
 
   const zTaste = standardize(rawTaste);
