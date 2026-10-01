@@ -7095,6 +7095,7 @@ async function fetchSwipeExclusions(
   excluded: Set<number>;
   tvExcluded: Set<number>;
   galleryDocs: admin.firestore.QueryDocumentSnapshot[];
+  tvGalleryDocs: admin.firestore.QueryDocumentSnapshot[];
 }> {
   const userRef = db.collection('users').doc(uid);
   const now = admin.firestore.Timestamp.now();
@@ -7131,83 +7132,431 @@ async function fetchSwipeExclusions(
     add(doc.get('mediaType') === 'tv' ? tvExcluded : excluded, doc);
   }
 
-  return {excluded, tvExcluded, galleryDocs: gallerySnap.docs};
+  return {
+    excluded,
+    tvExcluded,
+    galleryDocs: gallerySnap.docs,
+    tvGalleryDocs: tvGallerySnap.docs,
+  };
+}
+
+/* ===================================================================== *
+ *  Les fiches des séries — un cache partagé, comme `filmAxes`
+ *
+ *  Le deck des séries et le moteur des séries lisent la même chose : le
+ *  nombre de saisons sorties, le statut, le type, la durée d'un épisode, les
+ *  plateformes, la classification et la position sur les huit axes. Tout
+ *  vient d'une seule fiche TMDB, payée une fois par série pour tous les
+ *  comptes, et rafraîchie au bout de deux semaines : une série vivante
+ *  change de saison, de statut et de plateforme.
+ * ===================================================================== */
+
+/** Monte quand le calcul d'une fiche change : les anciennes se refont. */
+const TV_META_VERSION = 1;
+/** Ce que la fiche d'une série doit rapporter en un appel. */
+const TV_META_APPEND = 'videos,watch/providers,keywords,content_ratings';
+const TV_META_MAX_AGE_MS = 14 * 24 * 3600 * 1000;
+/**
+ * La fiction seule. Une téléréalité, un talk-show ou un journal n'a ni
+ * histoire ni axes, et le dire « vu » n'apprend rien de ce qu'on aime.
+ */
+const TV_KEPT_TYPES = new Set(['Scripted', 'Miniseries']);
+/** Jeunesse, actualités, téléréalité, talk-show : hors du vivier. */
+const TV_EXCLUDED_GENRES = [10762, 10763, 10764, 10767];
+
+/** Ce que la bibliothèque des séries sait d'une série. */
+interface TvMeta {
+  id: number;
+  name: string;
+  overview: string | null;
+  posterPath: string | null;
+  firstAirDate: string | null;
+  voteCount: number;
+  voteAverage: number | null;
+  genreIds: number[];
+  keywordNames: string[];
+  /** Durée d'un épisode, en minutes. */
+  episodeRuntime: number | null;
+  /** Saisons dont le premier épisode est sorti. */
+  seasonCount: number;
+  /** Épisodes de ces saisons. */
+  episodeCount: number;
+  status: 'ended' | 'returning' | 'canceled' | null;
+  type: string | null;
+  providerIds: number[];
+  certification: string | null;
+  trailerKey: string | null;
+  axes: AxisVector;
+  sigma: AxisVector;
 }
 
 /**
- * Cartes de série servies par lot, au plus, une fois la Mémoire pleine.
- *
- * Le deck a une mission : remplir la galerie de films assez variés pour
- * ouvrir CinéMatch. Les séries en sont tenues à l'écart, donc une carte de
- * série avant la Mémoire est une carte qui ne fait pas avancer la Porte. Elles
- * arrivent une fois la Porte nourrie, en petite part.
+ * Lit le statut TMDB dans le vocabulaire du moteur. « En production »,
+ * « prévue », « pilote » : la série continue.
+ * @param {unknown} raw Statut TMDB.
+ * @return {?string} Statut normalisé.
  */
-const SWIPE_TV_CARDS = 3;
-/** Notoriété minimale d'une série proposée au deck. */
-const SWIPE_TV_VOTE_COUNT_FLOOR = 1500;
+function tvStatusOf(raw: unknown): TvMeta['status'] {
+  if (raw === 'Ended') return 'ended';
+  if (raw === 'Canceled') return 'canceled';
+  if (typeof raw === 'string' && raw.length > 0) return 'returning';
+  return null;
+}
 
 /**
- * Les cartes de série d'un lot.
+ * Une fiche de série, depuis `/tv/{id}` et ses compléments.
  *
- * Même logique que les piliers des films : les séries les plus vues, parce
- * qu'on ne peut demander « tu la connais ? » que sur ce que tout le monde a
- * vu. Le nombre de saisons sorties voyage avec la carte : c'est lui que l'app
- * propose de ranger d'un tap.
+ * La position passe par la grammaire des films : une série se place sur les
+ * mêmes huit axes, avec ses genres ramenés aux genres de films, ses mots-clés
+ * et la durée d'un épisode. C'est ce qui permet au moteur de la comparer à
+ * un film aimé quand le profil de séries est encore mince.
+ * @param {Record<string, unknown>} detail Fiche TMDB.
+ * @return {TvMeta} La fiche normalisée.
+ */
+function tvMetaFromDetail(detail: Record<string, unknown>): TvMeta {
+  const today = todayISO();
+  const seasons = series.listSeasons(detail.seasons)
+      .filter((s) => s.air_date !== null && s.air_date <= today);
+  const genreIds = series.normalizeTvGenres(detail.genres);
+  const rawKeywords = (detail.keywords as {results?: unknown})?.results;
+  const keywordNames = Array.isArray(rawKeywords) ?
+    (rawKeywords as {name?: unknown}[])
+        .map((k) => k.name)
+        .filter((n): n is string => typeof n === 'string') : [];
+  const runtimes = Array.isArray(detail.episode_run_time) ?
+    (detail.episode_run_time as unknown[])
+        .filter((v): v is number => typeof v === 'number') : [];
+  // À défaut de durée déclarée, le dernier épisode diffusé : il penche vers
+  // un final plus long, mais le moteur n'en tire qu'un format — court,
+  // moyen, long — et une durée approchée vaut mieux qu'un filtre aveugle.
+  const lastEpisode = detail.last_episode_to_air as
+    {runtime?: unknown} | null | undefined;
+  const episodeRuntime = series.median(runtimes) ??
+    (typeof lastEpisode?.runtime === 'number' && lastEpisode.runtime > 0 ?
+      lastEpisode.runtime : null);
+  const ratings = (detail.content_ratings as {results?: unknown})?.results;
+  const french = Array.isArray(ratings) ?
+    (ratings as {iso_3166_1?: unknown; rating?: unknown}[])
+        .find((r) => r.iso_3166_1 === 'FR') : undefined;
+  const voteCount =
+    typeof detail.vote_count === 'number' ? detail.vote_count : 0;
+
+  const position = positionFilmFromDetail({
+    genres: genreIds.map((id) => ({id})),
+    vote_count: voteCount,
+    runtime: episodeRuntime,
+    budget: null,
+    keywords: {keywords: (rawKeywords as unknown[] | undefined) ?? []},
+    origin_country: detail.origin_country ?? [],
+    production_countries: [],
+    belongs_to_collection: null,
+  });
+
+  return {
+    id: Number(detail.id),
+    name: typeof detail.name === 'string' ? detail.name : '',
+    overview: typeof detail.overview === 'string' && detail.overview ?
+      detail.overview : null,
+    posterPath: typeof detail.poster_path === 'string' ?
+      detail.poster_path : null,
+    firstAirDate: typeof detail.first_air_date === 'string' &&
+      detail.first_air_date ? detail.first_air_date : null,
+    voteCount,
+    voteAverage: typeof detail.vote_average === 'number' &&
+      detail.vote_average > 0 ? detail.vote_average : null,
+    genreIds,
+    keywordNames,
+    episodeRuntime,
+    seasonCount: seasons.length,
+    episodeCount: seasons.reduce((sum, s) => sum + s.episode_count, 0),
+    status: tvStatusOf(detail.status),
+    type: typeof detail.type === 'string' ? detail.type : null,
+    providerIds: frenchProvidersFrom(detail['watch/providers'])
+        .map((p) => Number(p.provider_id))
+        .filter((id) => Number.isFinite(id)),
+    certification: typeof french?.rating === 'string' && french.rating ?
+      french.rating : null,
+    trailerKey: trailerKeyFrom(detail.videos),
+    axes: position.axes,
+    sigma: position.sigma,
+  };
+}
+
+/**
+ * Les fiches de ces séries, du cache ou de TMDB.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {number[]} ids Séries voulues.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {number} maxFetch Fiches payées à TMDB, au plus, dans cet appel.
+ * @return {Promise<Map<number, TvMeta>>} Les fiches trouvées.
+ */
+async function loadTvMeta(
+    db: admin.firestore.Firestore,
+    ids: number[],
+    ctx: TMDBContext,
+    maxFetch: number,
+): Promise<Map<number, TvMeta>> {
+  const out = new Map<number, TvMeta>();
+  const unique = Array.from(new Set(ids)).filter((id) => id > 0);
+  if (unique.length === 0) return out;
+
+  const snaps = await db.getAll(
+      ...unique.map((id) => db.collection('tvMeta').doc(String(id))));
+  const now = Date.now();
+  const missing: number[] = [];
+  snaps.forEach((snap, index) => {
+    const updated = snap.get('updatedAt');
+    const fresh = snap.exists && snap.get('v') === TV_META_VERSION &&
+      updated instanceof admin.firestore.Timestamp &&
+      now - updated.toMillis() < TV_META_MAX_AGE_MS;
+    if (fresh) {
+      out.set(unique[index], snap.get('meta') as TvMeta);
+    } else {
+      missing.push(unique[index]);
+    }
+  });
+
+  await Promise.all(missing.slice(0, maxFetch).map(async (id) => {
+    try {
+      const detail = await tmdbGET(
+          `/tv/${id}`, {append_to_response: TV_META_APPEND}, ctx);
+      const meta = tvMetaFromDetail(detail);
+      out.set(id, meta);
+      await db.collection('tvMeta').doc(String(id)).set({
+        v: TV_META_VERSION,
+        meta,
+        updatedAt: admin.firestore.Timestamp.now(),
+      });
+    } catch {
+      // Une fiche injoignable laisse la série de côté pour ce tour.
+    }
+  }));
+  return out;
+}
+
+/**
+ * Garde la série dans le vivier : fiction, avec au moins une saison.
+ * @param {TvMeta} meta Fiche de la série.
+ * @return {boolean} Vrai si elle peut être proposée.
+ */
+function isKeptSeries(meta: TvMeta): boolean {
+  return meta.seasonCount > 0 &&
+    (meta.type === null || TV_KEPT_TYPES.has(meta.type)) &&
+    !meta.genreIds.some((id) => TV_EXCLUDED_GENRES.includes(id));
+}
+
+/* ===================================================================== *
+ *  Le deck des séries
+ *
+ *  Le même principe que celui des films — on ne peut demander « tu la
+ *  connais ? » que sur ce que tout le monde a vu, et on couvre le terrain
+ *  plutôt que de flatter un goût — avec ses propres mesures : on connaît
+ *  bien moins de séries que de films, et TMDB en compte bien moins de votes.
+ * ===================================================================== */
+
+/** Cartes d'un lot de séries. */
+const SERIES_FEED_SIZE = 20;
+/** Notoriété minimale d'une série proposée. */
+const SERIES_VOTE_COUNT_FLOOR = 300;
+/** Séries visées par genre avant qu'un genre cesse d'être « en manque ». */
+const SERIES_COVERAGE_TARGET = 3;
+/**
+ * Les genres qu'une série peut couvrir. TMDB n'a pas de genre « thriller »,
+ * « horreur » ni « romance » pour la télévision : ils ne peuvent pas manquer.
+ */
+const SERIES_COVERAGE_GENRES = [18, 35, 80, 9648, 10751, 28, 12, 878, 14];
+/** Graines de voisinage tirées de la galerie des séries. */
+const SERIES_SEEDS = 4;
+/** Fiches payées à TMDB par lot, au plus. */
+const SERIES_META_PER_BATCH = 25;
+
+/**
+ * Le genre TV qu'on demande à TMDB pour couvrir un genre de film.
+ * @param {number} genreId Genre de film.
+ * @return {number} Genre TV.
+ */
+function tvGenreFor(genreId: number): number {
+  if (genreId === 28 || genreId === 12) return 10759;
+  if (genreId === 878 || genreId === 14) return 10765;
+  if (genreId === 10752) return 10768;
+  return genreId;
+}
+
+/**
+ * Une ligne `/discover/tv` ou `/recommendations`, dans le vocabulaire du
+ * deck.
+ * @param {Record<string, unknown>} raw Ligne TMDB.
+ * @return {?DiscoverRow} La ligne, ou null sans identifiant.
+ */
+function seriesRowFrom(raw: Record<string, unknown>): DiscoverRow | null {
+  const id = Number(raw.id);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return {
+    id,
+    media_type: 'tv',
+    title: typeof raw.name === 'string' ? raw.name : undefined,
+    overview: typeof raw.overview === 'string' ? raw.overview : null,
+    poster_path: typeof raw.poster_path === 'string' ? raw.poster_path : null,
+    vote_average: typeof raw.vote_average === 'number' ?
+      raw.vote_average : null,
+    vote_count: typeof raw.vote_count === 'number' ? raw.vote_count : null,
+    popularity: typeof raw.popularity === 'number' ? raw.popularity : null,
+    genre_ids: series.normalizeTvGenres(raw.genre_ids),
+    release_date: typeof raw.first_air_date === 'string' &&
+      raw.first_air_date ? raw.first_air_date : null,
+    origin_country: Array.isArray(raw.origin_country) ?
+      raw.origin_country as string[] : [],
+  };
+}
+
+/**
+ * Le lot de cartes du deck des séries.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {admin.firestore.QueryDocumentSnapshot[]} tvGalleryDocs Saisons vues.
  * @param {Set<number>} blocked Séries rangées, écartées ou déjà servies.
- * @param {DeclaredProfile} declared Genres bannis.
+ * @param {DeclaredProfile} declared Genres bannis, génération.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Record<string, unknown>[]>} Cartes prêtes à envoyer.
  */
-async function fetchTvCards(
-    blocked: Set<number>, declared: DeclaredProfile, ctx: TMDBContext,
+async function buildSeriesDeck(
+    db: admin.firestore.Firestore,
+    tvGalleryDocs: admin.firestore.QueryDocumentSnapshot[],
+    blocked: Set<number>,
+    declared: DeclaredProfile,
+    ctx: TMDBContext,
 ): Promise<Record<string, unknown>[]> {
-  const data = await tmdbGET('/discover/tv', {
+  // La galerie des séries, série par série : trois saisons de Dark sont une
+  // série, pas trois.
+  const bySeries = new Map<number, {genreIds: number[]; addedAt: number}>();
+  for (const doc of tvGalleryDocs) {
+    const id = Number(doc.get('tmdbId'));
+    if (!Number.isFinite(id)) continue;
+    const added = (doc.get('addedAt') as admin.firestore.Timestamp | undefined)
+        ?.toMillis() ?? 0;
+    const known = bySeries.get(id);
+    const genreIds = Array.isArray(doc.get('genreIds')) ?
+      doc.get('genreIds') as number[] : [];
+    if (!known || known.addedAt < added) {
+      bySeries.set(id, {genreIds, addedAt: added});
+    }
+  }
+  const genreCounts = new Map<number, number>();
+  for (const entry of bySeries.values()) {
+    for (const id of entry.genreIds) {
+      genreCounts.set(id, (genreCounts.get(id) ?? 0) + 1);
+    }
+  }
+  const banned = declared.bannedGenreIDs;
+  const deficient = SERIES_COVERAGE_GENRES
+      .filter((id) => !banned.has(id))
+      .filter((id) => (genreCounts.get(id) ?? 0) < SERIES_COVERAGE_TARGET)
+      .sort((a, b) => (genreCounts.get(a) ?? 0) - (genreCounts.get(b) ?? 0));
+  const seeds = [...bySeries.entries()]
+      .sort((a, b) => b[1].addedAt - a[1].addedAt)
+      .slice(0, SERIES_SEEDS)
+      .map(([id]) => id);
+
+  const base = {
     'include_adult': 'false',
-    'vote_count.gte': String(SWIPE_TV_VOTE_COUNT_FLOOR),
+    'with_type': '2|4',
+    'without_genres': TV_EXCLUDED_GENRES.join('|'),
     'sort_by': 'vote_count.desc',
-    'page': String(1 + Math.floor(Math.random() * 5)),
-  }, ctx).catch(() => null);
-  const rows = data && Array.isArray(data.results) ?
-    data.results as Record<string, unknown>[] : [];
+  };
+  const page = () => String(1 + Math.floor(Math.random() * 6));
+  const probes = shuffled(deficient.slice(0, 5)).slice(0, 3);
+  const [pillars, coverage, neighbors] = await Promise.all([
+    Promise.allSettled([page(), page()].map((p) => tmdbGET('/discover/tv', {
+      ...base, 'vote_count.gte': String(SERIES_VOTE_COUNT_FLOOR), 'page': p,
+    }, ctx))),
+    Promise.allSettled(probes.map((genreId) => tmdbGET('/discover/tv', {
+      ...base,
+      'with_genres': String(tvGenreFor(genreId)),
+      'vote_count.gte': String(SERIES_VOTE_COUNT_FLOOR),
+      'page': String(1 + Math.floor(Math.random() * 3)),
+    }, ctx))),
+    Promise.allSettled(seeds.map((id) =>
+      tmdbGET(`/tv/${id}/recommendations`, {page: '1'}, ctx))),
+  ]);
 
-  const picked = shuffled(rows.filter((row) =>
-    typeof row.id === 'number' && !blocked.has(row.id) &&
-    typeof row.poster_path === 'string' &&
-    !series.normalizeTvGenres(row.genre_ids)
-        .some((id) => declared.bannedGenreIDs.has(id)),
-  )).slice(0, SWIPE_TV_CARDS);
+  const pool = new Map<number, SwipeCandidate>();
+  const take = (
+      settled: PromiseSettledResult<Record<string, unknown>>[],
+      source: SwipeSource,
+  ) => {
+    for (const result of settled) {
+      for (const raw of rowsFrom(result, 'results')) {
+        const row = seriesRowFrom(raw as unknown as Record<string, unknown>);
+        if (!row || pool.has(row.id) || blocked.has(row.id)) continue;
+        if (!row.poster_path) continue;
+        if ((row.genre_ids ?? []).some((id) => banned.has(id))) continue;
+        pool.set(row.id, {...row, source, score: 0});
+      }
+    }
+  };
+  take(neighbors, 'neighbors');
+  take(coverage, 'coverage');
+  take(pillars, 'pillars');
 
-  const today = todayISO();
-  const details = await Promise.allSettled(picked.map((row) =>
-    tmdbGET(`/tv/${row.id}`, {append_to_response: TV_DETAIL_APPEND}, ctx)));
-  return picked.flatMap((row, index) => {
-    const detail = details[index];
-    if (detail.status !== 'fulfilled') return [];
-    const seasonCount = series.airedSeasonCount(
-        series.listSeasons(detail.value.seasons), today,
-    );
-    if (seasonCount === 0) return [];
-    return [{
-      id: row.id,
-      title: typeof row.name === 'string' ? row.name : null,
-      overview: typeof row.overview === 'string' ? row.overview : null,
-      poster_path: row.poster_path,
-      vote_average: typeof row.vote_average === 'number' ?
-        row.vote_average : null,
-      vote_count: typeof row.vote_count === 'number' ? row.vote_count : null,
-      popularity: typeof row.popularity === 'number' ? row.popularity : null,
-      genre_ids: series.normalizeTvGenres(row.genre_ids),
-      release_date: typeof row.first_air_date === 'string' &&
-        row.first_air_date ? row.first_air_date : null,
-      origin_country: Array.isArray(row.origin_country) ?
-        row.origin_country : [],
-      media_type: 'tv',
-      season_count: seasonCount,
-      source: 'series',
-      collection_id: null,
-      collection_total: null,
-    }];
-  });
+  // Le score : la notoriété d'abord, sur l'échelle des séries (cent votes
+  // pour une inconnue, quinze mille pour une évidence), puis ce qu'elle
+  // couvre, puis un goût de genre encore grossier.
+  const maxCount = Math.max(1, ...genreCounts.values());
+  const scored = [...pool.values()].map((row) => {
+    const notoriety = clamp01(
+        (Math.log10(Math.max(1, row.vote_count ?? 0)) - 2) / 2.2);
+    const generation = generationFactor(
+        decadeOf(row.release_date), declared.birthDecade);
+    let cover = 0;
+    let taste = 0;
+    for (const id of row.genre_ids ?? []) {
+      const owned = genreCounts.get(id) ?? 0;
+      if (SERIES_COVERAGE_GENRES.includes(id)) {
+        cover = Math.max(cover, clamp01(
+            (SERIES_COVERAGE_TARGET - owned) / SERIES_COVERAGE_TARGET));
+      }
+      taste = Math.max(taste, owned / maxCount);
+    }
+    const bonus = row.source === 'neighbors' ? 4 : 2;
+    return {
+      ...row,
+      score: 100 * (0.55 * notoriety * generation + 0.25 * cover +
+        0.20 * taste) + bonus + Math.random() * 4,
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  // Le plafond de genre, comme pour les films : un lot de séries ne doit pas
+  // être un lot de séries policières.
+  const cap = Math.ceil(SERIES_FEED_SIZE / 3);
+  const load = new Map<number, number>();
+  const picked: SwipeCandidate[] = [];
+  for (const relaxed of [false, true]) {
+    for (const candidate of scored) {
+      if (picked.length >= SERIES_FEED_SIZE + 5) break;
+      if (picked.includes(candidate)) continue;
+      const genres = candidate.genre_ids ?? [];
+      if (!relaxed && genres.some((id) => (load.get(id) ?? 0) >= cap)) continue;
+      picked.push(candidate);
+      for (const id of genres) load.set(id, (load.get(id) ?? 0) + 1);
+    }
+  }
+
+  // Les fiches disent ce que `/discover` tait : le type, et le nombre de
+  // saisons sorties, que la carte écrit et que la feuille propose de ranger.
+  const metas = await loadTvMeta(
+      db, picked.map((c) => c.id), ctx, SERIES_META_PER_BATCH);
+  const kept = picked.filter((c) => {
+    const meta = metas.get(c.id);
+    return meta !== undefined && isKeptSeries(meta);
+  }).slice(0, SERIES_FEED_SIZE);
+
+  return orderForDeck(kept).map((candidate) => ({
+    ...discoverRowToJSON(candidate),
+    media_type: 'tv',
+    season_count: metas.get(candidate.id)?.seasonCount ?? null,
+    source: candidate.source,
+    collection_id: null,
+    collection_total: null,
+  }));
 }
 
 /**
@@ -7255,6 +7604,23 @@ export const getSwipeFeed = onRequest(
           fetchDeclaredProfile(db, uid),
         ]);
 
+        // Le deck des séries, quand l'interrupteur est sur Séries. Les deux
+        // profils ne se mêlent pas : un lot de séries ne compte que des séries.
+        if (body?.format === 'tv') {
+          const tvBlocked = new Set<number>(exclusions.tvExcluded);
+          for (const id of sessionTvExcluded) tvBlocked.add(id);
+          const seriesCards = await buildSeriesDeck(
+              db, exclusions.tvGalleryDocs, tvBlocked, declared,
+              tmdb(req, res),
+          );
+          res.status(200).json({
+            cards: seriesCards,
+            gallery_size: exclusions.tvGalleryDocs.length,
+            exhausted: seriesCards.length === 0,
+          });
+          return;
+        }
+
         const profile = buildTasteProfile(
             exclusions.galleryDocs, parseSwipeCounters(countersSnap), declared,
         );
@@ -7285,24 +7651,6 @@ export const getSwipeFeed = onRequest(
           collection_id: candidate.collectionId ?? null,
           collection_total: candidate.collectionTotal ?? null,
         }));
-
-        // `gallerySize` ne compte que les films (`filmsIn`) : c'est bien la
-        // Mémoire de la Porte qui ouvre le deck aux séries.
-        // Une version de l'app antérieure aux séries lirait une carte de série
-        // comme un film : elle ne reçoit que des films.
-        const seriesAware = body?.series === true;
-        if (seriesAware && profile.gallerySize >= DOOR_MEMOIRE_TARGET) {
-          const tvBlocked = new Set<number>(exclusions.tvExcluded);
-          for (const id of sessionTvExcluded) tvBlocked.add(id);
-          const tvCards = await fetchTvCards(
-              tvBlocked, declared, tmdb(req, res),
-          );
-          // Espacées dans le lot, jamais groupées : trois séries d'affilée
-          // changeraient la nature de l'écran pendant quinze secondes.
-          tvCards.forEach((card, index) => {
-            cards.splice(Math.min(cards.length, 4 + index * 8), 0, card);
-          });
-        }
 
         if (cards.length === 0) {
           logger.info('getSwipeFeed: empty deck', {
