@@ -5170,6 +5170,39 @@ const SWIPE_MAX_DECISIONS = 40;
 const SWIPE_SEED_POOL_RECENT = 25;
 const SWIPE_SEED_POOL_OLDER = 10;
 
+/**
+ * Les onze genres que CinéMatch interroge (voir `GENRE_TMDB_IDS`).
+ *
+ * Ce ne sont pas « les genres TMDB » : ce sont ceux dont le moteur se sert
+ * pour trancher une soirée. C'est donc exactement eux que la Galerie doit
+ * couvrir, et donc eux que le deck cherche à remplir. Histoire, Guerre,
+ * Western, Documentaire et Téléfilm n'entrent pas dans le compte : les
+ * proposer au titre de la couverture ferait balayer des cartes pour un
+ * terrain que personne ne mesure ensuite.
+ */
+const SWIPE_COVERAGE_GENRES = [
+  18, 35, 53, 28, 10749, 27, 80, 12, 878, 14, 10751,
+];
+/**
+ * Films visés par genre avant qu'un genre cesse d'être « en manque ».
+ *
+ * Huit, parce que la Mémoire demande cent films et qu'un film porte deux à
+ * trois genres : le signal de manque reste donc vivant pendant presque toute
+ * la montée, et s'éteint de lui-même quand le terrain est couvert. Plus haut,
+ * on imposerait vingt films d'horreur à quelqu'un qui n'en veut pas.
+ */
+const SWIPE_COVERAGE_TARGET = 8;
+/** Genres sondés par lot au titre de la couverture. */
+const SWIPE_COVERAGE_PROBES = 3;
+/**
+ * Cartes d'un même lot pouvant partager un genre, au plus.
+ *
+ * Vingt-cinq cartes portant deux à trois genres font une soixantaine de
+ * places pour onze genres, soit six par genre en moyenne : huit laisse
+ * respirer un goût marqué et coupe net la série de huit thrillers d'affilée.
+ */
+const SWIPE_GENRE_CAP = 8;
+
 /** D'où vient un candidat — sert aux quotas de mix et au debug. */
 type SwipeSource =
   | 'neighbors'
@@ -5177,6 +5210,7 @@ type SwipeSource =
   | 'pillars'
   | 'franchise'
   | 'people'
+  | 'coverage'
   | 'exploration';
 
 interface SwipeCandidate extends DiscoverRow {
@@ -5193,6 +5227,14 @@ interface TasteProfile {
   gallerySize: number;
   /** Poids 0..1 par genre TMDB, normalisés sur le genre dominant. */
   genreWeights: Map<number, number>;
+  /**
+   * Nombre **brut** de films de la galerie par genre, sans pondération de
+   * récence. Les poids disent ce que la personne regarde en ce moment ; ces
+   * comptes-là disent ce qui manque, et un trou ne se pondère pas.
+   */
+  genreCounts: Map<number, number>;
+  /** Nombre brut de films par décennie, pour la même raison. */
+  decadeCounts: Map<number, number>;
   /** Poids 0..1 par décennie (1990, 2000, ...). */
   decadeWeights: Map<number, number>;
   /** Note TMDB moyenne des films de la galerie. */
@@ -5389,6 +5431,8 @@ function buildTasteProfile(
 
   const rawGenres = new Map<number, number>();
   const rawDecades = new Map<number, number>();
+  const genreCounts = new Map<number, number>();
+  const decadeCounts = new Map<number, number>();
   const ratings: number[] = [];
   const logVoteCounts: number[] = [];
 
@@ -5397,10 +5441,12 @@ function buildTasteProfile(
     const weight = 1 + Math.max(0, (20 - index) / 20);
     for (const genreId of entry.genreIds) {
       rawGenres.set(genreId, (rawGenres.get(genreId) ?? 0) + weight);
+      genreCounts.set(genreId, (genreCounts.get(genreId) ?? 0) + 1);
     }
     const decade = decadeOf(entry.releaseDate);
     if (decade !== null) {
       rawDecades.set(decade, (rawDecades.get(decade) ?? 0) + weight);
+      decadeCounts.set(decade, (decadeCounts.get(decade) ?? 0) + 1);
     }
     if (typeof entry.voteAverage === 'number' && entry.voteAverage > 0) {
       ratings.push(entry.voteAverage);
@@ -5450,6 +5496,8 @@ function buildTasteProfile(
   return {
     gallerySize: entries.length,
     genreWeights: normalizeWeights(rawGenres),
+    genreCounts,
+    decadeCounts,
     decadeWeights: normalizeWeights(rawDecades),
     meanRating: ratings.length > 0 ?
       ratings.reduce((a, b) => a + b, 0) / ratings.length : 7,
@@ -5513,6 +5561,64 @@ function targetDecades(profile: TasteProfile): number[] {
       .map(([decade]) => decade);
   if (known.length > 0) return known;
   return shuffled([1990, 2000, 2010, 2020]).slice(0, 2);
+}
+
+/**
+ * Les genres de couverture où la galerie est maigre, du plus creux au moins
+ * creux. C'est la liste de courses du deck.
+ * @param {TasteProfile} profile Profil de goût.
+ * @return {number[]} ids de genres TMDB en manque.
+ */
+function deficientGenres(profile: TasteProfile): number[] {
+  const banned = profile.declared.bannedGenreIDs;
+  return SWIPE_COVERAGE_GENRES
+      .filter((genreId) => !banned.has(genreId))
+      .filter((genreId) =>
+        (profile.genreCounts.get(genreId) ?? 0) < SWIPE_COVERAGE_TARGET)
+      .sort((a, b) =>
+        (profile.genreCounts.get(a) ?? 0) - (profile.genreCounts.get(b) ?? 0));
+}
+
+/**
+ * Ce que ce film apporterait à la couverture, entre 0 et 1.
+ *
+ * C'est la pièce qui empêche le deck de se refermer sur un genre. Le score de
+ * goût tire vers ce que la personne regarde déjà ; celui-ci tire vers ce qu'on
+ * n'a pas encore mesuré, et c'est ce dont CinéMatch a besoin — un profil bâti
+ * sur quatre-vingts thrillers ne sait pas trancher une soirée en famille.
+ * @param {SwipeCandidate} row Candidat.
+ * @param {TasteProfile} profile Profil de goût.
+ * @return {number} Gain entre 0 et 1.
+ */
+function coverageGain(row: SwipeCandidate, profile: TasteProfile): number {
+  let best = 0;
+  for (const genreId of row.genre_ids ?? []) {
+    if (!SWIPE_COVERAGE_GENRES.includes(genreId)) continue;
+    if (profile.declared.bannedGenreIDs.has(genreId)) continue;
+    const owned = profile.genreCounts.get(genreId) ?? 0;
+    const deficit = clamp01(
+        (SWIPE_COVERAGE_TARGET - owned) / SWIPE_COVERAGE_TARGET,
+    );
+    // Là où la personne n'a aucun vécu, insister coûte des cartes pour rien :
+    // le ratio appris au swipe amortit le manque sans jamais l'interdire. Un
+    // genre balayé « pas vu » vingt fois garde 60 % de son gain, pas zéro.
+    const appetite = clamp01(
+        0.5 + (profile.genreLikeRatio.get(genreId) ?? 0.5),
+    );
+    best = Math.max(best, deficit * appetite);
+  }
+
+  // Une décennie absente compte aussi : le détail des Horizons en demande
+  // quatre, et les axes de CinéMatch s'en servent. Pas avant que la galerie
+  // existe, sinon toutes les décennies sont absentes et le bonus devient une
+  // constante qui ne départage rien.
+  if (profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE) {
+    const decade = decadeOf(row.release_date);
+    if (decade !== null && (profile.decadeCounts.get(decade) ?? 0) === 0) {
+      best = Math.max(best, 0.5);
+    }
+  }
+  return clamp01(best);
 }
 
 /**
@@ -5629,6 +5735,45 @@ async function fetchPillarCandidates(
 }
 
 /**
+ * Source F — la couverture : les films les plus vus des genres où la galerie
+ * est maigre.
+ *
+ * Le plancher de notoriété reste celui du démarrage à froid **même pour un
+ * profil mature**, et c'est tout le principe : on ne peut demander « tu l'as
+ * vu ? » dans un genre étranger à quelqu'un que sur des films que tout le
+ * monde a vus. Un film de genre pointu dans un genre qu'il ne pratique pas
+ * est une carte perdue d'avance.
+ * @param {TasteProfile} profile Profil de goût.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<DiscoverRow[]>} Candidats de couverture.
+ */
+async function fetchCoverageCandidates(
+    profile: TasteProfile, ctx: TMDBContext,
+): Promise<DiscoverRow[]> {
+  const deficient = deficientGenres(profile);
+  if (deficient.length === 0) return [];
+
+  // Les plus creux d'abord, mais tirés au sort parmi les six premiers : deux
+  // lots consécutifs ne doivent pas sonder les trois mêmes genres, sinon on
+  // repasse les mêmes vingt films jusqu'à épuisement.
+  const probes = shuffled(deficient.slice(0, 6))
+      .slice(0, SWIPE_COVERAGE_PROBES);
+
+  const requests = probes.map((genreId) => tmdbGET('/discover/movie', {
+    'region': DEFAULT_REGION,
+    'include_adult': 'false',
+    'include_video': 'false',
+    'with_genres': String(genreId),
+    'vote_count.gte': String(SWIPE_COLD_VOTE_COUNT_FLOOR),
+    'sort_by': 'vote_count.desc',
+    'page': String(1 + Math.floor(Math.random() * 3)),
+  }, ctx));
+
+  const settled = await Promise.allSettled(requests);
+  return settled.flatMap((result) => rowsFrom(result, 'results'));
+}
+
+/**
  * Sources D et E — franchises et têtes d'affiche récurrentes. Les deux
  * partagent les mêmes appels de détail (`append_to_response=credits`) : une
  * seule requête par graine sert à la fois à trouver la saga et le casting.
@@ -5714,17 +5859,25 @@ async function fetchSwipePool(
   const voteCountFloor = profile.gallerySize >= SWIPE_PROFILE_MATURE_SIZE ?
     SWIPE_VOTE_COUNT_FLOOR : SWIPE_COLD_VOTE_COUNT_FLOOR;
 
-  const [neighbors, profiled, pillars, franchiseAndPeople] = await Promise.all([
+  const [
+    neighbors, profiled, pillars, franchiseAndPeople, coverage,
+  ] = await Promise.all([
     fetchNeighborCandidates(profile, ctx),
     fetchProfiledCandidates(profile, voteCountFloor, ctx),
     fetchPillarCandidates(profile, ctx),
     fetchFranchiseAndPeopleCandidates(profile, ctx),
+    fetchCoverageCandidates(profile, ctx),
   ]);
 
+  // L'ordre décide de l'étiquette d'un film ramené par plusieurs sources, et
+  // donc du quota qui le compte. La couverture passe **devant** les deux
+  // sources `/discover` génériques, qu'elle recoupe largement : derrière
+  // elles, son quota serait systématiquement à sec.
   const groups: [SwipeSource, DiscoverRow[]][] = [
     ['franchise', franchiseAndPeople.franchise],
     ['neighbors', neighbors],
     ['people', franchiseAndPeople.people],
+    ['coverage', coverage],
     ['profile', profiled],
     ['pillars', pillars],
   ];
@@ -5823,6 +5976,9 @@ const SWIPE_SOURCE_BONUS: Record<SwipeSource, number> = {
   neighbors: 4,
   people: 3,
   pillars: 2,
+  // Même force de signal que les piliers : c'est le même tri par notoriété,
+  // cadré sur un genre. Le gain de couverture, lui, est déjà dans le score.
+  coverage: 2,
   profile: 0,
   exploration: 0,
 };
@@ -5836,8 +5992,15 @@ const SWIPE_SOURCE_BONUS: Record<SwipeSource, number> = {
  * @return {number} Score final.
  */
 function swipeScore(row: SwipeCandidate, profile: TasteProfile): number {
+  // Les poids disent à quoi sert l'écran. « Probablement vu » reste
+  // majoritaire : une carte qu'on n'a pas vue ne remplit rien. Mais le goût
+  // passe derrière la couverture, parce que **le deck ne sert pas à plaire,
+  // il sert à mesurer** : un film dont on sait déjà qu'il sera aimé n'apprend
+  // rien, et c'est CinéMatch, pas le deck, qui a la charge de plaire.
   const base = 100 * (
-    0.55 * seenLikelihood(row, profile) + 0.45 * tasteMatch(row, profile)
+    0.55 * seenLikelihood(row, profile) +
+    0.25 * coverageGain(row, profile) +
+    0.20 * tasteMatch(row, profile)
   );
   return base + SWIPE_SOURCE_BONUS[row.source] + Math.random() * 4;
 }
@@ -5855,8 +6018,9 @@ function sourceQuotas(profile: TasteProfile): [SwipeSource, number][] {
 
   if (profile.gallerySize < SWIPE_PROFILE_MIN_SIZE) {
     return [
-      ['pillars', share(0.7)],
-      ['profile', share(0.2)],
+      ['pillars', share(0.45)],
+      ['coverage', share(0.3)],
+      ['profile', share(0.15)],
       ['neighbors', share(0.1)],
       ['franchise', 0],
       ['people', 0],
@@ -5864,17 +6028,19 @@ function sourceQuotas(profile: TasteProfile): [SwipeSource, number][] {
   }
   if (profile.gallerySize < SWIPE_PROFILE_MATURE_SIZE) {
     return [
-      ['neighbors', share(0.3)],
-      ['pillars', share(0.3)],
-      ['profile', share(0.25)],
+      ['neighbors', share(0.25)],
+      ['coverage', share(0.25)],
+      ['pillars', share(0.2)],
+      ['profile', share(0.2)],
       ['franchise', share(0.1)],
-      ['people', share(0.05)],
+      ['people', 0],
     ];
   }
   return [
-    ['neighbors', share(0.35)],
-    ['profile', share(0.25)],
-    ['pillars', share(0.15)],
+    ['neighbors', share(0.3)],
+    ['coverage', share(0.2)],
+    ['profile', share(0.2)],
+    ['pillars', share(0.1)],
     ['franchise', share(0.1)],
     ['people', share(0.1)],
   ];
@@ -5893,34 +6059,56 @@ function selectSwipeDeck(
 ): SwipeCandidate[] {
   const picked: SwipeCandidate[] = [];
   const used = new Set<number>();
+  // Charge du lot, genre par genre. C'est elle qui tient le plafond : la
+  // pénalité de `orderForDeck` ne faisait que **ranger** un lot monochrome,
+  // elle ne l'empêchait pas d'être composé.
+  const genreLoad = new Map<number, number>();
+
+  const fits = (candidate: SwipeCandidate) =>
+    (candidate.genre_ids ?? [])
+        .every((id) => (genreLoad.get(id) ?? 0) < SWIPE_GENRE_CAP);
+
+  const take = (candidate: SwipeCandidate, source?: SwipeSource) => {
+    picked.push(source ? {...candidate, source} : candidate);
+    used.add(candidate.id);
+    for (const id of candidate.genre_ids ?? []) {
+      genreLoad.set(id, (genreLoad.get(id) ?? 0) + 1);
+    }
+  };
 
   const explorationSlots = profile.gallerySize < SWIPE_PROFILE_MIN_SIZE ?
     0 : Math.max(1, Math.round(SWIPE_FEED_SIZE * 0.05));
+  const quotaCeiling = SWIPE_FEED_SIZE - explorationSlots;
 
   for (const [source, quota] of sourceQuotas(profile)) {
     if (quota <= 0) continue;
     for (const candidate of scored) {
-      if (picked.length >= SWIPE_FEED_SIZE - explorationSlots) break;
+      if (picked.length >= quotaCeiling) break;
       if (candidate.source !== source || used.has(candidate.id)) continue;
-      picked.push(candidate);
-      used.add(candidate.id);
+      if (!fits(candidate)) continue;
+      take(candidate);
       if (picked.filter((c) => c.source === source).length >= quota) break;
     }
   }
 
   // Une source peut être à sec (galerie sans franchise, TMDB qui renvoie peu) :
-  // on complète au score global plutôt que de rendre un lot incomplet.
+  // on complète au score global plutôt que de rendre un lot incomplet. Deux
+  // passes, parce que le plafond de genre doit céder plutôt que de laisser le
+  // lot court — un lot de douze cartes se vide en vingt secondes.
   for (const candidate of scored) {
-    if (picked.length >= SWIPE_FEED_SIZE - explorationSlots) break;
+    if (picked.length >= quotaCeiling) break;
+    if (used.has(candidate.id) || !fits(candidate)) continue;
+    take(candidate);
+  }
+  for (const candidate of scored) {
+    if (picked.length >= quotaCeiling) break;
     if (used.has(candidate.id)) continue;
-    picked.push(candidate);
-    used.add(candidate.id);
+    take(candidate);
   }
 
   const leftovers = shuffled(scored.filter((c) => !used.has(c.id)));
   for (const candidate of leftovers.slice(0, explorationSlots)) {
-    picked.push({...candidate, source: 'exploration'});
-    used.add(candidate.id);
+    take(candidate, 'exploration');
   }
 
   return orderForDeck(picked);
