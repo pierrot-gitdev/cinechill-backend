@@ -10056,6 +10056,88 @@ function parseTmdbIdList(raw: unknown, max: number): number[] {
   return out;
 }
 
+/** Remplacer les films déjà vus d'une proposition : ce que l'app envoie. */
+interface CineMatchReplace {
+  /** La séance des cinq, à compléter plutôt qu'à doubler. */
+  sessionId: string | null;
+  /** Les films restés dans la proposition : ils ne reviennent pas. */
+  keepIds: number[];
+  /** Les films déjà vus : un remplaçant chacun. */
+  seenIds: number[];
+}
+
+/**
+ * Relit le bloc `replace` d'une demande de cinq films.
+ *
+ * On peut avoir vu plusieurs des cinq : l'app les marque d'abord, sans
+ * rien demander, puis demande une seule fois leurs remplaçants. Les films
+ * gardés restent à leur place côté app ; le serveur ne renvoie que les
+ * remplaçants, un par film vu.
+ * @param {unknown} raw Bloc `replace` du corps de requête.
+ * @return {CineMatchReplace | null} Le remplacement, ou `null`.
+ */
+function parseCineMatchReplace(raw: unknown): CineMatchReplace | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  const seenIds = parseTmdbIdList(record.seenIds, 5);
+  if (seenIds.length === 0) return null;
+  const sessionId = typeof record.sessionId === 'string' &&
+    /^[A-Za-z0-9]{1,64}$/.test(record.sessionId) ? record.sessionId : null;
+  return {
+    sessionId,
+    keepIds: parseTmdbIdList(record.keepIds, 5)
+        .filter((id) => !seenIds.includes(id)),
+    seenIds,
+  };
+}
+
+/**
+ * Écrit la séance des cinq, ou la complète pour un remplacement.
+ *
+ * Un remplacement ne crée pas de seconde séance : les remplaçants
+ * rejoignent celle des cinq, pour que le lancement de l'un d'eux s'y
+ * accroche comme celui des autres, et les films vus y sont notés.
+ * @param {admin.firestore.CollectionReference} history La collection.
+ * @param {CineMatchReplace | null} replace Le remplacement, s'il y en a un.
+ * @param {number[]} ids Les films proposés.
+ * @param {Object[]} films Leur bloc d'historique.
+ * @param {Object} answers Les réponses de la soirée.
+ * @return {Promise<string>} L'identifiant de la séance.
+ */
+async function writeFiveHistory(
+    history: admin.firestore.CollectionReference,
+    replace: CineMatchReplace | null,
+    ids: number[],
+    films: Record<string, unknown>[],
+    answers: Record<string, unknown>,
+): Promise<string> {
+  const now = admin.firestore.Timestamp.now();
+  if (replace?.sessionId) {
+    const ref = history.doc(replace.sessionId);
+    const snap = await ref.get();
+    if (snap.exists && snap.get('kind') === 'five') {
+      await ref.set({
+        tmdbIds: admin.firestore.FieldValue.arrayUnion(...ids),
+        seenIds: admin.firestore.FieldValue.arrayUnion(...replace.seenIds),
+        films: admin.firestore.FieldValue.arrayUnion(
+            ...films.map((film) => ({...film, replacement: true}))),
+        replacedAt: now,
+      }, {merge: true});
+      return ref.id;
+    }
+  }
+  const ref = history.doc();
+  await ref.set({
+    createdAt: now,
+    kind: 'five',
+    tmdbIds: ids,
+    films,
+    answers,
+    ...(replace ? {seenIds: replace.seenIds} : {}),
+  });
+  return ref.id;
+}
+
 /**
  * Relit la situation de la soirée, avec des défauts sûrs.
  * @param {unknown} raw Bloc `situation` du corps de requête.
@@ -11322,71 +11404,96 @@ export const getCineMatchFive = onRequest(
             Math.max(0, Math.min(20, Math.floor(hesitationsRaw))) : 0,
         };
         const situation = parseCineMatchSituation(body.situation);
+        const replace = parseCineMatchReplace(body.replace);
+        // Ni les films gardés ni les films vus ne reviennent.
+        const withReplace = (setup: CineMatchSetup): CineMatchSetup =>
+          replace ? {
+            ...setup,
+            extraExcludedIds: [
+              ...(setup.extraExcludedIds ?? []),
+              ...replace.keepIds,
+              ...replace.seenIds,
+            ],
+          } : setup;
+        // Un remplacement ne renvoie que ce qui manque, dans l'ordre.
+        const wanted = <T>(picks: T[]): T[] =>
+          replace ? picks.slice(0, replace.seenIds.length) : picks;
 
         const db = getAdmin().firestore();
         const ctx = tmdb(req, res);
 
         if (format === 'series') {
-          const setup = await loadSeriesSetup(db, uid, situation, ctx);
+          const setup = withReplace(
+              await loadSeriesSetup(db, uid, situation, ctx));
           const {result, enriched} = await runCineMatchEngine(
               setup, evening,
               (relaxed) =>
                 buildSeriesCandidates(db, setup, evening, relaxed, ctx),
               engine.recommendFive, (r) => r.films.length >= 3,
           );
-          const picks =
-            result.films.filter((pick) => enriched.has(pick.film.id));
+          const picks = wanted(
+              result.films.filter((pick) => enriched.has(pick.film.id)));
           if (picks.length === 0) {
-            res.status(409).json({error: 'no_candidates'});
+            // Un remplacement sans remplaçant n'est pas une erreur : l'app
+            // garde sa proposition et le dit.
+            if (replace) {
+              res.status(200).json({films: [], widened: result.widened});
+            } else {
+              res.status(409).json({error: 'no_candidates'});
+            }
             return;
           }
-          const historyRef = db.collection('users').doc(uid)
-              .collection(cineMatchStoreFor('series').history).doc();
-          await historyRef.set({
-            createdAt: admin.firestore.Timestamp.now(),
-            kind: 'five',
-            tmdbIds: picks.map((pick) => pick.film.id),
-            films: seriesHistoryFilms(picks, enriched),
-            answers: {situation, want, engagement},
-          });
+          const sessionId = await writeFiveHistory(
+              db.collection('users').doc(uid)
+                  .collection(cineMatchStoreFor('series').history),
+              replace,
+              picks.map((pick) => pick.film.id),
+              seriesHistoryFilms(picks, enriched),
+              {situation, want, engagement},
+          );
           res.status(200).json({
             films: picks.map((pick) =>
               cineMatchSeriesJSON(enriched.get(pick.film.id) as TvMeta)),
             widened: result.widened,
-            sessionId: historyRef.id,
+            sessionId,
           });
           return;
         }
 
-        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
+        const setup = withReplace(
+            await loadCineMatchSetup(db, uid, situation, ctx));
         const {result, enriched} = await runCineMatchEngine(
             setup, evening,
             (relaxed) => buildCineMatchCandidates(setup, evening, relaxed, ctx),
             engine.recommendFive, (r) => r.films.length >= 3,
         );
 
-        const picks = result.films.filter((pick) => enriched.has(pick.film.id));
+        const picks = wanted(
+            result.films.filter((pick) => enriched.has(pick.film.id)));
         if (picks.length === 0) {
-          res.status(409).json({error: 'no_candidates'});
+          if (replace) {
+            res.status(200).json({films: [], widened: result.widened});
+          } else {
+            res.status(409).json({error: 'no_candidates'});
+          }
           return;
         }
 
-        const historyRef = db.collection('users').doc(uid)
-            .collection('recommendationHistory').doc();
-        await historyRef.set({
-          createdAt: admin.firestore.Timestamp.now(),
-          kind: 'five',
-          tmdbIds: picks.map((pick) => pick.film.id),
-          films: cineMatchHistoryFilms(picks, enriched),
-          answers: {situation, want, energy},
-        });
+        const sessionId = await writeFiveHistory(
+            db.collection('users').doc(uid)
+                .collection('recommendationHistory'),
+            replace,
+            picks.map((pick) => pick.film.id),
+            cineMatchHistoryFilms(picks, enriched),
+            {situation, want, energy},
+        );
 
         res.status(200).json({
           films: picks.map((pick) =>
             cineMatchFiveFilmJSON(enriched.get(pick.film.id) as
               EnrichedCandidate)),
           widened: result.widened,
-          sessionId: historyRef.id,
+          sessionId,
         });
       } catch (error) {
         if (sendTMDBError(error, res)) return;
