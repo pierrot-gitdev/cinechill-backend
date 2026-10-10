@@ -6,6 +6,7 @@ import {Response} from 'express';
 import * as admin from 'firebase-admin';
 import * as engine from './cinematch/engine';
 import * as series from './series';
+import * as deck from './deck/engine';
 
 /**
  * Initialise l'Admin SDK une seule fois, quel que soit le nombre de fonctions
@@ -5718,45 +5719,36 @@ export const finalizeRecommendations = onRequest(
 );
 
 // ===========================================================================
-// Swipe — getSwipeFeed / recordSwipes
+// Swipe — getSwipeFeed / recordSwipes / getProbeGrid / getDeckSheet
 //
-// Alimente le deck de swipe. Construit un profil de goût à partir de la
-// galerie et des compteurs de swipe, tire des candidats sur cinq sources TMDB
-// complémentaires, exclut ce que l'utilisateur a déjà classé ou écarté
-// récemment, puis ordonne par « probabilité qu'il l'ait vu » × « correspond à
-// son style ». Voir le plan produit Swipe pour le détail de chaque étape.
+// Alimente le deck Découvrir. Le moteur (`deck/engine.ts`) tient le modèle
+// de « déjà vu » de chaque personne et choisit les cartes ; ici, on lit et
+// on écrit Firestore, on interroge TMDB, et on garde le vivier en cache. Le
+// pourquoi de chaque pièce est dans l'audit du 11 octobre 2026 : le moteur
+// précédent classait par notoriété et n'entendait presque pas les « pas vu ».
 // ===========================================================================
 
-/** Nombre de cartes renvoyées par lot. */
-const SWIPE_FEED_SIZE = 25;
-/** Films de la galerie utilisés comme graines de `/recommendations`. */
-const SWIPE_SEEDS_RECOMMENDATIONS = 4;
-/** Films de la galerie utilisés comme graines de `/similar`. */
-const SWIPE_SEEDS_SIMILAR = 2;
-/** Films dont on charge le détail (franchise + casting, un seul appel). */
-const SWIPE_SEEDS_DETAILS = 2;
-/** Plancher de notoriété quand le profil est déjà nourri. */
-const SWIPE_VOTE_COUNT_FLOOR = 500;
-/** Plancher de notoriété à froid — on ne propose que du très vu. */
-const SWIPE_COLD_VOTE_COUNT_FLOOR = 3000;
-/** Taille de galerie à partir de laquelle le profil est jugé mature. */
-const SWIPE_PROFILE_MATURE_SIZE = 30;
-/** Galerie en-dessous de laquelle les poids de genre restent neutres. */
-const SWIPE_PROFILE_MIN_SIZE = 8;
-/** Cooldown de base d'un film écarté, doublé à chaque nouveau skip. */
-const SWIPE_SKIP_BASE_COOLDOWN_DAYS = 14;
-/** Plafond du cooldown — au-delà le film ne revient plus en pratique. */
-const SWIPE_SKIP_MAX_COOLDOWN_DAYS = 180;
+/**
+ * Cooldown de base d'un film écarté, doublé à chaque nouveau skip.
+ *
+ * Quatre-vingt-dix jours, et non plus quatorze : un film qu'on n'a pas vu en
+ * octobre, on ne l'a pas vu davantage début novembre, et le revoir au bout
+ * de deux semaines lassait.
+ */
+const SWIPE_SKIP_BASE_COOLDOWN_DAYS = 90;
+/** Plafond du cooldown : au-delà, le film ne revient plus en pratique. */
+const SWIPE_SKIP_MAX_COOLDOWN_DAYS = 365;
+/**
+ * Cooldown d'un opus déduit d'un « pas vu » sur la tête de sa saga. C'est
+ * une déduction, pas une déclaration, et elle doit s'oublier vite.
+ */
+const SWIPE_SAGA_SIBLING_COOLDOWN_DAYS = 14;
 /** Nombre max d'exclusions « skip » chargées par appel. */
 const SWIPE_MAX_ACTIVE_SKIPS = 1000;
 /** Cartes précédentes prises en compte par la pénalité de diversité. */
 const SWIPE_DIVERSITY_WINDOW = 3;
 /** Décisions acceptées en un seul appel à `recordSwipes`. */
 const SWIPE_MAX_DECISIONS = 40;
-/** Graines de galerie parmi lesquelles on tire (biais vers les récents). */
-const SWIPE_SEED_POOL_RECENT = 25;
-const SWIPE_SEED_POOL_OLDER = 10;
-
 /**
  * Les onze genres que CinéMatch interroge (voir `GENRE_TMDB_IDS`).
  *
@@ -5771,25 +5763,6 @@ const SWIPE_COVERAGE_GENRES = [
   18, 35, 53, 28, 10749, 27, 80, 12, 878, 14, 10751,
 ];
 /**
- * Films visés par genre avant qu'un genre cesse d'être « en manque ».
- *
- * Huit, parce que la Mémoire demande cent films et qu'un film porte deux à
- * trois genres : le signal de manque reste donc vivant pendant presque toute
- * la montée, et s'éteint de lui-même quand le terrain est couvert. Plus haut,
- * on imposerait vingt films d'horreur à quelqu'un qui n'en veut pas.
- */
-const SWIPE_COVERAGE_TARGET = 8;
-/** Genres sondés par lot au titre de la couverture. */
-const SWIPE_COVERAGE_PROBES = 3;
-/**
- * Cartes d'un même lot pouvant partager un genre, au plus.
- *
- * Vingt-cinq cartes portant deux à trois genres font une soixantaine de
- * places pour onze genres, soit six par genre en moyenne : huit laisse
- * respirer un goût marqué et coupe net la série de huit thrillers d'affilée.
- */
-const SWIPE_GENRE_CAP = 8;
-/**
  * Sagas résolues par lot quand le cache global ne les connaît pas encore.
  *
  * `/discover` et `/recommendations` ne disent pas à quelle saga appartient un
@@ -5799,16 +5772,15 @@ const SWIPE_GENRE_CAP = 8;
 const SWIPE_SAGA_RESOLVE_PER_BATCH = 12;
 /** Sagas dont on propage un « pas vu » dans un même appel, au plus. */
 const SWIPE_SAGA_SKIP_PROPAGATION = 3;
-
-/** D'où vient un candidat — sert aux quotas de mix et au debug. */
+/** D'où vient un candidat : sert à la composition du lot et aux journaux. */
 type SwipeSource =
   | 'neighbors'
-  | 'profile'
-  | 'pillars'
+  | 'family'
+  | 'promesse'
+  | 'coverage'
   | 'franchise'
   | 'people'
-  | 'coverage'
-  | 'exploration';
+  | 'pillars';
 
 interface SwipeCandidate extends DiscoverRow {
   source: SwipeSource;
@@ -5817,41 +5789,11 @@ interface SwipeCandidate extends DiscoverRow {
   collectionId?: number | null;
   /** Nombre d'opus de cette saga, pour que le client sache quoi proposer. */
   collectionTotal?: number | null;
+  /** Probabilité estimée d'avoir vu le film, renvoyée pour le journal. */
+  pSeen?: number;
+  families?: string[];
+  kind?: string;
 }
-
-/**
- * Profil de goût dérivé de la galerie (ce que l'utilisateur a vu) et des
- * compteurs de swipe (ce qu'il reconnaît ou pas). Les deux se complètent : la
- * galerie dit le style, les compteurs disent où il a réellement du vécu.
- */
-interface TasteProfile {
-  gallerySize: number;
-  /** Poids 0..1 par genre TMDB, normalisés sur le genre dominant. */
-  genreWeights: Map<number, number>;
-  /**
-   * Nombre **brut** de films de la galerie par genre, sans pondération de
-   * récence. Les poids disent ce que la personne regarde en ce moment ; ces
-   * comptes-là disent ce qui manque, et un trou ne se pondère pas.
-   */
-  genreCounts: Map<number, number>;
-  /** Nombre brut de films par décennie, pour la même raison. */
-  decadeCounts: Map<number, number>;
-  /** Poids 0..1 par décennie (1990, 2000, ...). */
-  decadeWeights: Map<number, number>;
-  /** Note TMDB moyenne des films de la galerie. */
-  meanRating: number;
-  /** log10 du vote_count médian de la galerie — le niveau de « niche ». */
-  medianLogVoteCount: number | null;
-  /** ids TMDB tirés de la galerie pour servir de graines. */
-  seedIds: number[];
-  /** Ratio lissé vu/(vu+écarté) par genre — module le goût. */
-  genreLikeRatio: Map<number, number>;
-  /** Ratio lissé vu/(vu+écarté) par décennie — module la probabilité de vu. */
-  decadeSeenRatio: Map<number, number>;
-  /** Ce que l'utilisateur a déclaré dans les réglages. */
-  declared: DeclaredProfile;
-}
-
 /** Compteurs agrégés persistés dans `preferences/swipeProfile`. */
 interface SwipeCounters {
   genreSeen: Record<string, number>;
@@ -5860,7 +5802,6 @@ interface SwipeCounters {
   decadeSeen: Record<string, number>;
   decadeSkipped: Record<string, number>;
 }
-
 /**
  * Ce que l'utilisateur a déclaré lui-même dans les réglages, par opposition à
  * ce que l'app déduit de ses swipes. Lu côté serveur plutôt que transmis par le
@@ -5872,12 +5813,10 @@ interface DeclaredProfile {
   /** Décennie de naissance (1970, 1980, …), ou null si non renseignée. */
   birthDecade: number | null;
 }
-
 const EMPTY_DECLARED_PROFILE: DeclaredProfile = {
   bannedGenreIDs: new Set<number>(),
   birthDecade: null,
 };
-
 /**
  * Lit `users/{uid}/preferences/profile`, en tolérant son absence — la grande
  * majorité des comptes n'aura jamais ouvert les réglages.
@@ -5909,27 +5848,6 @@ async function fetchDeclaredProfile(
 
   return {bannedGenreIDs, birthDecade};
 }
-
-/**
- * Pondère la probabilité d'avoir vu un film selon l'âge de l'utilisateur.
- *
- * Asymétrique à dessein : tout ce qui sort après votre naissance vous reste
- * accessible en salle, à la télé ou en streaming, alors qu'un film antérieur
- * demande une démarche. À 25 ans, on n'a pas la même probabilité d'avoir vu un
- * film de 1975 qu'à 55 ans.
- * @param {?number} decade Décennie du film.
- * @param {?number} birthDecade Décennie de naissance déclarée.
- * @return {number} Multiplicateur entre 0.45 et 1.
- */
-function generationFactor(
-    decade: number | null, birthDecade: number | null,
-): number {
-  if (decade === null || birthDecade === null) return 1;
-  if (decade >= birthDecade) return 1;
-  const decadesBefore = (birthDecade - decade) / 10;
-  return Math.max(0.45, 1 - 0.14 * decadesBefore);
-}
-
 /**
  * Décennie d'un film à partir de sa date de sortie TMDB.
  * @param {?string} releaseDate Date `YYYY-MM-DD` ou null.
@@ -5941,18 +5859,6 @@ function decadeOf(releaseDate: string | null | undefined): number | null {
   if (!Number.isFinite(year) || year < 1900) return null;
   return Math.floor(year / 10) * 10;
 }
-
-/**
- * Ratio lissé (Laplace) entre signaux positifs et négatifs — vaut 0.5 tant
- * qu'on n'a pas de données, et bouge d'autant plus vite qu'elles s'accumulent.
- * @param {number} positive Compteur positif.
- * @param {number} negative Compteur négatif.
- * @return {number} Ratio entre 0 et 1.
- */
-function smoothedRatio(positive: number, negative: number): number {
-  return (positive + 2) / (positive + negative + 4);
-}
-
 /**
  * Borne une valeur dans [0, 1].
  * @param {number} value Valeur à borner.
@@ -5961,22 +5867,6 @@ function smoothedRatio(positive: number, negative: number): number {
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
-
-/**
- * Normalise une table de poids bruts sur son maximum, pour que le critère
- * dominant vaille 1 quelle que soit la taille de la galerie.
- * @param {Map<K, number>} raw Poids bruts accumulés.
- * @return {Map<K, number>} Poids normalisés entre 0 et 1.
- */
-function normalizeWeights<K>(raw: Map<K, number>): Map<K, number> {
-  let max = 0;
-  for (const value of raw.values()) max = Math.max(max, value);
-  if (max <= 0) return new Map<K, number>();
-  const normalized = new Map<K, number>();
-  for (const [key, value] of raw) normalized.set(key, value / max);
-  return normalized;
-}
-
 /**
  * Lit les compteurs de swipe, en tolérant un document absent ou partiel.
  * @param {admin.firestore.DocumentSnapshot} snap Snapshot du document.
@@ -6002,127 +5892,6 @@ function parseSwipeCounters(
     decadeSkipped: asRecord(data.decadeSkipped),
   };
 }
-
-/**
- * Construit le profil de goût. Les entrées de galerie récentes pèsent jusqu'à
- * deux fois plus que les anciennes : le feed suit la période que l'utilisateur
- * est en train d'explorer plutôt que la moyenne de toute sa vie de spectateur.
- * @param {admin.firestore.QueryDocumentSnapshot[]} galleryDocs Docs galerie.
- * @param {SwipeCounters} counters Compteurs de swipe agrégés.
- * @param {DeclaredProfile} declared Préférences déclarées au questionnaire.
- * @return {TasteProfile} Profil prêt pour le scoring.
- */
-function buildTasteProfile(
-    galleryDocs: admin.firestore.QueryDocumentSnapshot[],
-    counters: SwipeCounters,
-    declared: DeclaredProfile,
-): TasteProfile {
-  const entries = galleryDocs
-      .map((doc) => ({
-        tmdbId: doc.get('tmdbId') as number | undefined,
-        genreIds: (doc.get('genreIds') as number[] | undefined) ?? [],
-        releaseDate: doc.get('releaseDate') as string | null | undefined,
-        voteAverage: doc.get('voteAverage') as number | null | undefined,
-        voteCount: doc.get('voteCount') as number | null | undefined,
-        addedAt: doc.get('addedAt') as admin.firestore.Timestamp | undefined,
-      }))
-      .filter((entry) => typeof entry.tmdbId === 'number')
-      .sort((a, b) =>
-        (b.addedAt?.toMillis() ?? 0) - (a.addedAt?.toMillis() ?? 0));
-
-  const rawGenres = new Map<number, number>();
-  const rawDecades = new Map<number, number>();
-  const genreCounts = new Map<number, number>();
-  const decadeCounts = new Map<number, number>();
-  const ratings: number[] = [];
-  const logVoteCounts: number[] = [];
-
-  entries.forEach((entry, index) => {
-    // Les 20 ajouts les plus récents pèsent de 2x (le dernier) à 1x.
-    const weight = 1 + Math.max(0, (20 - index) / 20);
-    for (const genreId of entry.genreIds) {
-      rawGenres.set(genreId, (rawGenres.get(genreId) ?? 0) + weight);
-      genreCounts.set(genreId, (genreCounts.get(genreId) ?? 0) + 1);
-    }
-    const decade = decadeOf(entry.releaseDate);
-    if (decade !== null) {
-      rawDecades.set(decade, (rawDecades.get(decade) ?? 0) + weight);
-      decadeCounts.set(decade, (decadeCounts.get(decade) ?? 0) + 1);
-    }
-    if (typeof entry.voteAverage === 'number' && entry.voteAverage > 0) {
-      ratings.push(entry.voteAverage);
-    }
-    if (typeof entry.voteCount === 'number' && entry.voteCount > 0) {
-      logVoteCounts.push(Math.log10(entry.voteCount));
-    }
-  });
-
-  // `voteCount` n'est écrit que par les entrées ajoutées au swipe : le niveau
-  // de « niche » se construit tout seul et reste neutre tant qu'il manque des
-  // échantillons, plutôt que d'être deviné sur trop peu de films.
-  let medianLogVoteCount: number | null = null;
-  if (logVoteCounts.length >= 5) {
-    const sorted = [...logVoteCounts].sort((a, b) => a - b);
-    medianLogVoteCount = sorted[Math.floor(sorted.length / 2)];
-  }
-
-  const genreLikeRatio = new Map<number, number>();
-  const genreKeys = new Set([
-    ...Object.keys(counters.genreSeen),
-    ...Object.keys(counters.genreWanted),
-    ...Object.keys(counters.genreSkipped),
-  ]);
-  for (const key of genreKeys) {
-    const positive = (counters.genreSeen[key] ?? 0) +
-      (counters.genreWanted[key] ?? 0);
-    genreLikeRatio.set(
-        Number(key), smoothedRatio(positive, counters.genreSkipped[key] ?? 0),
-    );
-  }
-
-  const decadeSeenRatio = new Map<number, number>();
-  const decadeKeys = new Set([
-    ...Object.keys(counters.decadeSeen),
-    ...Object.keys(counters.decadeSkipped),
-  ]);
-  for (const key of decadeKeys) {
-    decadeSeenRatio.set(
-        Number(key),
-        smoothedRatio(
-            counters.decadeSeen[key] ?? 0, counters.decadeSkipped[key] ?? 0,
-        ),
-    );
-  }
-
-  return {
-    gallerySize: entries.length,
-    genreWeights: normalizeWeights(rawGenres),
-    genreCounts,
-    decadeCounts,
-    decadeWeights: normalizeWeights(rawDecades),
-    meanRating: ratings.length > 0 ?
-      ratings.reduce((a, b) => a + b, 0) / ratings.length : 7,
-    medianLogVoteCount,
-    seedIds: pickSeedIds(entries.map((entry) => entry.tmdbId as number)),
-    genreLikeRatio,
-    decadeSeenRatio,
-    declared,
-  };
-}
-
-/**
- * Tire les graines de galerie : majoritairement parmi les ajouts récents, avec
- * quelques anciens pour que le feed ne se referme pas sur la dernière lubie.
- * @param {number[]} orderedIds ids galerie, du plus récent au plus ancien.
- * @return {number[]} ids mélangés servant de graines TMDB.
- */
-function pickSeedIds(orderedIds: number[]): number[] {
-  const recent = orderedIds.slice(0, SWIPE_SEED_POOL_RECENT);
-  const older = shuffled(orderedIds.slice(SWIPE_SEED_POOL_RECENT))
-      .slice(0, SWIPE_SEED_POOL_OLDER);
-  return shuffled([...recent, ...older]);
-}
-
 /**
  * Copie mélangée (Fisher-Yates).
  * @param {T[]} items Éléments à mélanger.
@@ -6136,92 +5905,6 @@ function shuffled<T>(items: T[]): T[] {
   }
   return copy;
 }
-
-/**
- * Les genres les plus présents dans la galerie, pour le discover profilé.
- * @param {TasteProfile} profile Profil de goût.
- * @param {number} count Nombre de genres voulus.
- * @return {number[]} ids de genres TMDB, du plus fort au plus faible.
- */
-function topGenreIds(profile: TasteProfile, count: number): number[] {
-  return Array.from(profile.genreWeights.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, count)
-      .map(([genreId]) => genreId);
-}
-
-/**
- * Les décennies dominantes de la galerie, ou un éventail large à froid.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number[]} Décennies à interroger.
- */
-function targetDecades(profile: TasteProfile): number[] {
-  const known = Array.from(profile.decadeWeights.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 2)
-      .map(([decade]) => decade);
-  if (known.length > 0) return known;
-  return shuffled([1990, 2000, 2010, 2020]).slice(0, 2);
-}
-
-/**
- * Les genres de couverture où la galerie est maigre, du plus creux au moins
- * creux. C'est la liste de courses du deck.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number[]} ids de genres TMDB en manque.
- */
-function deficientGenres(profile: TasteProfile): number[] {
-  const banned = profile.declared.bannedGenreIDs;
-  return SWIPE_COVERAGE_GENRES
-      .filter((genreId) => !banned.has(genreId))
-      .filter((genreId) =>
-        (profile.genreCounts.get(genreId) ?? 0) < SWIPE_COVERAGE_TARGET)
-      .sort((a, b) =>
-        (profile.genreCounts.get(a) ?? 0) - (profile.genreCounts.get(b) ?? 0));
-}
-
-/**
- * Ce que ce film apporterait à la couverture, entre 0 et 1.
- *
- * C'est la pièce qui empêche le deck de se refermer sur un genre. Le score de
- * goût tire vers ce que la personne regarde déjà ; celui-ci tire vers ce qu'on
- * n'a pas encore mesuré, et c'est ce dont CinéMatch a besoin — un profil bâti
- * sur quatre-vingts thrillers ne sait pas trancher une soirée en famille.
- * @param {SwipeCandidate} row Candidat.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number} Gain entre 0 et 1.
- */
-function coverageGain(row: SwipeCandidate, profile: TasteProfile): number {
-  let best = 0;
-  for (const genreId of row.genre_ids ?? []) {
-    if (!SWIPE_COVERAGE_GENRES.includes(genreId)) continue;
-    if (profile.declared.bannedGenreIDs.has(genreId)) continue;
-    const owned = profile.genreCounts.get(genreId) ?? 0;
-    const deficit = clamp01(
-        (SWIPE_COVERAGE_TARGET - owned) / SWIPE_COVERAGE_TARGET,
-    );
-    // Là où la personne n'a aucun vécu, insister coûte des cartes pour rien :
-    // le ratio appris au swipe amortit le manque sans jamais l'interdire. Un
-    // genre balayé « pas vu » vingt fois garde 60 % de son gain, pas zéro.
-    const appetite = clamp01(
-        0.5 + (profile.genreLikeRatio.get(genreId) ?? 0.5),
-    );
-    best = Math.max(best, deficit * appetite);
-  }
-
-  // Une décennie absente compte aussi : le détail des Horizons en demande
-  // quatre, et les axes de CinéMatch s'en servent. Pas avant que la galerie
-  // existe, sinon toutes les décennies sont absentes et le bonus devient une
-  // constante qui ne départage rien.
-  if (profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE) {
-    const decade = decadeOf(row.release_date);
-    if (decade !== null && (profile.decadeCounts.get(decade) ?? 0) === 0) {
-      best = Math.max(best, 0.5);
-    }
-  }
-  return clamp01(best);
-}
-
 /**
  * Extrait les lignes exploitables d'une réponse de liste TMDB.
  * @param {PromiseSettledResult<Record<string, unknown>>} settled Réponse.
@@ -6236,157 +5919,18 @@ function rowsFrom(
   const raw = settled.value[key];
   return Array.isArray(raw) ? raw as DiscoverRow[] : [];
 }
-
-/**
- * Source A — le voisinage de la galerie. `/recommendations` donne le « les
- * gens qui ont aimé ça ont aussi vu ça », `/similar` est plus littéral et
- * ramène beaucoup d'épisodes de la même saga : les deux se complètent.
- * @param {TasteProfile} profile Profil de goût.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<DiscoverRow[]>} Candidats du voisinage.
- */
-async function fetchNeighborCandidates(
-    profile: TasteProfile, ctx: TMDBContext,
-): Promise<DiscoverRow[]> {
-  const seeds = profile.seedIds;
-  if (seeds.length === 0) return [];
-
-  const recommendationSeeds = seeds.slice(0, SWIPE_SEEDS_RECOMMENDATIONS);
-  const similarSeeds = seeds.slice(
-      SWIPE_SEEDS_RECOMMENDATIONS,
-      SWIPE_SEEDS_RECOMMENDATIONS + SWIPE_SEEDS_SIMILAR,
-  );
-
-  const requests = [
-    ...recommendationSeeds.map((id) =>
-      tmdbGET(`/movie/${id}/recommendations`, {
-        page: '1',
-      }, ctx)),
-    ...similarSeeds.map((id) =>
-      tmdbGET(`/movie/${id}/similar`, {
-        page: '1',
-      }, ctx)),
-  ];
-
-  const settled = await Promise.allSettled(requests);
-  return settled.flatMap((result) => rowsFrom(result, 'results'));
-}
-
-/**
- * Source B — discover cadré sur le profil : genres dominants, bande de
- * décennies habituelle, tri par `vote_count.desc`. Ce tri est volontaire :
- * `popularity.desc` est un score de buzz du jour, qui fait remonter des
- * nouveautés que personne n'a encore vues — l'inverse de ce qu'on cherche.
- * @param {TasteProfile} profile Profil de goût.
- * @param {number} voteCountFloor Plancher de notoriété.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<DiscoverRow[]>} Candidats profilés.
- */
-async function fetchProfiledCandidates(
-    profile: TasteProfile, voteCountFloor: number, ctx: TMDBContext,
-): Promise<DiscoverRow[]> {
-  const genreIds = topGenreIds(profile, 3);
-  if (genreIds.length === 0) return [];
-
-  const decades = targetDecades(profile);
-  const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    'region': DEFAULT_REGION,
-    'include_adult': 'false',
-    'include_video': 'false',
-    'with_genres': genreIds.join('|'),
-    'primary_release_date.gte': `${decade}-01-01`,
-    'primary_release_date.lte': `${decade + 9}-12-31`,
-    'vote_count.gte': String(voteCountFloor),
-    'sort_by': 'vote_count.desc',
-    'page': String(1 + Math.floor(Math.random() * 3)),
-  }, ctx));
-
-  const settled = await Promise.allSettled(requests);
-  return settled.flatMap((result) => rowsFrom(result, 'results'));
-}
-
-/**
- * Source C — les piliers de notoriété d'une décennie, sans filtre de genre.
- * C'est ce qui fait tourner le feed à froid, et ce qui rattrape les
- * blockbusters que tout le monde a vus en dehors de son genre de prédilection.
- * @param {TasteProfile} profile Profil de goût.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<DiscoverRow[]>} Candidats grand public.
- */
-async function fetchPillarCandidates(
-    profile: TasteProfile, ctx: TMDBContext,
-): Promise<DiscoverRow[]> {
-  const decades = profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE ?
-    targetDecades(profile) :
-    shuffled([1990, 2000, 2010, 2020]);
-
-  const requests = decades.map((decade) => tmdbGET('/discover/movie', {
-    'region': DEFAULT_REGION,
-    'include_adult': 'false',
-    'include_video': 'false',
-    'primary_release_date.gte': `${decade}-01-01`,
-    'primary_release_date.lte': `${decade + 9}-12-31`,
-    'vote_count.gte': String(SWIPE_COLD_VOTE_COUNT_FLOOR),
-    'sort_by': 'vote_count.desc',
-    'page': String(1 + Math.floor(Math.random() * 3)),
-  }, ctx));
-
-  const settled = await Promise.allSettled(requests);
-  return settled.flatMap((result) => rowsFrom(result, 'results'));
-}
-
-/**
- * Source F — la couverture : les films les plus vus des genres où la galerie
- * est maigre.
- *
- * Le plancher de notoriété reste celui du démarrage à froid **même pour un
- * profil mature**, et c'est tout le principe : on ne peut demander « tu l'as
- * vu ? » dans un genre étranger à quelqu'un que sur des films que tout le
- * monde a vus. Un film de genre pointu dans un genre qu'il ne pratique pas
- * est une carte perdue d'avance.
- * @param {TasteProfile} profile Profil de goût.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<DiscoverRow[]>} Candidats de couverture.
- */
-async function fetchCoverageCandidates(
-    profile: TasteProfile, ctx: TMDBContext,
-): Promise<DiscoverRow[]> {
-  const deficient = deficientGenres(profile);
-  if (deficient.length === 0) return [];
-
-  // Les plus creux d'abord, mais tirés au sort parmi les six premiers : deux
-  // lots consécutifs ne doivent pas sonder les trois mêmes genres, sinon on
-  // repasse les mêmes vingt films jusqu'à épuisement.
-  const probes = shuffled(deficient.slice(0, 6))
-      .slice(0, SWIPE_COVERAGE_PROBES);
-
-  const requests = probes.map((genreId) => tmdbGET('/discover/movie', {
-    'region': DEFAULT_REGION,
-    'include_adult': 'false',
-    'include_video': 'false',
-    'with_genres': String(genreId),
-    'vote_count.gte': String(SWIPE_COLD_VOTE_COUNT_FLOOR),
-    'sort_by': 'vote_count.desc',
-    'page': String(1 + Math.floor(Math.random() * 3)),
-  }, ctx));
-
-  const settled = await Promise.allSettled(requests);
-  return settled.flatMap((result) => rowsFrom(result, 'results'));
-}
-
 /**
  * Sources D et E — franchises et têtes d'affiche récurrentes. Les deux
  * partagent les mêmes appels de détail (`append_to_response=credits`) : une
  * seule requête par graine sert à la fois à trouver la saga et le casting.
- * @param {TasteProfile} profile Profil de goût.
+ * @param {number[]} seeds Films de la galerie dont on lit la fiche.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<{franchise: DiscoverRow[], people: DiscoverRow[]}>}
  *   Candidats des deux sources.
  */
 async function fetchFranchiseAndPeopleCandidates(
-    profile: TasteProfile, ctx: TMDBContext,
+    seeds: number[], ctx: TMDBContext,
 ): Promise<{franchise: DiscoverRow[]; people: DiscoverRow[]}> {
-  const seeds = profile.seedIds.slice(0, SWIPE_SEEDS_DETAILS);
   if (seeds.length === 0) return {franchise: [], people: []};
 
   const detailSettled = await Promise.allSettled(
@@ -6433,7 +5977,7 @@ async function fetchFranchiseAndPeopleCandidates(
             'include_adult': 'false',
             'include_video': 'false',
             'with_cast': String(id),
-            'vote_count.gte': String(SWIPE_VOTE_COUNT_FLOOR),
+            'vote_count.gte': '500',
             'sort_by': 'vote_count.desc',
             'page': '1',
           }, ctx)),
@@ -6445,276 +5989,6 @@ async function fetchFranchiseAndPeopleCandidates(
     people: peopleSettled.flatMap((result) => rowsFrom(result, 'results')),
   };
 }
-
-/**
- * Assemble le vivier complet en marquant la provenance de chaque film. Un film
- * ramené par plusieurs sources garde la première rencontrée, dans l'ordre de
- * fiabilité décroissante du signal « il l'a probablement vu ».
- * @param {TasteProfile} profile Profil de goût.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<Map<number, SwipeCandidate>>} Vivier dédoublonné.
- */
-async function fetchSwipePool(
-    profile: TasteProfile, ctx: TMDBContext,
-): Promise<Map<number, SwipeCandidate>> {
-  const voteCountFloor = profile.gallerySize >= SWIPE_PROFILE_MATURE_SIZE ?
-    SWIPE_VOTE_COUNT_FLOOR : SWIPE_COLD_VOTE_COUNT_FLOOR;
-
-  const [
-    neighbors, profiled, pillars, franchiseAndPeople, coverage,
-  ] = await Promise.all([
-    fetchNeighborCandidates(profile, ctx),
-    fetchProfiledCandidates(profile, voteCountFloor, ctx),
-    fetchPillarCandidates(profile, ctx),
-    fetchFranchiseAndPeopleCandidates(profile, ctx),
-    fetchCoverageCandidates(profile, ctx),
-  ]);
-
-  // L'ordre décide de l'étiquette d'un film ramené par plusieurs sources, et
-  // donc du quota qui le compte. La couverture passe **devant** les deux
-  // sources `/discover` génériques, qu'elle recoupe largement : derrière
-  // elles, son quota serait systématiquement à sec.
-  const groups: [SwipeSource, DiscoverRow[]][] = [
-    ['franchise', franchiseAndPeople.franchise],
-    ['neighbors', neighbors],
-    ['people', franchiseAndPeople.people],
-    ['coverage', coverage],
-    ['profile', profiled],
-    ['pillars', pillars],
-  ];
-
-  const banned = profile.declared.bannedGenreIDs;
-  const pool = new Map<number, SwipeCandidate>();
-  for (const [source, rows] of groups) {
-    for (const row of rows) {
-      if (typeof row.id !== 'number' || pool.has(row.id)) continue;
-      if (!row.poster_path) continue;
-      // « Jamais de… » est un filtre dur : contrairement aux rejets appris au
-      // swipe, ce n'est pas une préférence à sous-pondérer mais une règle.
-      if ((row.genre_ids ?? []).some((id) => banned.has(id))) continue;
-      pool.set(row.id, {...row, source, score: 0});
-    }
-  }
-  return pool;
-}
-
-/**
- * Probabilité que l'utilisateur ait vu le film, entre 0 et 1.
- *
- * Le poids principal est le `vote_count` : c'est le meilleur proxy disponible
- * de « combien de gens ont réellement vu ce film », très au-dessus de
- * `popularity`. L'échelle est logarithmique — 200 votes et 2 000 votes sont
- * deux inconnus, 20 000 et 60 000 sont deux évidences.
- * @param {SwipeCandidate} row Candidat.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number} Score entre 0 et 1.
- */
-function seenLikelihood(row: SwipeCandidate, profile: TasteProfile): number {
-  const voteCount = Math.max(1, row.vote_count ?? 0);
-  const notoriety = clamp01((Math.log10(voteCount) - 2.3) / (4.8 - 2.3));
-
-  const decade = decadeOf(row.release_date);
-  const decadeWeight = decade === null ? 0.4 :
-    profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE ?
-      profile.decadeWeights.get(decade) ?? 0.15 : 0.4;
-  const decadeRatio = decade === null ? 0.5 :
-    profile.decadeSeenRatio.get(decade) ?? 0.5;
-  const decadeAffinity = 0.5 * decadeWeight + 0.5 * decadeRatio;
-
-  // La génération déclarée calibre dès le premier lot ce que les compteurs de
-  // swipe mettraient des dizaines de cartes à découvrir.
-  const generation = generationFactor(decade, profile.declared.birthDecade);
-
-  return clamp01((0.65 * notoriety + 0.35 * decadeAffinity) * generation);
-}
-
-/**
- * Correspondance avec le style de l'utilisateur, entre 0 et 1.
- * @param {SwipeCandidate} row Candidat.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number} Score entre 0 et 1.
- */
-function tasteMatch(row: SwipeCandidate, profile: TasteProfile): number {
-  const genreIds = row.genre_ids ?? [];
-  let genreAffinity = 0.4;
-  if (genreIds.length > 0) {
-    const scores = genreIds.map((genreId) => {
-      const weight = profile.gallerySize >= SWIPE_PROFILE_MIN_SIZE ?
-        profile.genreWeights.get(genreId) ?? 0.1 : 0.4;
-      const ratio = profile.genreLikeRatio.get(genreId) ?? 0.5;
-      return 0.6 * weight + 0.4 * ratio;
-    });
-    // Le meilleur genre compte plus que la moyenne : un film d'action teinté
-    // de romance reste un film d'action pour qui aime l'action.
-    genreAffinity = 0.6 * Math.max(...scores) +
-      0.4 * (scores.reduce((a, b) => a + b, 0) / scores.length);
-  }
-
-  const rating = row.vote_average ?? profile.meanRating;
-  const ratingProximity = bandScore(
-      rating, profile.meanRating - 0.5, profile.meanRating + 0.5, 2.5,
-  );
-
-  let nicheProximity = 0.6;
-  if (profile.medianLogVoteCount !== null) {
-    const logVoteCount = Math.log10(Math.max(1, row.vote_count ?? 1));
-    nicheProximity = bandScore(
-        logVoteCount,
-        profile.medianLogVoteCount - 0.4,
-        profile.medianLogVoteCount + 0.4,
-        1.2,
-    );
-  }
-
-  return clamp01(
-      0.55 * genreAffinity + 0.25 * ratingProximity + 0.20 * nicheProximity,
-  );
-}
-
-/** Bonus de score par source, reflétant la force du signal « déjà vu ». */
-const SWIPE_SOURCE_BONUS: Record<SwipeSource, number> = {
-  franchise: 6,
-  neighbors: 4,
-  people: 3,
-  pillars: 2,
-  // Même force de signal que les piliers : c'est le même tri par notoriété,
-  // cadré sur un genre. Le gain de couverture, lui, est déjà dans le score.
-  coverage: 2,
-  profile: 0,
-  exploration: 0,
-};
-
-/**
- * Score final d'un candidat, sur une échelle 0..100 plus bonus de source et
- * une pincée d'aléatoire pour que deux lots consécutifs ne soient jamais
- * strictement identiques.
- * @param {SwipeCandidate} row Candidat.
- * @param {TasteProfile} profile Profil de goût.
- * @return {number} Score final.
- */
-function swipeScore(row: SwipeCandidate, profile: TasteProfile): number {
-  // Les poids disent à quoi sert l'écran. « Probablement vu » reste
-  // majoritaire : une carte qu'on n'a pas vue ne remplit rien. Mais le goût
-  // passe derrière la couverture, parce que **le deck ne sert pas à plaire,
-  // il sert à mesurer** : un film dont on sait déjà qu'il sera aimé n'apprend
-  // rien, et c'est CinéMatch, pas le deck, qui a la charge de plaire.
-  const base = 100 * (
-    0.55 * seenLikelihood(row, profile) +
-    0.25 * coverageGain(row, profile) +
-    0.20 * tasteMatch(row, profile)
-  );
-  return base + SWIPE_SOURCE_BONUS[row.source] + Math.random() * 4;
-}
-
-/**
- * Quotas de mix par source, adaptés à la maturité du profil. À froid la
- * galerie ne dit rien : on s'appuie presque uniquement sur la notoriété brute,
- * la seule chose qui rende un film probablement vu par n'importe qui.
- * @param {TasteProfile} profile Profil de goût.
- * @return {[SwipeSource, number][]} Quotas, source par source.
- */
-function sourceQuotas(profile: TasteProfile): [SwipeSource, number][] {
-  const size = SWIPE_FEED_SIZE;
-  const share = (fraction: number) => Math.round(size * fraction);
-
-  if (profile.gallerySize < SWIPE_PROFILE_MIN_SIZE) {
-    return [
-      ['pillars', share(0.45)],
-      ['coverage', share(0.3)],
-      ['profile', share(0.15)],
-      ['neighbors', share(0.1)],
-      ['franchise', 0],
-      ['people', 0],
-    ];
-  }
-  if (profile.gallerySize < SWIPE_PROFILE_MATURE_SIZE) {
-    return [
-      ['neighbors', share(0.25)],
-      ['coverage', share(0.25)],
-      ['pillars', share(0.2)],
-      ['profile', share(0.2)],
-      ['franchise', share(0.1)],
-      ['people', 0],
-    ];
-  }
-  return [
-    ['neighbors', share(0.3)],
-    ['coverage', share(0.2)],
-    ['profile', share(0.2)],
-    ['pillars', share(0.1)],
-    ['franchise', share(0.1)],
-    ['people', share(0.1)],
-  ];
-}
-
-/**
- * Compose le lot final : quotas par source, complément par score global, puis
- * une part d'exploration tirée au hasard dans le reste du vivier pour que le
- * feed ne se referme pas sur ce que l'algo croit déjà savoir.
- * @param {SwipeCandidate[]} scored Vivier scoré, trié par score décroissant.
- * @param {TasteProfile} profile Profil de goût.
- * @return {SwipeCandidate[]} Cartes sélectionnées.
- */
-function selectSwipeDeck(
-    scored: SwipeCandidate[], profile: TasteProfile,
-): SwipeCandidate[] {
-  const picked: SwipeCandidate[] = [];
-  const used = new Set<number>();
-  // Charge du lot, genre par genre. C'est elle qui tient le plafond : la
-  // pénalité de `orderForDeck` ne faisait que **ranger** un lot monochrome,
-  // elle ne l'empêchait pas d'être composé.
-  const genreLoad = new Map<number, number>();
-
-  const fits = (candidate: SwipeCandidate) =>
-    (candidate.genre_ids ?? [])
-        .every((id) => (genreLoad.get(id) ?? 0) < SWIPE_GENRE_CAP);
-
-  const take = (candidate: SwipeCandidate, source?: SwipeSource) => {
-    picked.push(source ? {...candidate, source} : candidate);
-    used.add(candidate.id);
-    for (const id of candidate.genre_ids ?? []) {
-      genreLoad.set(id, (genreLoad.get(id) ?? 0) + 1);
-    }
-  };
-
-  const explorationSlots = profile.gallerySize < SWIPE_PROFILE_MIN_SIZE ?
-    0 : Math.max(1, Math.round(SWIPE_FEED_SIZE * 0.05));
-  const quotaCeiling = SWIPE_FEED_SIZE - explorationSlots;
-
-  for (const [source, quota] of sourceQuotas(profile)) {
-    if (quota <= 0) continue;
-    for (const candidate of scored) {
-      if (picked.length >= quotaCeiling) break;
-      if (candidate.source !== source || used.has(candidate.id)) continue;
-      if (!fits(candidate)) continue;
-      take(candidate);
-      if (picked.filter((c) => c.source === source).length >= quota) break;
-    }
-  }
-
-  // Une source peut être à sec (galerie sans franchise, TMDB qui renvoie peu) :
-  // on complète au score global plutôt que de rendre un lot incomplet. Deux
-  // passes, parce que le plafond de genre doit céder plutôt que de laisser le
-  // lot court — un lot de douze cartes se vide en vingt secondes.
-  for (const candidate of scored) {
-    if (picked.length >= quotaCeiling) break;
-    if (used.has(candidate.id) || !fits(candidate)) continue;
-    take(candidate);
-  }
-  for (const candidate of scored) {
-    if (picked.length >= quotaCeiling) break;
-    if (used.has(candidate.id)) continue;
-    take(candidate);
-  }
-
-  const leftovers = shuffled(scored.filter((c) => !used.has(c.id)));
-  for (const candidate of leftovers.slice(0, explorationSlots)) {
-    take(candidate, 'exploration');
-  }
-
-  return orderForDeck(picked);
-}
-
 /**
  * Ordonne les cartes pour l'affichage en pénalisant la ressemblance avec les
  * dernières servies — sans ça, les quotas produisent des séries de huit films
@@ -6753,6 +6027,631 @@ function orderForDeck(cards: SwipeCandidate[]): SwipeCandidate[] {
   }
 
   return ordered;
+}
+/* ===================================================================== *
+ *  Le vivier du deck — mis en cache par personne
+ *
+ *  Un vivier coûte une vingtaine d'appels TMDB. Le refaire à chaque lot de
+ *  dix cartes doublerait la latence de la recharge pour rien : le modèle
+ *  change à chaque carte, mais le vivier d'où il pioche peut tenir deux
+ *  lots. On le refait quand il a servi deux lots, quand il a vieilli, quand
+ *  la phase ou le mode change, ou quand il reste trop peu de films à servir.
+ * ===================================================================== */
+
+/** Monte quand la forme du vivier change : les anciens se refont. */
+const DECK_POOL_VERSION = 1;
+/** Lots servis par un même vivier avant de le refaire. */
+const DECK_POOL_MAX_LOTS = 2;
+const DECK_POOL_MAX_AGE_MS = 6 * 3600 * 1000;
+/** En dessous de ce nombre de films encore servables, on le refait. */
+const DECK_POOL_MIN_FRESH = 25;
+/** Taille maximale d'un vivier, loin sous la limite d'un document. */
+const DECK_POOL_MAX_ROWS = 220;
+/** Films vus ou adorés dont on demande les recommandations. */
+const DECK_NEIGHBOR_SEEDS = 6;
+/** Familles interrogées par vivier, et pendant le repérage. */
+const DECK_FAMILY_QUERIES = 4;
+const DECK_REPERAGE_FAMILY_QUERIES = 6;
+/**
+ * Sondes par genre de CinéMatch, au-delà on arrête.
+ *
+ * Huit films par genre, c'était imposer vingt films d'horreur à qui n'en
+ * regarde pas. Trois sondes suffisent à apprendre qu'un genre est absent, et
+ * pour CinéMatch, savoir qu'un genre est absent est déjà l'information utile.
+ */
+const DECK_COVERAGE_PROBES_PER_GENRE = 3;
+/** Genres sondés par vivier au titre de la couverture. */
+const DECK_COVERAGE_GENRES_PER_POOL = 2;
+/** Galerie à partir de laquelle on cherche aussi sagas et têtes d'affiche. */
+const DECK_FRANCHISE_MIN_GALLERY = 8;
+
+/** Une ligne du vivier, telle que Firestore la garde. */
+interface DeckPoolRow extends DiscoverRow {
+  original_language: string | null;
+  source: SwipeSource;
+  /** Familles posées par la requête qui a ramené le film. */
+  tagged: string[];
+  /** Films vus ou adorés qui le recommandent. */
+  neighborCount: number;
+}
+
+/** Ce que la construction du vivier doit savoir de la personne. */
+interface DeckPoolInput {
+  model: deck.DeckModel;
+  phase: deck.DeckPhase;
+  mode: deck.DeckMode;
+  /** Galerie, watchlist et écarts en cours : jamais dans le vivier. */
+  excluded: Set<number>;
+  galleryDocs: admin.firestore.QueryDocumentSnapshot[];
+  /** Films tout juste balayés « vu », pas encore écrits en galerie. */
+  pendingSeenIds: number[];
+  counters: SwipeCounters;
+  declared: DeclaredProfile;
+  watchlistSize: number;
+}
+
+/**
+ * Une ligne TMDB réduite à ce que le vivier garde, sans `undefined` :
+ * Firestore les refuse.
+ * @param {Record<string, unknown>} raw Ligne `/discover` ou recommandation.
+ * @param {SwipeSource} source Source.
+ * @param {string[]} tagged Familles posées par la requête.
+ * @return {?DeckPoolRow} La ligne, ou null si elle est inexploitable.
+ */
+function poolRowFrom(
+    raw: Record<string, unknown>, source: SwipeSource, tagged: string[],
+): DeckPoolRow | null {
+  const id = Number(raw.id);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const numberOrNull = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  return {
+    id,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    overview: typeof raw.overview === 'string' ? raw.overview : null,
+    poster_path: typeof raw.poster_path === 'string' ? raw.poster_path : null,
+    vote_average: numberOrNull(raw.vote_average),
+    vote_count: numberOrNull(raw.vote_count),
+    popularity: numberOrNull(raw.popularity),
+    genre_ids: Array.isArray(raw.genre_ids) ?
+      (raw.genre_ids as unknown[])
+          .filter((g): g is number => typeof g === 'number') : [],
+    release_date: typeof raw.release_date === 'string' && raw.release_date ?
+      raw.release_date : null,
+    origin_country: Array.isArray(raw.origin_country) ?
+      (raw.origin_country as unknown[])
+          .filter((c): c is string => typeof c === 'string') : [],
+    original_language: typeof raw.original_language === 'string' ?
+      raw.original_language : null,
+    source,
+    tagged,
+    neighborCount: 0,
+  };
+}
+
+/**
+ * Une ligne du vivier, dans le vocabulaire du moteur.
+ * @param {DeckPoolRow} row Ligne.
+ * @return {deck.DeckCandidate} Candidat.
+ */
+function candidateOf(row: DeckPoolRow): deck.DeckCandidate {
+  return {
+    id: row.id,
+    source: row.source,
+    neighborCount: row.neighborCount,
+    genreIds: row.genre_ids ?? [],
+    originalLanguage: row.original_language,
+    year: yearOf(row.release_date),
+    voteCount: row.vote_count ?? null,
+    voteAverage: row.vote_average ?? null,
+    taggedFamilies: row.tagged,
+  };
+}
+
+/**
+ * Les graines du voisinage : ce que la personne vient de balayer « vu »
+ * d'abord, puis ses coups de cœur, puis ses ajouts récents, et un ancien
+ * tiré au sort pour ne pas se refermer sur la dernière lubie.
+ *
+ * Un film recommandé par plusieurs graines est le meilleur candidat du
+ * vivier : la V1 n'en tenait pas compte, et ne demandait qu'à quatre films.
+ * @param {admin.firestore.QueryDocumentSnapshot[]} docs Galerie.
+ * @param {number[]} pendingSeenIds Films vus pas encore écrits.
+ * @return {number[]} Graines, six au plus.
+ */
+function deckSeeds(
+    docs: admin.firestore.QueryDocumentSnapshot[], pendingSeenIds: number[],
+): number[] {
+  const millis = (value: unknown) =>
+    value instanceof admin.firestore.Timestamp ? value.toMillis() : 0;
+  const entries = docs
+      .map((doc) => ({
+        tmdbId: doc.get('tmdbId') as unknown,
+        addedAt: millis(doc.get('addedAt')),
+        lovedAt: millis(doc.get('lovedAt')),
+      }))
+      .filter((e): e is {tmdbId: number; addedAt: number; lovedAt: number} =>
+        typeof e.tmdbId === 'number');
+  const loved = entries.filter((e) => e.lovedAt > 0)
+      .sort((a, b) => b.lovedAt - a.lovedAt)
+      .map((e) => e.tmdbId);
+  const recent = [...entries].sort((a, b) => b.addedAt - a.addedAt)
+      .map((e) => e.tmdbId);
+  const ordered = [
+    ...[...pendingSeenIds].reverse().slice(0, 3),
+    ...loved.slice(0, 2),
+    ...recent.slice(0, 3),
+    ...shuffled(recent.slice(3)).slice(0, 1),
+  ];
+  return Array.from(new Set(ordered)).slice(0, DECK_NEIGHBOR_SEEDS);
+}
+
+/**
+ * Les familles à interroger pour ce vivier.
+ *
+ * - Repérage : les trois que le tirage préfère, et trois jamais sondées.
+ * - Récolte et finitions : les quatre que le tirage préfère.
+ * - Recentrage : les quatre où la personne a le plus de vécu, sans tirage.
+ * @param {DeckPoolInput} input Personne.
+ * @return {deck.Family[]} Familles.
+ */
+function poolFamilies(input: DeckPoolInput): deck.Family[] {
+  const {model} = input;
+  const banned = input.declared.bannedGenreIDs;
+  const open = deck.QUERYABLE_FAMILIES.filter((f) => {
+    if (deck.isClosed(model, f.key)) return false;
+    const genres = f.query.genres ?? [];
+    return genres.length === 0 || !genres.every((g) => banned.has(g));
+  });
+  const mean = (f: deck.Family) => deck.beliefOf(model, f.key).m;
+
+  if (input.mode === 'recentrage') {
+    return [...open].sort((a, b) => mean(b) - mean(a))
+        .slice(0, DECK_FAMILY_QUERIES);
+  }
+  const draws = deck.drawFamilies(model, Math.random,
+      deck.drawTemperature(input.phase, input.mode));
+  const byDraw = [...open].sort((a, b) =>
+    (draws.get(b.key) ?? 0) - (draws.get(a.key) ?? 0));
+  if (input.phase !== 'reperage') return byDraw.slice(0, DECK_FAMILY_QUERIES);
+
+  const chosen = byDraw.slice(0, 3);
+  const untested = shuffled(open.filter((f) => {
+    const b = deck.beliefOf(model, f.key);
+    return b.seen + b.skipped === 0 && !chosen.includes(f);
+  }));
+  return [...chosen, ...untested]
+      .slice(0, DECK_REPERAGE_FAMILY_QUERIES);
+}
+
+/**
+ * Les genres de CinéMatch à sonder : moins de trois sondes et moins de
+ * trois films en galerie. Plus, s'il manque des genres à l'Éventail à 50
+ * films, les genres absents de la galerie.
+ * @param {DeckPoolInput} input Personne.
+ * @return {number[]} Genres, deux au plus.
+ */
+function coverageGenres(input: DeckPoolInput): number[] {
+  const banned = input.declared.bannedGenreIDs;
+  const galleryCounts = new Map<number, number>();
+  for (const doc of input.galleryDocs) {
+    const ids = doc.get('genreIds');
+    if (!Array.isArray(ids)) continue;
+    for (const id of ids) {
+      if (typeof id === 'number') {
+        galleryCounts.set(id, (galleryCounts.get(id) ?? 0) + 1);
+      }
+    }
+  }
+  const probes = (g: number) => {
+    const key = String(g);
+    return (input.counters.genreSeen[key] ?? 0) +
+      (input.counters.genreSkipped[key] ?? 0) +
+      (input.counters.genreWanted[key] ?? 0);
+  };
+  const eventailShort = input.galleryDocs.length >= 50 &&
+    galleryCounts.size < 6;
+  const wanted = SWIPE_COVERAGE_GENRES.filter((g) => !banned.has(g))
+      .filter((g) => eventailShort ? !galleryCounts.has(g) :
+        probes(g) < DECK_COVERAGE_PROBES_PER_GENRE &&
+        (galleryCounts.get(g) ?? 0) < DECK_COVERAGE_PROBES_PER_GENRE);
+  return shuffled(wanted).slice(0, DECK_COVERAGE_GENRES_PER_POOL);
+}
+
+/**
+ * Construit un vivier.
+ * @param {DeckPoolInput} input Personne.
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<DeckPoolRow[]>} Lignes, dédoublonnées.
+ */
+async function buildDeckPool(
+    input: DeckPoolInput, ctx: TMDBContext,
+): Promise<DeckPoolRow[]> {
+  const floor = deck.voteFloor(input.model);
+  const base = {'include_adult': 'false', 'include_video': 'false',
+    'sort_by': 'vote_count.desc'};
+  const seeds = deckSeeds(input.galleryDocs, input.pendingSeenIds);
+  const families = poolFamilies(input);
+  const calm = input.phase === 'reperage' || input.mode === 'recentrage';
+  const page = () => calm ? '1' : String(1 + Math.floor(Math.random() * 2));
+
+  const familyCalls = families.map((family) => tmdbGET('/discover/movie', {
+    ...base,
+    ...deck.familyDiscoverParams(family),
+    'vote_count.gte': String(deck.familyVoteFloor(family, floor)),
+    'page': page(),
+  }, ctx).then((payload) => ({family, payload})));
+
+  const neighborCalls = seeds.map((id) =>
+    tmdbGET(`/movie/${id}/recommendations`, {page: '1'}, ctx));
+
+  // La Promesse : des films acclamés des trois dernières années, dans la
+  // famille où la personne a le plus de vécu.
+  const wantsPromesse = input.mode === 'normal' &&
+    input.phase !== 'reperage' && input.watchlistSize < 10;
+  const promesseFamily = wantsPromesse ?
+    [...families].sort((a, b) => deck.beliefOf(input.model, b.key).m -
+      deck.beliefOf(input.model, a.key).m)[0] : undefined;
+  const promesseCall = promesseFamily ? tmdbGET('/discover/movie', {
+    ...base,
+    ...deck.familyDiscoverParams(promesseFamily),
+    'primary_release_date.gte': `${new Date().getUTCFullYear() - 3}-01-01`,
+    'vote_average.gte': '7',
+    'vote_count.gte': String(Math.min(300, floor)),
+    'page': '1',
+  }, ctx) : Promise.resolve(null);
+
+  const coverage = input.mode === 'normal' ? coverageGenres(input) : [];
+  const coverageCalls = coverage.map((genreId) => tmdbGET('/discover/movie', {
+    ...base,
+    'with_genres': String(genreId),
+    'vote_count.gte': '3000',
+    'page': '1',
+  }, ctx));
+
+  const franchiseCall = seeds.length > 0 &&
+    input.galleryDocs.length >= DECK_FRANCHISE_MIN_GALLERY ?
+    fetchFranchiseAndPeopleCandidates(seeds.slice(0, 2), ctx) :
+    Promise.resolve({franchise: [], people: []});
+
+  const [familySettled, neighborSettled, promesse, coverageSettled,
+    franchise] = await Promise.all([
+    Promise.allSettled(familyCalls),
+    Promise.allSettled(neighborCalls),
+    promesseCall.catch(() => null),
+    Promise.allSettled(coverageCalls),
+    franchiseCall.catch(() => ({franchise: [], people: []})),
+  ]);
+
+  const today = todayISO();
+  const banned = input.declared.bannedGenreIDs;
+  const pool = new Map<number, DeckPoolRow>();
+  const admit = (
+      raw: unknown, source: SwipeSource, tagged: string[],
+  ): DeckPoolRow | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const row = poolRowFrom(raw as Record<string, unknown>, source, tagged);
+    if (!row || !row.poster_path || input.excluded.has(row.id)) return null;
+    // Une sortie à venir n'est pas une carte : personne ne peut l'avoir vue.
+    if (!row.release_date || row.release_date > today) return null;
+    // « Jamais de… » est un filtre dur, pas une préférence à sous-pondérer.
+    if ((row.genre_ids ?? []).some((id) => banned.has(id))) return null;
+    const known = pool.get(row.id);
+    if (known) {
+      for (const key of tagged) {
+        if (!known.tagged.includes(key)) known.tagged.push(key);
+      }
+      return known;
+    }
+    pool.set(row.id, row);
+    return row;
+  };
+
+  // L'ordre décide de l'étiquette d'un film ramené par plusieurs sources :
+  // la plus parlante d'abord.
+  for (const settled of neighborSettled) {
+    for (const raw of rowsFrom(settled, 'results')) {
+      const row = admit(raw, 'neighbors', []);
+      if (row) row.neighborCount += 1;
+    }
+  }
+  for (const raw of franchise.franchise) admit(raw, 'franchise', []);
+  for (const raw of franchise.people) admit(raw, 'people', []);
+  if (promesse && promesseFamily) {
+    const rows = Array.isArray(promesse.results) ? promesse.results : [];
+    for (const raw of rows) admit(raw, 'promesse', [promesseFamily.key]);
+  }
+  for (const settled of coverageSettled) {
+    for (const raw of rowsFrom(settled, 'results')) admit(raw, 'coverage', []);
+  }
+  for (const settled of familySettled) {
+    if (settled.status !== 'fulfilled') continue;
+    const {family, payload} = settled.value;
+    const rows = Array.isArray(payload.results) ? payload.results : [];
+    for (const raw of rows) admit(raw, 'family', [family.key]);
+  }
+
+  return Array.from(pool.values()).slice(0, DECK_POOL_MAX_ROWS);
+}
+
+/**
+ * Le vivier de la personne, du cache ou refait.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Utilisateur.
+ * @param {DeckPoolInput} input Personne.
+ * @param {Set<number>} blocked Ce qui ne peut pas être servi maintenant.
+ * @param {boolean} fresh Le client demande un vivier neuf (après une
+ *   mosaïque, qui vient de beaucoup apprendre au modèle).
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<DeckPoolRow[]>} Lignes.
+ */
+async function loadDeckPool(
+    db: admin.firestore.Firestore,
+    uid: string,
+    input: DeckPoolInput,
+    blocked: Set<number>,
+    fresh: boolean,
+    ctx: TMDBContext,
+): Promise<DeckPoolRow[]> {
+  const ref = db.collection('users').doc(uid)
+      .collection('preferences').doc('deckPool');
+  const snap = fresh ? null : await ref.get();
+  if (snap?.exists) {
+    const rows = snap.get('rows');
+    const builtAt = snap.get('builtAt');
+    const lots = snap.get('lots');
+    const usable = snap.get('v') === DECK_POOL_VERSION &&
+      Array.isArray(rows) &&
+      builtAt instanceof admin.firestore.Timestamp &&
+      Date.now() - builtAt.toMillis() < DECK_POOL_MAX_AGE_MS &&
+      typeof lots === 'number' && lots < DECK_POOL_MAX_LOTS &&
+      snap.get('mode') === input.mode &&
+      snap.get('phase') === input.phase;
+    if (usable) {
+      const typed = rows as DeckPoolRow[];
+      const servable = typed.filter((row) => !blocked.has(row.id)).length;
+      if (servable >= DECK_POOL_MIN_FRESH) {
+        await ref.update({lots: admin.firestore.FieldValue.increment(1)});
+        return typed;
+      }
+    }
+  }
+
+  const rows = await buildDeckPool(input, ctx);
+  await ref.set({
+    v: DECK_POOL_VERSION,
+    builtAt: admin.firestore.Timestamp.now(),
+    lots: 1,
+    mode: input.mode,
+    phase: input.phase,
+    rows,
+  });
+  return rows;
+}
+
+/**
+ * Ce qu'une décision apprend au modèle, ou null si elle ne lui apprend
+ * rien (une série, qui a son propre profil).
+ *
+ * Un « à voir » compte comme un demi-« vu » sur l'affinité seule ; une case
+ * laissée vide dans une mosaïque ou une feuille compte comme un demi-« pas
+ * vu ». Les décisions de la feuille de saga n'entrent pas dans le rendement
+ * glissant : elles ne disent rien de la qualité du deck.
+ * @param {SwipeDecisionPayload} d Décision.
+ * @return {?deck.Observation} Observation.
+ */
+function observationOf(d: SwipeDecisionPayload): deck.Observation | null {
+  if (d.item.mediaType !== 'movie') return null;
+  const logged = (d.log?.families ?? [])
+      .filter((key) => deck.FAMILIES.some((f) => f.key === key));
+  const families = logged.length > 0 ? logged : deck.familiesOf({
+    genreIds: d.item.genreIds ?? [],
+    originalLanguage: d.item.originalLanguage ?? null,
+    year: yearOf(d.item.releaseDate),
+    voteCount: d.item.voteCount ?? null,
+    voteAverage: d.item.voteAverage ?? null,
+  });
+  const fromDeck = d.via === 'deck' || d.via === 'reserve';
+  if (d.decision === 'watchlist') {
+    return {families, voteCount: d.item.voteCount ?? null, seen: 1,
+      weight: 0.5, familiesOnly: true, fromDeck, countsForClosing: false};
+  }
+  return {
+    families,
+    voteCount: d.item.voteCount ?? null,
+    seen: d.decision === 'seen' ? 1 : 0,
+    weight: d.soft ? 0.5 : 1,
+    fromDeck,
+    countsForClosing: d.via !== 'sheet' && d.via !== 'saga',
+  };
+}
+
+/**
+ * Le modèle de la personne, décisions encore en route comprises. Celles-ci
+ * ne sont pas écrites : `recordSwipes` les apprendra pour de bon à leur
+ * arrivée. Elles servent à ce que le lot demandé tienne compte des refus des
+ * dernières secondes, que la V1 ignorait.
+ * @param {admin.firestore.DocumentSnapshot} profileSnap `swipeProfile`.
+ * @param {SwipeDecisionPayload[]} pending Décisions en route.
+ * @return {deck.DeckModel} Modèle.
+ */
+function modelWithPending(
+    profileSnap: admin.firestore.DocumentSnapshot,
+    pending: SwipeDecisionPayload[],
+): deck.DeckModel {
+  const model = deck.parseModel(profileSnap.get('model'));
+  for (const decision of pending) {
+    const obs = observationOf(decision);
+    if (obs) deck.learn(model, obs);
+  }
+  return model;
+}
+
+/**
+ * Une carte du lot, telle que l'app la lit.
+ * @param {SwipeCandidate} c Carte.
+ * @param {number} position Rang dans le lot.
+ * @param {{lotId: string, phase: string, mode: string}} meta Lot.
+ * @return {Record<string, unknown>} Carte.
+ */
+function deckCardJSON(
+    c: SwipeCandidate & {original_language?: string | null},
+    position: number,
+    meta: {lotId: string; phase: string; mode: string},
+): Record<string, unknown> {
+  return {
+    ...discoverRowToJSON(c),
+    media_type: 'movie',
+    source: c.source,
+    collection_id: c.collectionId ?? null,
+    collection_total: c.collectionTotal ?? null,
+    original_language: c.original_language ?? null,
+    p_seen: typeof c.pSeen === 'number' ?
+      Math.round(c.pSeen * 1000) / 1000 : null,
+    families: c.families ?? [],
+    kind: c.kind ?? 'main',
+    lot_id: meta.lotId,
+    phase: meta.phase,
+    mode: meta.mode,
+    position,
+  };
+}
+
+/**
+ * Identifiant court d'un lot, pour relier les décisions à ce qui a été servi.
+ * @return {string} Identifiant.
+ */
+function newLotId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+/**
+ * Ce que la Porte compte et que le choix des cartes doit savoir.
+ * @param {admin.firestore.QueryDocumentSnapshot[]} docs Galerie.
+ * @return {{lovedCount: number, genreCount: number}} Comptes.
+ */
+function galleryFacts(
+    docs: admin.firestore.QueryDocumentSnapshot[],
+): {lovedCount: number; genreCount: number} {
+  let lovedCount = 0;
+  const genres = new Set<number>();
+  for (const doc of docs) {
+    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) lovedCount++;
+    const ids = doc.get('genreIds');
+    if (Array.isArray(ids)) {
+      for (const id of ids) if (typeof id === 'number') genres.add(id);
+    }
+  }
+  return {lovedCount, genreCount: genres.size};
+}
+
+/**
+ * Le lot de films : vivier, notes, composition, règle des sagas.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {string} uid Utilisateur.
+ * @param {object} args Ce que la requête a apporté.
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<Record<string, unknown>>} Réponse prête à envoyer.
+ */
+async function buildFilmLot(
+    db: admin.firestore.Firestore,
+    uid: string,
+    args: {
+      exclusions: Awaited<ReturnType<typeof fetchSwipeExclusions>>;
+      profileSnap: admin.firestore.DocumentSnapshot;
+      declared: DeclaredProfile;
+      sessionExcluded: Set<number>;
+      pending: SwipeDecisionPayload[];
+      mode: deck.DeckMode;
+      fresh: boolean;
+    },
+    ctx: TMDBContext,
+): Promise<Record<string, unknown>> {
+  const {exclusions, declared} = args;
+  const pendingFilms = args.pending.filter((d) => d.item.mediaType === 'movie');
+  const model = modelWithPending(args.profileSnap, pendingFilms);
+  const pendingSeenIds = pendingFilms
+      .filter((d) => d.decision === 'seen')
+      .map((d) => d.item.tmdbId);
+  const gallerySize = exclusions.galleryDocs.length + pendingSeenIds.length;
+  const phase = deck.phaseOf(model, gallerySize);
+
+  const blocked = new Set<number>(exclusions.excluded);
+  for (const id of args.sessionExcluded) blocked.add(id);
+  for (const d of pendingFilms) blocked.add(d.item.tmdbId);
+
+  const input: DeckPoolInput = {
+    model,
+    phase,
+    mode: args.mode,
+    excluded: exclusions.excluded,
+    galleryDocs: exclusions.galleryDocs,
+    pendingSeenIds,
+    counters: parseSwipeCounters(args.profileSnap),
+    declared,
+    watchlistSize: exclusions.watchlistSize,
+  };
+  const rows = await loadDeckPool(db, uid, input, blocked, args.fresh, ctx);
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const facts = galleryFacts(exclusions.galleryDocs);
+
+  const lotContext: deck.LotContext = {
+    model,
+    phase,
+    mode: args.mode,
+    birthDecade: declared.birthDecade,
+    gallerySize,
+    lovedCount: facts.lovedCount,
+    watchlistSize: exclusions.watchlistSize,
+    galleryGenreCount: facts.genreCount,
+    rolling: deck.rollingYield(model.recent),
+    random: Math.random,
+  };
+  const scored = deck.scoreCandidates(
+      rows.filter((row) => !blocked.has(row.id)).map(candidateOf),
+      lotContext,
+  );
+  const lot = deck.composeLot(scored, lotContext);
+
+  const asSwipe = (c: deck.ScoredCandidate): SwipeCandidate => {
+    const row = byId.get(c.id) as DeckPoolRow;
+    return {
+      ...row,
+      score: c.value,
+      pSeen: c.pSeen,
+      families: c.families,
+      kind: c.kind,
+    };
+  };
+  // La règle de saga passe sur le lot, puis sur la réserve en sachant ce
+  // que le lot a déjà pris : une saga ne paraît qu'une fois.
+  const cards = await applySagaRule(db, lot.cards.map(asSwipe), blocked, ctx);
+  const reserveBlocked = new Set(blocked);
+  for (const c of cards) reserveBlocked.add(c.id);
+  const reserve = (await applySagaRule(
+      db, lot.reserve.map(asSwipe), reserveBlocked, ctx,
+  )).filter((c) => !cards.some((card) => card.id === c.id));
+
+  const meta = {lotId: newLotId(), phase, mode: args.mode};
+  if (cards.length === 0) {
+    logger.info('getSwipeFeed: empty deck', {
+      uid, poolSize: rows.length, gallerySize, phase, mode: args.mode,
+      sessionExcluded: args.sessionExcluded.size,
+    });
+  }
+  return {
+    cards: cards.map((c, i) => deckCardJSON(c, i, meta)),
+    reserve: reserve.map((c, i) => deckCardJSON(c, i, meta)),
+    gallery_size: exclusions.galleryDocs.length,
+    exhausted: cards.length === 0,
+    lot_id: meta.lotId,
+    phase,
+    mode: args.mode,
+    // La mosaïque de départ, à la première ouverture de Découvrir. Pas pour
+    // un compte qui a déjà une galerie fournie : il n'en a plus besoin.
+    start_grid: !model.startGridDone && exclusions.galleryDocs.length < 30 &&
+      model.n < 10,
+  };
 }
 
 /* ===================================================================== *
@@ -7010,6 +6909,11 @@ async function applySagaRule(
       // les logs : un lot où tout est `franchise` est un lot de rattrapage.
       source: 'franchise',
       score: card.score,
+      // Le premier opus hérite de ce que le moteur pensait de celui qu'il
+      // remplace : même saga, mêmes familles, et il est plus vu que lui.
+      pSeen: card.pSeen,
+      families: card.families,
+      kind: card.kind,
       collectionId: sagaId,
       collectionTotal: saga.parts.length,
     });
@@ -7130,6 +7034,7 @@ async function fetchSwipeExclusions(
   tvExcluded: Set<number>;
   galleryDocs: admin.firestore.QueryDocumentSnapshot[];
   tvGalleryDocs: admin.firestore.QueryDocumentSnapshot[];
+  watchlistSize: number;
 }> {
   const userRef = db.collection('users').doc(uid);
   const now = admin.firestore.Timestamp.now();
@@ -7171,6 +7076,8 @@ async function fetchSwipeExclusions(
     tvExcluded,
     galleryDocs: gallerySnap.docs,
     tvGalleryDocs: tvGallerySnap.docs,
+    // Les films seuls : la Promesse de la Porte des films ne compte qu'eux.
+    watchlistSize: watchlistSnap.size,
   };
 }
 
@@ -7538,7 +7445,7 @@ async function buildSeriesDeck(
   const scored = [...pool.values()].map((row) => {
     const notoriety = clamp01(
         (Math.log10(Math.max(1, row.vote_count ?? 0)) - 2) / 2.2);
-    const generation = generationFactor(
+    const generation = deck.generationFactor(
         decadeOf(row.release_date), declared.birthDecade);
     let cover = 0;
     let taste = 0;
@@ -7655,51 +7562,20 @@ export const getSwipeFeed = onRequest(
           return;
         }
 
-        const profile = buildTasteProfile(
-            exclusions.galleryDocs, parseSwipeCounters(countersSnap), declared,
-        );
-
-        const pool = await fetchSwipePool(profile, tmdb(req, res));
-        const scored = Array.from(pool.values())
-            .filter((candidate) =>
-              !exclusions.excluded.has(candidate.id) &&
-              !sessionExcluded.has(candidate.id))
-            .map((candidate) => ({
-              ...candidate, score: swipeScore(candidate, profile),
-            }))
-            .sort((a, b) => b.score - a.score);
-
-        // La règle de saga passe **après** la composition : elle corrige un
-        // lot déjà équilibré par les quotas plutôt que de peser dans le
-        // vivier, où une saga de huit opus écraserait les autres sources.
-        const blocked = new Set<number>(exclusions.excluded);
-        for (const id of sessionExcluded) blocked.add(id);
-        const deck = await applySagaRule(
-            db, selectSwipeDeck(scored, profile), blocked, tmdb(req, res),
-        );
-
-        const cards: Record<string, unknown>[] = deck.map((candidate) => ({
-          ...discoverRowToJSON(candidate),
-          media_type: 'movie',
-          source: candidate.source,
-          collection_id: candidate.collectionId ?? null,
-          collection_total: candidate.collectionTotal ?? null,
-        }));
-
-        if (cards.length === 0) {
-          logger.info('getSwipeFeed: empty deck', {
-            uid,
-            poolSize: pool.size,
-            gallerySize: profile.gallerySize,
-            sessionExcluded: sessionExcluded.size,
-          });
-        }
-
-        res.status(200).json({
-          cards,
-          gallery_size: profile.gallerySize,
-          exhausted: cards.length === 0,
-        });
+        // Les films. Les décisions encore en route sur le téléphone viennent
+        // avec la demande : sans elles, le lot ne tenait pas compte des refus
+        // des dernières secondes, ceux qui ont justement fait demander un
+        // recentrage.
+        const lot = await buildFilmLot(db, uid, {
+          exclusions,
+          profileSnap: countersSnap,
+          declared,
+          sessionExcluded,
+          pending: parseSwipeDecisions(body?.pending),
+          mode: body?.mode === 'recentrage' ? 'recentrage' : 'normal',
+          fresh: body?.fresh === true,
+        }, tmdb(req, res));
+        res.status(200).json(lot);
       } catch (error) {
         if (sendTMDBError(error, res)) return;
         logger.error('getSwipeFeed failed', {error});
@@ -7714,7 +7590,55 @@ interface SwipeDecisionPayload {
   /** Le second cran du balayage droite : vu ET adoré. Un modificateur de
    * « seen », pas un quatrième verbe — la liste des décisions reste fermée. */
   loved: boolean;
-  item: MediaItemPayload & {voteCount?: number | null};
+  /**
+   * Une case laissée vide dans une mosaïque ou une feuille : un demi-« pas
+   * vu » pour le modèle, sans cooldown ni compteur. Rien n'est écrit en
+   * bibliothèque, puisque personne n'a rien répondu.
+   */
+  soft: boolean;
+  /** D'où vient la décision : seules celles du deck font le rendement. */
+  via: 'deck' | 'reserve' | 'grid' | 'sheet' | 'saga';
+  /** Ce que le serveur avait dit de la carte en la servant. */
+  log?: {
+    lotId?: string;
+    pSeen?: number;
+    families?: string[];
+    kind?: string;
+    phase?: string;
+    mode?: string;
+    position?: number;
+  };
+  item: MediaItemPayload & {
+    voteCount?: number | null;
+    originalLanguage?: string | null;
+  };
+}
+
+const SWIPE_VIAS = ['deck', 'reserve', 'grid', 'sheet', 'saga'] as const;
+
+/**
+ * Le journal d'une carte, tel que le client le renvoie, nettoyé.
+ * @param {unknown} raw Valeur brute.
+ * @return {?Object} Journal, ou undefined.
+ */
+function parseSwipeLog(raw: unknown): SwipeDecisionPayload['log'] {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const data = raw as Record<string, unknown>;
+  const text = (value: unknown) =>
+    typeof value === 'string' ? value.slice(0, 40) : undefined;
+  const num = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return {
+    lotId: text(data.lotId),
+    pSeen: num(data.pSeen),
+    families: Array.isArray(data.families) ?
+      data.families.filter((k): k is string => typeof k === 'string')
+          .slice(0, 8) : undefined,
+    kind: text(data.kind),
+    phase: text(data.phase),
+    mode: text(data.mode),
+    position: num(data.position),
+  };
 }
 
 /**
@@ -7754,6 +7678,9 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
     decisions.push({
       decision,
       loved: decision === 'seen' && entry.loved === true,
+      soft: decision === 'skipped' && entry.soft === true,
+      via: SWIPE_VIAS.find((v) => v === entry.via) ?? 'deck',
+      log: parseSwipeLog(entry.log),
       item,
     });
   }
@@ -7791,10 +7718,12 @@ export const recordSwipes = onRequest(
         const uid = await verifyAuth(req, res);
         if (!uid) return;
 
-        const decisions = parseSwipeDecisions(
-            (req.body as Record<string, unknown> | undefined)?.decisions,
-        );
-        if (decisions.length === 0) {
+        const body = req.body as Record<string, unknown> | undefined;
+        const decisions = parseSwipeDecisions(body?.decisions);
+        // La mosaïque de départ passée sans rien toucher n'envoie aucune
+        // décision, mais elle ne doit pas se rouvrir.
+        const startGridDone = body?.startGridDone === true;
+        if (decisions.length === 0 && !startGridDone) {
           res.status(200).json({ok: true, recorded: 0});
           return;
         }
@@ -7805,9 +7734,10 @@ export const recordSwipes = onRequest(
         const now = a.firestore.Timestamp.now();
 
         // Le cooldown dépend du nombre de skips déjà encaissés : une lecture
-        // groupée en amont évite une transaction par film.
+        // groupée en amont évite une transaction par film. Une case laissée
+        // vide n'écarte rien : elle n'a pas de cooldown.
         const skippedIds = decisions
-            .filter((d) => d.decision === 'skipped')
+            .filter((d) => d.decision === 'skipped' && !d.soft)
             .map((d) => d.item.id);
         const previousSkipCounts = new Map<string, number>();
         if (skippedIds.length > 0) {
@@ -7859,7 +7789,7 @@ export const recordSwipes = onRequest(
         const sagaCooldown = await sagaSiblingsToCool(
             db,
             decisions
-                .filter((d) => d.decision === 'skipped' &&
+                .filter((d) => d.decision === 'skipped' && !d.soft &&
                   d.item.mediaType === 'movie')
                 .map((d) => ({id: d.item.id, tmdbId: d.item.tmdbId})),
         );
@@ -7898,7 +7828,7 @@ export const recordSwipes = onRequest(
 
         const batch = db.batch();
 
-        for (const {decision, loved, item} of decisions) {
+        for (const {decision, loved, soft, via, log, item} of decisions) {
           const galleryRef = userRef.collection('gallery').doc(item.id);
           const watchlistRef = userRef.collection('watchlist').doc(item.id);
           const skipRef = userRef.collection('swipeSkips').doc(item.id);
@@ -7908,6 +7838,35 @@ export const recordSwipes = onRequest(
           // films : une série n'y entre pas, comme elle n'entre pas dans
           // CinéMatch.
           const isFilm = item.mediaType === 'movie';
+
+          // Le journal : une ligne par décision sur un film, avec ce que le
+          // serveur pensait de la carte en la servant. C'est lui qui dira le
+          // rendement réel du deck et réglera les seuils des garde-fous.
+          if (isFilm) {
+            batch.set(userRef.collection('swipeLog').doc(), {
+              tmdbId: item.tmdbId,
+              decision,
+              loved,
+              soft,
+              via,
+              voteCount: item.voteCount ?? null,
+              genreIds,
+              originalLanguage: item.originalLanguage ?? null,
+              releaseDate: item.releaseDate ?? null,
+              lotId: log?.lotId ?? null,
+              pSeen: log?.pSeen ?? null,
+              families: log?.families ?? [],
+              kind: log?.kind ?? null,
+              phase: log?.phase ?? null,
+              mode: log?.mode ?? null,
+              position: log?.position ?? null,
+              decidedAt: now,
+            });
+          }
+
+          // Une case laissée vide n'écrit rien d'autre : ni cooldown, ni
+          // compteur. Seul le modèle l'apprend, à demi-poids.
+          if (soft) continue;
 
           if (decision === 'skipped') {
             const skipCount = (previousSkipCounts.get(item.id) ?? 0) + 1;
@@ -7994,7 +7953,7 @@ export const recordSwipes = onRequest(
                 lastSkippedAt: now,
                 resurfaceAt: a.firestore.Timestamp.fromMillis(
                     now.toMillis() +
-                    skipCooldownMillis(1),
+                    SWIPE_SAGA_SIBLING_COOLDOWN_DAYS * 24 * 3600 * 1000,
                 ),
               },
               {merge: true},
@@ -8015,14 +7974,32 @@ export const recordSwipes = onRequest(
               // Total exact des cartes tranchées : les compteurs par genre
               // sur-comptent (un film porte plusieurs genres) et ceux par
               // décennie ratent les mises en watchlist.
-              totalDecisions:
-                a.firestore.FieldValue.increment(decisions.length),
+              totalDecisions: a.firestore.FieldValue.increment(
+                  decisions.filter((d) => !d.soft).length),
               updatedAt: now,
             },
             {merge: true},
         );
 
         await batch.commit();
+
+        // Le modèle de « déjà vu » apprend chaque décision. À part du lot
+        // d'écritures, dans une transaction : c'est une lecture-écriture, et
+        // la feuille de saga peut écrire en même temps que le deck.
+        const observations = decisions
+            .map(observationOf)
+            .filter((obs): obs is deck.Observation => obs !== null);
+        if (observations.length > 0 || startGridDone) {
+          const profileRef =
+            userRef.collection('preferences').doc('swipeProfile');
+          await db.runTransaction(async (tx) => {
+            const snap = await tx.get(profileRef);
+            const model = deck.parseModel(snap.get('model'));
+            for (const obs of observations) deck.learn(model, obs);
+            if (startGridDone) model.startGridDone = true;
+            tx.set(profileRef, {model}, {merge: true});
+          });
+        }
 
         // C1 — les films qui viennent d'entrer en galerie reçoivent leur
         // position, via le cache global. Plafonné : un lot de quarante venus
@@ -8048,6 +8025,288 @@ export const recordSwipes = onRequest(
         res.status(200).json({ok: true, recorded: decisions.length});
       } catch (error) {
         logger.error('recordSwipes failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/* ===================================================================== *
+ *  Les mosaïques — plusieurs films d'un geste
+ *
+ *  Neuf affiches, « lesquels as-tu vus ? ». Neuf réponses en dix secondes
+ *  apprennent davantage que neuf cartes, et chaque affiche touchée entre en
+ *  galerie. La mosaïque de départ s'ouvre à la première venue sur Découvrir ;
+ *  celle de relance remplace le deck quand il ne trouve plus rien.
+ * ===================================================================== */
+
+const GRID_STAGES: deck.GridStage[] =
+  ['start1', 'start2', 'start3', 'relance1', 'relance2'];
+/** Votes minimum d'une affiche de mosaïque : on sonde par le plus vu. */
+const GRID_VOTE_FLOOR = 200;
+
+/**
+ * Les films les plus vus d'une famille, toutes langues de la famille
+ * confondues. Le cache de `tmdbGET` sert les appels répétés.
+ * @param {deck.Family} family Famille.
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<DeckPoolRow[]>} Films, du plus voté au moins voté.
+ */
+async function familyProbes(
+    family: deck.Family, ctx: TMDBContext,
+): Promise<DeckPoolRow[]> {
+  const languages = family.query.languages ?? [null];
+  const settled = await Promise.allSettled(languages.map((language) => {
+    const params = deck.familyDiscoverParams(family);
+    if (language) params['with_original_language'] = language;
+    return tmdbGET('/discover/movie', {
+      'include_adult': 'false',
+      'include_video': 'false',
+      ...params,
+      'vote_count.gte': String(deck.familyVoteFloor(family, GRID_VOTE_FLOOR)),
+      'sort_by': 'vote_count.desc',
+      'page': '1',
+    }, ctx);
+  }));
+  const rows = settled.flatMap((result) => rowsFrom(result, 'results'))
+      .map((raw) => poolRowFrom(
+          raw as unknown as Record<string, unknown>, 'family', [family.key]))
+      .filter((row): row is DeckPoolRow => row !== null && !!row.poster_path);
+  return rows.sort((a, b) => (b.vote_count ?? 0) - (a.vote_count ?? 0));
+}
+
+/**
+ * Renvoie les neuf affiches d'une mosaïque, ou les résultats d'une
+ * recherche « un film que tu as aimé » dans la seconde relance.
+ */
+export const getProbeGrid = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = req.body as Record<string, unknown> | undefined;
+        const stage = GRID_STAGES.find((s) => s === body?.stage) ?? 'start1';
+        const query = typeof body?.query === 'string' ?
+          body.query.trim().slice(0, 80) : '';
+        const db = getAdmin().firestore();
+        const ctx = tmdb(req, res);
+
+        const [exclusions, profileSnap, declared] = await Promise.all([
+          fetchSwipeExclusions(db, uid),
+          db.collection('users').doc(uid)
+              .collection('preferences').doc('swipeProfile').get(),
+          fetchDeclaredProfile(db, uid),
+        ]);
+        const blocked = new Set<number>(exclusions.excluded);
+        for (const id of parseExcludeIds(body?.excludeIds)) blocked.add(id);
+        const banned = declared.bannedGenreIDs;
+        const servable = (row: DeckPoolRow) => !blocked.has(row.id) &&
+          !(row.genre_ids ?? []).some((id) => banned.has(id)) &&
+          !!row.release_date && row.release_date <= todayISO();
+
+        const meta = {lotId: `grid-${stage}`, phase: 'reperage', mode: 'grid'};
+        const toCard = (row: DeckPoolRow, i: number) => {
+          const families = deck.familiesOf(candidateOf(row));
+          return deckCardJSON(
+              {...row, score: 0, families, kind: 'probe'}, i, meta);
+        };
+
+        if (query.length >= 2) {
+          const payload = await tmdbGET('/search/movie', {
+            'query': query, 'include_adult': 'false', 'page': '1',
+          }, ctx);
+          const rows = (Array.isArray(payload.results) ? payload.results : [])
+              .map((raw) => poolRowFrom(
+                  raw as Record<string, unknown>, 'family', []))
+              .filter((row): row is DeckPoolRow =>
+                row !== null && !!row.poster_path && servable(row))
+              // Le titre exact d'abord, puis le plus vu : « Alien » doit
+              // rendre Alien, pas une parodie au titre plus proche.
+              .sort((a, b) => {
+                const wanted = query.toLocaleLowerCase();
+                const exact = (row: DeckPoolRow) =>
+                  (row.title ?? '').toLocaleLowerCase() === wanted ? 1 : 0;
+                return exact(b) - exact(a) ||
+                  (b.vote_count ?? 0) - (a.vote_count ?? 0);
+              })
+              .slice(0, deck.GRID_SIZE);
+          res.status(200).json({cards: rows.map(toCard), stage});
+          return;
+        }
+
+        const model = deck.parseModel(profileSnap.get('model'));
+        const plan = deck.gridPlan(stage, model, Math.random)
+            .filter(({key}) => {
+              const genres = deck.FAMILIES
+                  .find((f) => f.key === key)?.query.genres ?? [];
+              return genres.length === 0 ||
+                !genres.every((g) => banned.has(g));
+            });
+        const probes = await Promise.all(plan.map(({key}) =>
+          familyProbes(deck.FAMILIES.find((f) => f.key === key) as deck.Family,
+              ctx).catch(() => [] as DeckPoolRow[])));
+
+        const chosen: DeckPoolRow[] = [];
+        const taken = new Set<number>();
+        plan.forEach(({count}, index) => {
+          let left = count;
+          for (const row of probes[index]) {
+            if (left === 0) break;
+            if (taken.has(row.id) || !servable(row)) continue;
+            chosen.push(row);
+            taken.add(row.id);
+            left--;
+          }
+        });
+
+        res.status(200).json({
+          cards: chosen.slice(0, deck.GRID_SIZE).map(toCard),
+          stage,
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getProbeGrid failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/* ===================================================================== *
+ *  Les feuilles « Dans la même veine » et du réalisateur
+ *
+ *  Après un « vu », six affiches à cocher : les autres films du réalisateur
+ *  si c'est le deuxième qu'on voit de lui, sinon les films proches que la
+ *  personne a de bonnes chances d'avoir vus. C'est la feuille de saga,
+ *  étendue à ce qui n'est pas une saga.
+ * ===================================================================== */
+
+/** Affiches d'une feuille, au plus et au moins. */
+const SHEET_MAX = 6;
+const SHEET_DIRECTOR_MIN = 3;
+const SHEET_VEIN_MIN = 4;
+/** Probabilité d'avoir vu un voisin, sous laquelle il ne figure pas. */
+const SHEET_VEIN_P_SEEN = 0.6;
+
+/**
+ * Renvoie la feuille à proposer après un « vu », ou rien.
+ */
+export const getDeckSheet = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = req.body as Record<string, unknown> | undefined;
+        const tmdbId = Number(body?.tmdbId);
+        if (!Number.isFinite(tmdbId) || tmdbId <= 0) {
+          res.status(400).json({error: 'invalid_tmdb_id'});
+          return;
+        }
+        const db = getAdmin().firestore();
+        const ctx = tmdb(req, res);
+
+        const [exclusions, profileSnap, declared, detail] = await Promise.all([
+          fetchSwipeExclusions(db, uid),
+          db.collection('users').doc(uid)
+              .collection('preferences').doc('swipeProfile').get(),
+          fetchDeclaredProfile(db, uid),
+          tmdbGET(`/movie/${tmdbId}`,
+              {append_to_response: 'credits,recommendations'}, ctx),
+        ]);
+        const blocked = new Set<number>(exclusions.excluded);
+        blocked.add(tmdbId);
+        for (const id of parseExcludeIds(body?.excludeIds)) blocked.add(id);
+        const banned = declared.bannedGenreIDs;
+        const today = todayISO();
+        const servable = (row: DeckPoolRow) => !blocked.has(row.id) &&
+          !!row.poster_path && !!row.release_date &&
+          row.release_date <= today &&
+          !(row.genre_ids ?? []).some((id) => banned.has(id));
+        const meta = {
+          lotId: `sheet-${tmdbId}`, phase: 'recolte', mode: 'sheet',
+        };
+        const galleryIds = new Set(exclusions.galleryDocs
+            .map((doc) => doc.get('tmdbId'))
+            .filter((id): id is number => typeof id === 'number'));
+        const model = deck.parseModel(profileSnap.get('model'));
+
+        // Le réalisateur d'abord : « deux films de lui vus » est un signal
+        // plus sûr que n'importe quel voisinage.
+        const credits = detail.credits as Record<string, unknown> | undefined;
+        const crew = Array.isArray(credits?.crew) ?
+          credits?.crew as {id?: number; job?: string; name?: string}[] : [];
+        const director = crew.find((member) => member.job === 'Director');
+        if (director && typeof director.id === 'number' && director.name) {
+          const person = await tmdbGET(
+              `/person/${director.id}/movie_credits`, {}, ctx,
+          ).catch(() => null);
+          const directed = (Array.isArray(person?.crew) ? person.crew : [])
+              .filter((raw) =>
+                (raw as {job?: string}).job === 'Director')
+              .map((raw) => poolRowFrom(
+                  raw as Record<string, unknown>, 'people', []))
+              .filter((row): row is DeckPoolRow => row !== null);
+          const owned = directed.filter((row) => galleryIds.has(row.id))
+              .length + (galleryIds.has(tmdbId) ? 0 : 1);
+          const others = Array.from(
+              new Map(directed.map((row) => [row.id, row])).values())
+              .filter((row) => servable(row) && (row.vote_count ?? 0) >= 200)
+              .sort((a, b) => (b.vote_count ?? 0) - (a.vote_count ?? 0))
+              .slice(0, SHEET_MAX);
+          if (owned >= 2 && others.length >= SHEET_DIRECTOR_MIN) {
+            res.status(200).json({
+              kind: 'director',
+              name: director.name,
+              cards: others.map((row, i) => deckCardJSON({
+                ...row, score: 0,
+                families: deck.familiesOf(candidateOf(row)), kind: 'sheet',
+              }, i, meta)),
+            });
+            return;
+          }
+        }
+
+        const recommendations =
+          detail.recommendations as Record<string, unknown> | undefined;
+        const vein = (Array.isArray(recommendations?.results) ?
+          recommendations?.results as unknown[] : [])
+            .map((raw) => poolRowFrom(
+                raw as Record<string, unknown>, 'neighbors', []))
+            .filter((row): row is DeckPoolRow => row !== null && servable(row))
+            .map((row) => {
+              const candidate = {...candidateOf(row), neighborCount: 1};
+              const families = deck.familiesOf(candidate);
+              return {row, families, pSeen: deck.pSeenOf(
+                  model, candidate, families, declared.birthDecade)};
+            })
+            .filter((entry) => entry.pSeen >= SHEET_VEIN_P_SEEN)
+            .sort((a, b) => b.pSeen - a.pSeen)
+            .slice(0, SHEET_MAX);
+        if (vein.length >= SHEET_VEIN_MIN) {
+          res.status(200).json({
+            kind: 'vein',
+            name: null,
+            cards: vein.map((entry, i) => deckCardJSON({
+              ...entry.row, score: 0, pSeen: entry.pSeen,
+              families: entry.families, kind: 'sheet',
+            }, i, meta)),
+          });
+          return;
+        }
+        res.status(200).json({kind: null, name: null, cards: []});
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getDeckSheet failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
@@ -8107,6 +8366,10 @@ export const resetSwipeSkips = onRequest(
         const deleted = await deleteCollection(
             db, db.collection('users').doc(uid).collection('swipeSkips'),
         );
+        // Le vivier en cache a été construit sans les films qu'on vient de
+        // rendre : il se refait à la prochaine demande.
+        await db.collection('users').doc(uid)
+            .collection('preferences').doc('deckPool').delete();
 
         res.status(200).json({ok: true, deleted});
       } catch (error) {
