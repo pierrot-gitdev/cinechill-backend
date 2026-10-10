@@ -6038,8 +6038,11 @@ function orderForDeck(cards: SwipeCandidate[]): SwipeCandidate[] {
  *  la phase ou le mode change, ou quand il reste trop peu de films à servir.
  * ===================================================================== */
 
-/** Monte quand la forme du vivier change : les anciens se refont. */
-const DECK_POOL_VERSION = 1;
+/**
+ * Monte quand la forme ou les règles du vivier changent : les anciens se
+ * refont. 2 : seuls les films visibles chez soi y entrent.
+ */
+const DECK_POOL_VERSION = 2;
 /** Lots servis par un même vivier avant de le refaire. */
 const DECK_POOL_MAX_LOTS = 2;
 const DECK_POOL_MAX_AGE_MS = 6 * 3600 * 1000;
@@ -6127,6 +6130,146 @@ function poolRowFrom(
     tagged,
     neighborCount: 0,
   };
+}
+
+/* --------------------------------------------------------------------- *
+ *  Ce qu'on a le droit de servir : un vrai film, qu'on peut voir chez soi
+ *
+ *  Le deck demande « tu l'as vu ? ». La question n'a de sens que pour un
+ *  film sorti, et la réponse « à voir » n'en a que pour un film qu'on peut
+ *  regarder : un film encore en salle, une suite annoncée (Uncharted 2) ou
+ *  une fiche de projet (« Untitled Michael Sequel ») ne sont pas des cartes.
+ *  TMDB les renvoie pourtant dans ses recommandations et ses sagas.
+ * --------------------------------------------------------------------- */
+
+/** Votes TMDB minimum : un film que personne n'a noté, personne ne l'a vu. */
+const SERVE_MIN_VOTES = 20;
+/**
+ * Au-delà d'un an après sa première sortie, un film est chez soi : on ne le
+ * vérifie plus. En deçà, on demande à TMDB s'il est sorti en vidéo.
+ */
+const SERVE_SETTLED_DAYS = 365;
+/** Sorties qui mettent un film à la maison : numérique, physique, télé. */
+const HOME_RELEASE_TYPES = [4, 5, 6];
+/**
+ * Pays lus pour la sortie vidéo : la France d'abord, les États-Unis parce
+ * que TMDB y est le plus complet et qu'une sortie numérique y précède
+ * rarement de beaucoup la nôtre.
+ */
+const HOME_RELEASE_COUNTRIES = ['FR', 'US'];
+/** Un film pas encore sorti en vidéo est revérifié au bout d'une semaine. */
+const HOME_RECHECK_MS = 7 * 24 * 3600 * 1000;
+/** Fiches de sorties payées à TMDB par appel, au plus. */
+const HOME_FETCH_PER_CALL = 25;
+
+/**
+ * Un titre de fiche de projet, pas de film.
+ * @param {?string} title Titre.
+ * @return {boolean} Vrai pour « Untitled… » et ses équivalents.
+ */
+function isPlaceholderTitle(title: string | null | undefined): boolean {
+  return /^\s*(untitled|sans titre|projet sans titre)\b/i.test(title ?? '');
+}
+
+/**
+ * Ce qui se vérifie sur la ligne seule : une affiche, une date passée, des
+ * votes, un vrai titre.
+ * @param {DiscoverRow} row Ligne TMDB.
+ * @param {string} today Date du jour, `YYYY-MM-DD`.
+ * @return {boolean} Vrai si la ligne peut être un film servi.
+ */
+function looksServable(row: DiscoverRow, today: string): boolean {
+  return !!row.poster_path &&
+    !!row.release_date && row.release_date <= today &&
+    (row.vote_count ?? 0) >= SERVE_MIN_VOTES &&
+    !isPlaceholderTitle(row.title);
+}
+
+/**
+ * La date de sortie à la maison d'un film, d'après `/release_dates` : la plus
+ * ancienne sortie numérique, physique ou télé en France ou aux États-Unis.
+ * @param {Record<string, unknown>} payload Réponse TMDB.
+ * @return {?string} Date `YYYY-MM-DD`, ou null si aucune n'est connue.
+ */
+function homeReleaseFrom(payload: Record<string, unknown>): string | null {
+  const results = Array.isArray(payload.results) ? payload.results : [];
+  let earliest: string | null = null;
+  for (const raw of results) {
+    const country = raw as {iso_3166_1?: string; release_dates?: unknown};
+    if (!HOME_RELEASE_COUNTRIES.includes(country.iso_3166_1 ?? '')) continue;
+    const dates = Array.isArray(country.release_dates) ?
+      country.release_dates as {type?: number; release_date?: string}[] : [];
+    for (const entry of dates) {
+      if (!HOME_RELEASE_TYPES.includes(entry.type ?? 0)) continue;
+      const day = (entry.release_date ?? '').slice(0, 10);
+      if (day.length === 10 && (earliest === null || day < earliest)) {
+        earliest = day;
+      }
+    }
+  }
+  return earliest;
+}
+
+/**
+ * Garde les films qu'on peut servir : un vrai film, sorti, et visible chez
+ * soi. Un film sorti il y a plus d'un an passe sans appel ; un film plus
+ * récent doit avoir une sortie vidéo connue de TMDB, sinon il est encore en
+ * salle ou pas sorti du tout, et il attend.
+ *
+ * La réponse est gardée dans `filmAxes/{id}`, le cache global des fiches :
+ * une fois sorti en vidéo, un film le reste, et il n'est plus jamais
+ * revérifié. Un film dont on n'a pas pu lire les sorties dans cet appel est
+ * écarté pour ce tour : dans le doute, on ne le sert pas.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {T[]} rows Lignes candidates.
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<T[]>} Lignes servables, dans le même ordre.
+ */
+async function servableRows<T extends DiscoverRow>(
+    db: admin.firestore.Firestore, rows: T[], ctx: TMDBContext,
+): Promise<T[]> {
+  const today = todayISO();
+  const settledBefore = new Date(Date.now() - SERVE_SETTLED_DAYS * 86400000)
+      .toISOString().slice(0, 10);
+  const basic = rows.filter((row) => looksServable(row, today));
+  const recent = Array.from(new Set(basic
+      .filter((row) => (row.release_date ?? '') > settledBefore)
+      .map((row) => row.id)));
+  if (recent.length === 0) return basic;
+
+  const available = new Set<number>();
+  const snaps = await db.getAll(
+      ...recent.map((id) => db.collection('filmAxes').doc(String(id))));
+  const missing: number[] = [];
+  snaps.forEach((snap, index) => {
+    const id = recent[index];
+    const home = snap.get('homeReleaseDate');
+    const checked = snap.get('homeCheckedAt');
+    if (typeof home === 'string' && home <= today) {
+      available.add(id);
+    } else if (checked instanceof admin.firestore.Timestamp &&
+      Date.now() - checked.toMillis() < HOME_RECHECK_MS) {
+      // Vérifié il y a moins d'une semaine, pas encore à la maison.
+    } else {
+      missing.push(id);
+    }
+  });
+
+  const now = admin.firestore.Timestamp.now();
+  await Promise.all(missing.slice(0, HOME_FETCH_PER_CALL).map(async (id) => {
+    try {
+      const payload = await tmdbGET(`/movie/${id}/release_dates`, {}, ctx);
+      const home = homeReleaseFrom(payload);
+      if (home !== null && home <= today) available.add(id);
+      await db.collection('filmAxes').doc(String(id)).set(
+          {homeReleaseDate: home, homeCheckedAt: now}, {merge: true});
+    } catch {
+      // Fiche injoignable : le film attend le prochain tour.
+    }
+  }));
+
+  return basic.filter((row) =>
+    (row.release_date ?? '') <= settledBefore || available.has(row.id));
 }
 
 /**
@@ -6331,9 +6474,11 @@ async function buildDeckPool(
   ): DeckPoolRow | null => {
     if (!raw || typeof raw !== 'object') return null;
     const row = poolRowFrom(raw as Record<string, unknown>, source, tagged);
-    if (!row || !row.poster_path || input.excluded.has(row.id)) return null;
-    // Une sortie à venir n'est pas une carte : personne ne peut l'avoir vue.
-    if (!row.release_date || row.release_date > today) return null;
+    if (!row || input.excluded.has(row.id)) return null;
+    // Une sortie à venir, une fiche de projet, un film que personne n'a
+    // noté : pas une carte. La sortie vidéo se vérifie une fois le vivier
+    // assemblé, en un seul passage.
+    if (!looksServable(row, today)) return null;
     // « Jamais de… » est un filtre dur, pas une préférence à sous-pondérer.
     if ((row.genre_ids ?? []).some((id) => banned.has(id))) return null;
     const known = pool.get(row.id);
@@ -6372,6 +6517,19 @@ async function buildDeckPool(
   }
 
   return Array.from(pool.values()).slice(0, DECK_POOL_MAX_ROWS);
+}
+
+/**
+ * Le vivier, réduit à ce qu'on peut voir chez soi.
+ * @param {DeckPoolInput} input Personne.
+ * @param {admin.firestore.Firestore} db Firestore.
+ * @param {TMDBContext} ctx Jeton et langue.
+ * @return {Promise<DeckPoolRow[]>} Lignes servables.
+ */
+async function buildServablePool(
+    input: DeckPoolInput, db: admin.firestore.Firestore, ctx: TMDBContext,
+): Promise<DeckPoolRow[]> {
+  return servableRows(db, await buildDeckPool(input, ctx), ctx);
 }
 
 /**
@@ -6417,7 +6575,7 @@ async function loadDeckPool(
     }
   }
 
-  const rows = await buildDeckPool(input, ctx);
+  const rows = await buildServablePool(input, db, ctx);
   await ref.set({
     v: DECK_POOL_VERSION,
     builtAt: admin.firestore.Timestamp.now(),
@@ -6625,12 +6783,15 @@ async function buildFilmLot(
   };
   // La règle de saga passe sur le lot, puis sur la réserve en sachant ce
   // que le lot a déjà pris : une saga ne paraît qu'une fois.
-  const cards = await applySagaRule(db, lot.cards.map(asSwipe), blocked, ctx);
+  // La règle de saga peut remplacer une carte par un opus que le vivier n'a
+  // pas vérifié : le lot repasse par la même porte.
+  const cards = await servableRows(db,
+      await applySagaRule(db, lot.cards.map(asSwipe), blocked, ctx), ctx);
   const reserveBlocked = new Set(blocked);
   for (const c of cards) reserveBlocked.add(c.id);
-  const reserve = (await applySagaRule(
+  const reserve = (await servableRows(db, await applySagaRule(
       db, lot.reserve.map(asSwipe), reserveBlocked, ctx,
-  )).filter((c) => !cards.some((card) => card.id === c.id));
+  ), ctx)).filter((c) => !cards.some((card) => card.id === c.id));
 
   const meta = {lotId: newLotId(), phase, mode: args.mode};
   if (cards.length === 0) {
@@ -8105,9 +8266,10 @@ export const getProbeGrid = onRequest(
         const blocked = new Set<number>(exclusions.excluded);
         for (const id of parseExcludeIds(body?.excludeIds)) blocked.add(id);
         const banned = declared.bannedGenreIDs;
+        // Ce qui est propre à la personne. Le reste (sorti, noté, visible
+        // chez soi) passe par `servableRows`, la même porte que le deck.
         const servable = (row: DeckPoolRow) => !blocked.has(row.id) &&
-          !(row.genre_ids ?? []).some((id) => banned.has(id)) &&
-          !!row.release_date && row.release_date <= todayISO();
+          !(row.genre_ids ?? []).some((id) => banned.has(id));
 
         const meta = {lotId: `grid-${stage}`, phase: 'reperage', mode: 'grid'};
         const toCard = (row: DeckPoolRow, i: number) => {
@@ -8120,11 +8282,12 @@ export const getProbeGrid = onRequest(
           const payload = await tmdbGET('/search/movie', {
             'query': query, 'include_adult': 'false', 'page': '1',
           }, ctx);
-          const rows = (Array.isArray(payload.results) ? payload.results : [])
+          const found = (Array.isArray(payload.results) ? payload.results : [])
               .map((raw) => poolRowFrom(
                   raw as Record<string, unknown>, 'family', []))
               .filter((row): row is DeckPoolRow =>
-                row !== null && !!row.poster_path && servable(row))
+                row !== null && servable(row));
+          const rows = (await servableRows(db, found, ctx))
               // Le titre exact d'abord, puis le plus vu : « Alien » doit
               // rendre Alien, pas une parodie au titre plus proche.
               .sort((a, b) => {
@@ -8149,7 +8312,9 @@ export const getProbeGrid = onRequest(
             });
         const probes = await Promise.all(plan.map(({key}) =>
           familyProbes(deck.FAMILIES.find((f) => f.key === key) as deck.Family,
-              ctx).catch(() => [] as DeckPoolRow[])));
+              ctx)
+              .then((rows) => servableRows(db, rows.filter(servable), ctx))
+              .catch(() => [] as DeckPoolRow[])));
 
         const chosen: DeckPoolRow[] = [];
         const taken = new Set<number>();
@@ -8157,7 +8322,7 @@ export const getProbeGrid = onRequest(
           let left = count;
           for (const row of probes[index]) {
             if (left === 0) break;
-            if (taken.has(row.id) || !servable(row)) continue;
+            if (taken.has(row.id)) continue;
             chosen.push(row);
             taken.add(row.id);
             left--;
@@ -8227,10 +8392,9 @@ export const getDeckSheet = onRequest(
         blocked.add(tmdbId);
         for (const id of parseExcludeIds(body?.excludeIds)) blocked.add(id);
         const banned = declared.bannedGenreIDs;
-        const today = todayISO();
+        // Ce qui est propre à la personne ; le reste passe par
+        // `servableRows`, la même porte que le deck.
         const servable = (row: DeckPoolRow) => !blocked.has(row.id) &&
-          !!row.poster_path && !!row.release_date &&
-          row.release_date <= today &&
           !(row.genre_ids ?? []).some((id) => banned.has(id));
         const meta = {
           lotId: `sheet-${tmdbId}`, phase: 'recolte', mode: 'sheet',
@@ -8258,9 +8422,10 @@ export const getDeckSheet = onRequest(
               .filter((row): row is DeckPoolRow => row !== null);
           const owned = directed.filter((row) => galleryIds.has(row.id))
               .length + (galleryIds.has(tmdbId) ? 0 : 1);
-          const others = Array.from(
+          const others = (await servableRows(db, Array.from(
               new Map(directed.map((row) => [row.id, row])).values())
-              .filter((row) => servable(row) && (row.vote_count ?? 0) >= 200)
+              .filter((row) => servable(row) && (row.vote_count ?? 0) >= 200),
+          ctx))
               .sort((a, b) => (b.vote_count ?? 0) - (a.vote_count ?? 0))
               .slice(0, SHEET_MAX);
           if (owned >= 2 && others.length >= SHEET_DIRECTOR_MIN) {
@@ -8278,11 +8443,12 @@ export const getDeckSheet = onRequest(
 
         const recommendations =
           detail.recommendations as Record<string, unknown> | undefined;
-        const vein = (Array.isArray(recommendations?.results) ?
+        const neighbors = (Array.isArray(recommendations?.results) ?
           recommendations?.results as unknown[] : [])
             .map((raw) => poolRowFrom(
                 raw as Record<string, unknown>, 'neighbors', []))
-            .filter((row): row is DeckPoolRow => row !== null && servable(row))
+            .filter((row): row is DeckPoolRow => row !== null && servable(row));
+        const vein = (await servableRows(db, neighbors, ctx))
             .map((row) => {
               const candidate = {...candidateOf(row), neighborCount: 1};
               const families = deck.familiesOf(candidate);
