@@ -6174,14 +6174,22 @@ function isPlaceholderTitle(title: string | null | undefined): boolean {
 /**
  * Ce qui se vérifie sur la ligne seule : une affiche, une date passée, des
  * votes, un vrai titre.
+ *
+ * Un nombre de votes inconnu ne refuse pas : seules les lignes relues de la
+ * bibliothèque n'en ont pas (un film mis en watchlist depuis la fiche), et
+ * la date de sortie suffit à les juger.
  * @param {DiscoverRow} row Ligne TMDB.
  * @param {string} today Date du jour, `YYYY-MM-DD`.
+ * @param {boolean} requirePoster Exiger une affiche.
  * @return {boolean} Vrai si la ligne peut être un film servi.
  */
-function looksServable(row: DiscoverRow, today: string): boolean {
-  return !!row.poster_path &&
+function looksServable(
+    row: DiscoverRow, today: string, requirePoster = true,
+): boolean {
+  return (!requirePoster || !!row.poster_path) &&
     !!row.release_date && row.release_date <= today &&
-    (row.vote_count ?? 0) >= SERVE_MIN_VOTES &&
+    (row.vote_count === null || row.vote_count === undefined ||
+      row.vote_count >= SERVE_MIN_VOTES) &&
     !isPlaceholderTitle(row.title);
 }
 
@@ -6223,15 +6231,18 @@ function homeReleaseFrom(payload: Record<string, unknown>): string | null {
  * @param {admin.firestore.Firestore} db Firestore.
  * @param {T[]} rows Lignes candidates.
  * @param {TMDBContext} ctx Jeton et langue.
+ * @param {boolean} requirePoster Exiger une affiche : la feuille de saga
+ *   sait montrer un opus sans affiche, par son titre.
  * @return {Promise<T[]>} Lignes servables, dans le même ordre.
  */
 async function servableRows<T extends DiscoverRow>(
     db: admin.firestore.Firestore, rows: T[], ctx: TMDBContext,
+    requirePoster = true,
 ): Promise<T[]> {
   const today = todayISO();
   const settledBefore = new Date(Date.now() - SERVE_SETTLED_DAYS * 86400000)
       .toISOString().slice(0, 10);
-  const basic = rows.filter((row) => looksServable(row, today));
+  const basic = rows.filter((row) => looksServable(row, today, requirePoster));
   const recent = Array.from(new Set(basic
       .filter((row) => (row.release_date ?? '') > settledBefore)
       .map((row) => row.id)));
@@ -7155,18 +7166,20 @@ export const getCollection = onRequest(
           return;
         }
 
-        const saga = await loadSaga(getAdmin().firestore(), id, tmdb(req, res));
+        const db = getAdmin().firestore();
+        const ctx = tmdb(req, res);
+        const saga = await loadSaga(db, id, ctx);
         if (!saga) {
           res.status(404).json({error: 'collection_not_found'});
           return;
         }
 
-        const today = new Date().toISOString().slice(0, 10);
+        // Les opus qu'on peut voir chez soi : ni la suite annoncée, ni celle
+        // qui est encore en salle.
         res.status(200).json({
           id: saga.id,
           name: saga.name,
-          parts: saga.parts
-              .filter((part) => part.release_date && part.release_date <= today)
+          parts: (await servableRows(db, saga.parts, ctx, false))
               .map(discoverRowToJSON),
         });
       } catch (error) {
@@ -8987,14 +9000,22 @@ export const getHomeRows = onRequest(
             trendingInitial, declared, theatricalExclusion, tmdb(req, res),
         );
 
+        // Les films des tendances passent par la même porte que le deck :
+        // un film annoncé fait parler de lui bien avant qu'on puisse le voir.
+        // Les séries gardent leur place, dans l'ordre de TMDB.
+        const servableTrendingFilms = new Set((await servableRows(
+            db, trending.filter((row) => row.media_type !== 'tv'),
+            tmdb(req, res),
+        )).map((row) => row.id));
         const trendingRow = await withSeasonCounts(
             cleanHomeRow(
-                seriesAware ? trending :
-                  trending.filter((row) => row.media_type !== 'tv'),
+                trending.filter((row) => row.media_type === 'tv' ?
+                  seriesAware : servableTrendingFilms.has(row.id)),
                 declared, theatricalExclusion,
             ),
             tmdb(req, res),
         );
+        const seeded = await servableRows(db, seededRaw, tmdb(req, res));
 
         res.status(200).json({
           in_theaters: cleanHomeRow(rankedTheaters, declared, noExclusion)
@@ -9003,7 +9024,7 @@ export const getHomeRows = onRequest(
           because_you_watched: seedId === null ? null : {
             seed_id: seedId,
             seed_title: titleById.get(seedId) ?? null,
-            items: cleanHomeRow(seededRaw, declared, seededExclusion)
+            items: cleanHomeRow(seeded, declared, seededExclusion)
                 .map(homeRowToJSON),
           },
         });
@@ -11235,7 +11256,11 @@ async function buildCineMatchCandidates(
   for (const row of [...strictRows, ...personal.values(), ...relaxedRows]) {
     if (!byId.has(row.id)) byId.set(row.id, row);
   }
-  const rows = [...byId.values()];
+  // Ce soir, on regarde chez soi : ni un film encore en salle, ni une sortie
+  // à venir, ni une fiche de projet. Les tris par date et par popularité du
+  // catalogue en ramènent pourtant chaque semaine.
+  const rows = await servableRows(
+      getAdmin().firestore(), [...byId.values()], ctx);
   if (rows.length === 0) {
     return {films: [], enriched: new Map(), relaxed};
   }
