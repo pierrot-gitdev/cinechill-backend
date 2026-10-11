@@ -81,6 +81,14 @@ service cloud.firestore {
         allow read: if isOwner(uid);
         allow write: if false;
       }
+
+      // Les comptes écartés des suggestions. Écrits par
+      // dismissFollowSuggestion, lus par getFollowSuggestions, jamais par
+      // le client : l'app n'en a pas besoin en direct, et rien ne justifie
+      // d'exposer à qui que ce soit la liste de ceux qu'on a écartés.
+      match /dismissedFollowSuggestions/{targetUid} {
+        allow read, write: if false;
+      }
     }
 
     // -----------------------------------------------------------------
@@ -147,6 +155,23 @@ service cloud.firestore {
     // retomber sur TMDB quand le cache ne connaît pas encore la saga.
     // -----------------------------------------------------------------
     match /collections/{collectionId} {
+      allow read, write: if false;
+    }
+
+    // -----------------------------------------------------------------
+    // Les suggestions de comptes à suivre — tenues par getFollowSuggestions.
+    //
+    // tasteIndex porte la liste des films vus de chaque compte : c'est la
+    // galerie, que les règles ferment déjà à autrui, sous une autre forme.
+    // followSuggestionCache est un classement calculé pour un compte. Ni
+    // l'un ni l'autre n'est lu par le client : le serveur n'en renvoie que
+    // des agrégats (nombre de films en commun), jamais les identifiants.
+    // Les règles refusent déjà par défaut ; ces blocs le disent.
+    // -----------------------------------------------------------------
+    match /tasteIndex/{uid} {
+      allow read, write: if false;
+    }
+    match /followSuggestionCache/{uid} {
       allow read, write: if false;
     }
   }

@@ -8804,9 +8804,17 @@ export const deleteAccount = onRequest(
         await detachFromFollowGraph(db, uid);
         await deletePublicIdentity(db, uid);
 
+        // Deux documents tenus par le serveur hors de l'arbre du compte :
+        // l'index de goût (la liste de ses films) et son classement de
+        // suggestions. `recursiveDelete` ne les atteindrait pas.
+        const cleanup = db.batch();
+        cleanup.delete(db.collection('tasteIndex').doc(uid));
+        cleanup.delete(db.collection('followSuggestionCache').doc(uid));
+        await cleanup.commit();
+
         // `recursiveDelete` descend dans toutes les sous-collections, y compris
-        // celles ajoutées plus tard : rien à maintenir ici quand le schéma
-        // évolue.
+        // celles ajoutées plus tard (`dismissedFollowSuggestions` comprise) :
+        // rien à maintenir ici quand le schéma évolue.
         await db.recursiveDelete(userRef);
         await a.auth().deleteUser(uid);
 
@@ -10257,6 +10265,479 @@ export const unfollowUser = onRequest(
         );
       } catch (error) {
         logger.error('unfollowUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Comptes à suivre — getFollowSuggestions / dismissFollowSuggestion.
+//
+// Trois sources de candidats : ceux qui me suivent sans que je les suive,
+// ceux que suivent les gens que je suis, et les comptes les plus actifs pour
+// qu'un nouveau venu sans graphe ait quand même quelqu'un à qui parler. Les
+// films en commun départagent.
+//
+// Le calcul coûteux (deux sauts dans le graphe, index de goût) est gardé en
+// cache par compte. Ce qui doit être exact à la seconde, qui je suis déjà et
+// qui j'ai écarté, est relu à chaque appel : une suggestion qu'on vient de
+// suivre ou d'écarter ne doit jamais réapparaître au rafraîchissement.
+// ---------------------------------------------------------------------------
+
+/** Suggestions renvoyées au plus. */
+const FOLLOW_SUGGESTIONS_MAX = 20;
+/** Durée de vie du classement mis en cache. */
+const FOLLOW_SUGGESTION_CACHE_MS = 12 * 3600 * 1000;
+/** Comptes suivis dont on lit à leur tour les abonnements. */
+const FOLLOW_TWO_HOP_SOURCES = 30;
+/** Abonnements lus chez chacun d'eux, les plus récents d'abord. */
+const FOLLOW_TWO_HOP_FANOUT = 50;
+/** Comptes actifs ajoutés aux candidats, galerie la plus fournie d'abord. */
+const FOLLOW_ACTIVE_ACCOUNTS = 60;
+/** Candidats notés au plus, toutes sources confondues. */
+const FOLLOW_CANDIDATES_MAX = 150;
+/** Films en commun à partir desquels un inconnu vaut d'être montré. */
+const FOLLOW_COMMON_FILMS_MIN = 3;
+/** Galerie minimale d'un compte que rien d'autre ne recommande. */
+const FOLLOW_ACTIVE_GALLERY_MIN = 5;
+/**
+ * Profils relus à chaque appel servi depuis le cache : de quoi remplir la
+ * liste même si quelques comptes ont disparu entretemps.
+ */
+const FOLLOW_REFRESH_WINDOW = 30;
+/** Âge au-delà duquel l'index de goût d'un compte est reconstruit. */
+const TASTE_INDEX_MAX_AGE_MS = 3 * 24 * 3600 * 1000;
+/** Index de goût lus ou reconstruits en parallèle, au plus. */
+const TASTE_INDEX_CONCURRENCY = 10;
+
+/** Un compte suggéré, tel que l'app l'affiche et tel que le cache le garde. */
+interface FollowSuggestion {
+  uid: string;
+  handle: string;
+  displayName: string;
+  avatarURL: string | null;
+  galleryCount: number;
+  followerCount: number;
+  followingCount: number;
+  followsYou: boolean;
+  mutualCount: number;
+  mutualName: string | null;
+  commonCount: number;
+}
+
+/**
+ * Applique `fn` à chaque élément, jamais plus de `limit` à la fois.
+ *
+ * Cent cinquante reconstructions d'index lancées d'un coup ouvriraient
+ * autant de requêtes de galerie simultanées : la latence d'une seule
+ * requête ne s'en trouve pas meilleure, et Firestore commence à refuser.
+ * @param {T[]} items Éléments à traiter.
+ * @param {number} limit Appels simultanés au plus.
+ * @param {Function} fn Traitement d'un élément.
+ * @return {Promise<R[]>} Résultats, dans l'ordre des éléments.
+ */
+async function mapWithConcurrency<T, R>(
+    items: T[], limit: number, fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+      {length: Math.min(limit, items.length)},
+      async () => {
+        while (next < items.length) {
+          const index = next++;
+          results[index] = await fn(items[index]);
+        }
+      },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Les films de la galerie d'un compte, par identifiant TMDB.
+ *
+ * Tenu dans `tasteIndex/{uid}` et reconstruit paresseusement : comparer deux
+ * galeries ne demande que leurs identifiants, et relire la galerie entière de
+ * cent cinquante comptes à chaque calcul coûterait des milliers de lectures.
+ * Trois jours de retard sur un ajout ne changent rien à un « films en
+ * commun ». Pas de déclencheur Firestore pour le tenir à jour : la base n'en
+ * a aucun, et ce n'est pas un compteur pour lequel il vaudrait d'en ouvrir un.
+ * @param {Firestore} db Firestore.
+ * @param {string} uid Compte dont on veut les films.
+ * @return {Promise<number[]>} Identifiants TMDB des films vus.
+ */
+async function tasteIdsFor(db: Firestore, uid: string): Promise<number[]> {
+  const ref = db.collection('tasteIndex').doc(uid);
+  const snap = await ref.get();
+  const updatedAt = snap.get('updatedAt');
+  const stored = snap.get('ids');
+  if (
+    updatedAt instanceof Timestamp &&
+    Date.now() - updatedAt.toMillis() < TASTE_INDEX_MAX_AGE_MS &&
+    Array.isArray(stored)
+  ) {
+    return stored.filter((id): id is number => typeof id === 'number');
+  }
+
+  // `filmsIn` : une série 1399 serait lue comme le film 1399.
+  const gallery = await filmsIn(
+      db.collection('users').doc(uid).collection('gallery'),
+  ).select('tmdbId').get();
+  const ids = [...new Set(gallery.docs
+      .map((doc) => doc.get('tmdbId'))
+      .filter((id): id is number => typeof id === 'number'))];
+  await ref.set({ids, updatedAt: Timestamp.now()});
+  return ids;
+}
+
+/**
+ * Le nom à montrer pour un profil : son nom affiché, à défaut son pseudo.
+ * @param {DocumentSnapshot} snap Profil public.
+ * @return {string | null} Le nom, ou `null` si le profil n'a ni l'un ni
+ *   l'autre.
+ */
+function profileName(snap: DocumentSnapshot): string | null {
+  const displayName = snap.get('displayName');
+  if (typeof displayName === 'string' && displayName.trim()) {
+    return displayName;
+  }
+  const handle = snap.get('handle');
+  return typeof handle === 'string' && handle ? handle : null;
+}
+
+/**
+ * Les champs d'une suggestion qui viennent du profil public.
+ * @param {DocumentSnapshot} snap Profil public.
+ * @return {Object | null} Les champs, ou `null` si le profil n'existe pas
+ *   ou n'a pas de pseudo : un compte sans pseudo ne peut pas être suivi.
+ */
+function suggestionProfileFields(snap: DocumentSnapshot): Pick<
+    FollowSuggestion,
+    'handle' | 'displayName' | 'avatarURL' | 'galleryCount' |
+    'followerCount' | 'followingCount'
+> | null {
+  const handle = snap.get('handle');
+  if (!snap.exists || typeof handle !== 'string' || !handle) return null;
+  const count = (field: string) => {
+    const value = snap.get(field);
+    return typeof value === 'number' ? value : 0;
+  };
+  const avatarURL = snap.get('avatarURL');
+  return {
+    handle,
+    displayName: profileName(snap) ?? handle,
+    avatarURL: typeof avatarURL === 'string' ? avatarURL : null,
+    galleryCount: count('galleryCount'),
+    followerCount: count('followerCount'),
+    followingCount: count('followingCount'),
+  };
+}
+
+/**
+ * Lit des profils publics par paquets, `getAll` n'aimant pas les listes
+ * démesurées.
+ * @param {Firestore} db Firestore.
+ * @param {string[]} uids Comptes à lire.
+ * @return {Promise<Map<string, DocumentSnapshot>>} Profils, par compte.
+ */
+async function readPublicProfiles(
+    db: Firestore, uids: string[],
+): Promise<Map<string, DocumentSnapshot>> {
+  const CHUNK = 100;
+  const chunks: string[][] = [];
+  for (let i = 0; i < uids.length; i += CHUNK) {
+    chunks.push(uids.slice(i, i + CHUNK));
+  }
+  const snaps = await Promise.all(chunks.map((chunk) => db.getAll(
+      ...chunk.map((id) => db.collection('publicProfiles').doc(id)),
+  )));
+  return new Map(snaps.flat().map((snap) => [snap.id, snap]));
+}
+
+/**
+ * Le rang d'une suggestion : qui me suit, puis qui est suivi par ceux que je
+ * suis, puis qui a vu les mêmes films, puis le reste.
+ * @param {FollowSuggestion} candidate Candidat noté.
+ * @return {number} De 4 (le plus haut) à 1.
+ */
+function followSuggestionTier(candidate: FollowSuggestion): number {
+  if (candidate.followsYou) return 4;
+  if (candidate.mutualCount > 0) return 3;
+  if (candidate.commonCount >= FOLLOW_COMMON_FILMS_MIN) return 2;
+  return 1;
+}
+
+/**
+ * Rassemble, note et classe les candidats d'un compte. C'est le calcul que
+ * le cache épargne.
+ * @param {Firestore} db Firestore.
+ * @param {string} me Compte pour lequel on cherche.
+ * @param {QueryDocumentSnapshot[]} followingDocs Mes abonnements, avec leur
+ *   date.
+ * @param {Set<string>} followers Mes abonnés.
+ * @return {Promise<FollowSuggestion[]>} Candidats classés, du meilleur au
+ *   moins bon, sans ceux que je suis déjà.
+ */
+async function scoreFollowCandidates(
+    db: Firestore,
+    me: string,
+    followingDocs: QueryDocumentSnapshot[],
+    followers: Set<string>,
+): Promise<FollowSuggestion[]> {
+  const following = new Set(followingDocs.map((doc) => doc.id));
+  const eligible = (id: string) => id !== me && !following.has(id);
+  const millis = (value: unknown) =>
+    value instanceof Timestamp ? value.toMillis() : 0;
+
+  // Les abonnements récents d'abord : ils disent mieux qui l'on fréquente
+  // aujourd'hui, et c'est le plus récent qui sera nommé comme ami commun.
+  const sources = [...followingDocs]
+      .sort((a, b) => millis(b.get('since')) - millis(a.get('since')))
+      .slice(0, FOLLOW_TWO_HOP_SOURCES)
+      .map((doc) => doc.id);
+
+  const [hops, activeSnap] = await Promise.all([
+    Promise.all(sources.map((source) => db.collection('users').doc(source)
+        .collection('following')
+        .orderBy('since', 'desc')
+        .limit(FOLLOW_TWO_HOP_FANOUT)
+        .select()
+        .get())),
+    db.collection('publicProfiles')
+        .orderBy('galleryCount', 'desc')
+        .limit(FOLLOW_ACTIVE_ACCOUNTS)
+        .get(),
+  ]);
+
+  const mutualCounts = new Map<string, number>();
+  const mutualVia = new Map<string, string>();
+  hops.forEach((snap, index) => {
+    for (const doc of snap.docs) {
+      if (!eligible(doc.id)) continue;
+      mutualCounts.set(doc.id, (mutualCounts.get(doc.id) ?? 0) + 1);
+      // `sources` est trié du plus récent au plus ancien : le premier
+      // arrivé est l'ami commun le plus proche.
+      if (!mutualVia.has(doc.id)) mutualVia.set(doc.id, sources[index]);
+    }
+  });
+
+  // L'ordre de fusion décide qui survit au plafond : les signaux les plus
+  // forts d'abord, les comptes actifs en dernier.
+  const byMutual = [...mutualCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([id]) => id);
+  const candidateIds = [...new Set([
+    ...[...followers].filter(eligible),
+    ...byMutual,
+    ...activeSnap.docs.map((doc) => doc.id).filter(eligible),
+  ])].slice(0, FOLLOW_CANDIDATES_MAX);
+
+  // Les comptes actifs ont déjà leur profil en main ; les amis communs, eux,
+  // ne sont lus que pour leur nom.
+  const profiles = new Map<string, DocumentSnapshot>(
+      activeSnap.docs.map((doc) => [doc.id, doc]),
+  );
+  const viaIds = candidateIds
+      .map((id) => mutualVia.get(id))
+      .filter((id): id is string => !!id);
+  const toRead = [...new Set([...candidateIds, ...viaIds])]
+      .filter((id) => !profiles.has(id));
+  for (const [id, snap] of await readPublicProfiles(db, toRead)) {
+    profiles.set(id, snap);
+  }
+
+  const candidates: FollowSuggestion[] = [];
+  for (const id of candidateIds) {
+    const snap = profiles.get(id);
+    const fields = snap ? suggestionProfileFields(snap) : null;
+    if (!fields) continue;
+    const via = mutualVia.get(id);
+    const viaSnap = via ? profiles.get(via) : undefined;
+    candidates.push({
+      uid: id,
+      ...fields,
+      followsYou: followers.has(id),
+      mutualCount: mutualCounts.get(id) ?? 0,
+      mutualName: viaSnap?.exists ? profileName(viaSnap) : null,
+      commonCount: 0,
+    });
+  }
+
+  // Une galerie vide n'a rien en commun avec personne : inutile alors de
+  // lire ou reconstruire l'index des cent cinquante autres.
+  const mine = new Set(await tasteIdsFor(db, me));
+  if (mine.size > 0) {
+    const theirs = await mapWithConcurrency(
+        candidates, TASTE_INDEX_CONCURRENCY, async (candidate) => {
+          try {
+            return await tasteIdsFor(db, candidate.uid);
+          } catch (error) {
+            // Un index illisible coûte un « films en commun », pas la liste.
+            logger.warn('tasteIdsFor failed', {uid: candidate.uid, error});
+            return [];
+          }
+        },
+    );
+    candidates.forEach((candidate, index) => {
+      candidate.commonCount =
+        theirs[index].filter((id) => mine.has(id)).length;
+    });
+  }
+
+  return candidates
+      // Un compte que rien ne rattache à moi doit au moins avoir de quoi
+      // montrer : une galerie vide n'aide personne à décider.
+      .filter((candidate) => followSuggestionTier(candidate) > 1 ||
+        candidate.galleryCount >= FOLLOW_ACTIVE_GALLERY_MIN)
+      .sort((a, b) =>
+        followSuggestionTier(b) - followSuggestionTier(a) ||
+        b.mutualCount - a.mutualCount ||
+        b.commonCount - a.commonCount ||
+        b.galleryCount - a.galleryCount);
+}
+
+/**
+ * Relit le profil des premières suggestions d'un classement en cache.
+ *
+ * Le cache vit douze heures : un compte supprimé entretemps y resterait, et
+ * le suivre échouerait. Un nom ou un avatar changé y resterait aussi.
+ * Relire une trentaine de profils coûte peu au regard de ces deux erreurs.
+ * @param {Firestore} db Firestore.
+ * @param {FollowSuggestion[]} cached Suggestions déjà filtrées, classées.
+ * @return {Promise<FollowSuggestion[]>} Les premières, à jour, sans les
+ *   comptes disparus.
+ */
+async function refreshFollowSuggestions(
+    db: Firestore, cached: FollowSuggestion[],
+): Promise<FollowSuggestion[]> {
+  const head = cached.slice(0, FOLLOW_REFRESH_WINDOW);
+  const profiles = await readPublicProfiles(db, head.map((s) => s.uid));
+  return head.flatMap((suggestion) => {
+    const snap = profiles.get(suggestion.uid);
+    const fields = snap ? suggestionProfileFields(snap) : null;
+    return fields ? [{...suggestion, ...fields}] : [];
+  });
+}
+
+/**
+ * Les comptes que le compte authentifié pourrait suivre, du plus au moins
+ * proche, avec de quoi dire pourquoi chacun est là.
+ */
+export const getFollowSuggestions = onRequest(
+    {invoker: 'public', timeoutSeconds: 60, memory: '512MiB'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const cacheRef = db.collection('followSuggestionCache').doc(uid);
+        const [followingSnap, followersSnap, dismissedSnap, cacheSnap] =
+          await Promise.all([
+            userRef.collection('following').get(),
+            userRef.collection('followers').select().get(),
+            userRef.collection('dismissedFollowSuggestions').select().get(),
+            cacheRef.get(),
+          ]);
+        const following = new Set(followingSnap.docs.map((doc) => doc.id));
+        const followers = new Set(followersSnap.docs.map((doc) => doc.id));
+        const dismissed = new Set(dismissedSnap.docs.map((doc) => doc.id));
+        const visible = (candidate: FollowSuggestion) =>
+          candidate.uid !== uid &&
+          !following.has(candidate.uid) &&
+          !dismissed.has(candidate.uid);
+
+        const createdAt = cacheSnap.get('createdAt');
+        const cached = cacheSnap.get('candidates');
+        let suggestions: FollowSuggestion[];
+        if (
+          createdAt instanceof Timestamp &&
+          Date.now() - createdAt.toMillis() < FOLLOW_SUGGESTION_CACHE_MS &&
+          Array.isArray(cached)
+        ) {
+          // Les abonnés sont relus à chaque appel : « Te suit » est la raison
+          // la plus forte, et ne doit pas attendre douze heures. Un nouvel
+          // abonné absent du cache passe en tête, son profil est relu juste
+          // après comme les autres.
+          const fromCache = (cached as FollowSuggestion[]).filter(visible)
+              .map((c) => ({...c, followsYou: followers.has(c.uid)}));
+          const known = new Set(fromCache.map((c) => c.uid));
+          const newFollowers: FollowSuggestion[] = [...followers]
+              .filter((f) => !known.has(f) &&
+                visible({uid: f} as FollowSuggestion))
+              .map((f) => ({
+                uid: f, handle: '', displayName: '', avatarURL: null,
+                galleryCount: 0, followerCount: 0, followingCount: 0,
+                followsYou: true, mutualCount: 0, mutualName: null,
+                commonCount: 0,
+              }));
+          const merged = [...newFollowers, ...fromCache]
+              // Tri stable : seuls les abonnés remontent, le reste garde
+              // l'ordre du calcul.
+              .sort((a, b) => Number(b.followsYou) - Number(a.followsYou));
+          suggestions = await refreshFollowSuggestions(db, merged);
+        } else {
+          const scored = await scoreFollowCandidates(
+              db, uid, followingSnap.docs, followers,
+          );
+          await cacheRef.set({candidates: scored, createdAt: Timestamp.now()});
+          suggestions = scored.filter(visible);
+        }
+
+        res.status(200).json({
+          followingCount: following.size,
+          suggestions: suggestions.slice(0, FOLLOW_SUGGESTIONS_MAX),
+        });
+      } catch (error) {
+        logger.error('getFollowSuggestions failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Écarte un compte des suggestions, pour de bon.
+ *
+ * Idempotente : écarter deux fois le même compte réécrit la même date. Le
+ * cache des suggestions n'est pas touché, le filtre de `getFollowSuggestions`
+ * relit cette liste à chaque appel.
+ */
+export const dismissFollowSuggestion = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = req.body?.targetUid;
+        // Un `/` ferait de l'identifiant un chemin, et un uid Firebase ne
+        // dépasse pas 128 caractères : refusé ici plutôt qu'en erreur 500.
+        if (
+          typeof targetUid !== 'string' || !targetUid ||
+          targetUid === uid || targetUid.includes('/') ||
+          targetUid.length > 128
+        ) {
+          res.status(400).json({error: 'invalid_target'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        await db.collection('users').doc(uid)
+            .collection('dismissedFollowSuggestions').doc(targetUid)
+            .set({at: Timestamp.now()});
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('dismissFollowSuggestion failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
