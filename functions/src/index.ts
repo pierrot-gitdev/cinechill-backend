@@ -12761,7 +12761,10 @@ async function writeFiveHistory(
     if (snap.exists && snap.get('kind') === 'five') {
       await ref.set({
         tmdbIds: FieldValue.arrayUnion(...ids),
-        seenIds: FieldValue.arrayUnion(...replace.seenIds),
+        // `arrayUnion` refuse une liste vide : un remplacement de films
+        // écartés seulement (« Pas celui-là ») échouait avec une 500.
+        ...(replace.seenIds.length > 0 ?
+          {seenIds: FieldValue.arrayUnion(...replace.seenIds)} : {}),
         ...(replace.refusedIds && replace.refusedIds.length > 0 ?
           {refusedIds: FieldValue.arrayUnion(...replace.refusedIds)} : {}),
         films: FieldValue.arrayUnion(
