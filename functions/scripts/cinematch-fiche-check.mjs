@@ -209,6 +209,83 @@ check('« d\'après un roman » n\'aide pas à chercher', !keywords.includes(818
 check('les autres mots-clés gardés', keywords.includes(10051));
 
 /* ------------------------------------------------------------------ *
+ *  Affiner : un second film, puis « Comme Heat, mais… ? »
+ * ------------------------------------------------------------------ */
+
+check('deux films : proche des deux > proche d\'un seul',
+    F.pairSimilarity(0.3, 0.3) > F.pairSimilarity(0.6, 0));
+check('deux films : la ressemblance reste entre 0 et 1',
+    F.pairSimilarity(1, 1) === 1 && F.pairSimilarity(0, 0) === 0);
+
+// Le film choisi, deux films presque identiques du même auteur que lui, un
+// d'une autre veine voisine, et un sans rapport.
+const pivot = film(400, {genres: [80, 53], keywords: [40, 41, 42],
+  makers: [500]});
+const sameMaker1 = film(401, {genres: [80, 53], keywords: [40], makers: [500]});
+const sameMaker2 = film(402, {genres: [80, 53], keywords: [40], makers: [500]});
+const otherVein = film(403, {genres: [80, 18], keywords: [42, 43],
+  makers: [501]});
+const unrelated = film(404, {genres: [35], keywords: [90], makers: [502]});
+const nearCmp = new F.FicheComparer(F.buildRarity(
+    [pivot, sameMaker1, sameMaker2, otherVein, unrelated, ...crowd]));
+const neighbours = F.nearFilms(pivot,
+    [sameMaker1, sameMaker2, otherVein, unrelated], nearCmp, new Set(), 2);
+check('voisins : le plus proche d\'abord',
+    neighbours[0] === 401 || neighbours[0] === 402);
+check('voisins : le quasi-double du premier cède sa place',
+    neighbours[1] === 403);
+check('voisins : un film sans rapport n\'est pas proposé',
+    !F.nearFilms(pivot, [unrelated], nearCmp, new Set()).includes(404));
+
+const old1990 = film(410, {decade: 1990, voteCount: 9000, genres: [80, 18]});
+const new2010 = film(411, {decade: 2010, voteCount: 900, genres: [35, 80]});
+check('plus récent : une décennie plus tard compte',
+    F.tweakShift(new2010, old1990, 'recent') > 0 &&
+    F.tweakShift(old1990, new2010, 'recent') < 0);
+check('moins connu : dix fois moins de votes compte',
+    F.tweakShift(new2010, old1990, 'lesser') > 0);
+check('plus léger : une comédie passe devant un drame policier',
+    F.tweakShift(new2010, old1990, 'lighter') > 0 &&
+    F.tweakShift(new2010, old1990, 'darker') < 0);
+check('retouche bornée',
+    Math.abs(F.tweakShift(film(412, {decade: 2020}),
+        film(413, {decade: 1950}), 'recent')) <= 0.8 + 1e-9);
+const offered = F.availableTweaks(
+    film(420, {decade: 2020, voteCount: 300, genres: [35, 10751]}), 2026);
+check('retouches : rien de plus récent qu\'un film de 2020',
+    !offered.includes('recent'));
+check('retouches : un film confidentiel n\'a pas de « Moins connu »',
+    !offered.includes('lesser'));
+check('retouches : une comédie familiale n\'a pas de « Plus léger »',
+    !offered.includes('lighter') && offered.includes('darker'));
+check('retouches : Heat a « Plus récent », « Moins connu », « Plus léger »',
+    F.availableTweaks(heat, 2026).join() === 'recent,lesser,lighter');
+const sombre = film(430, {genres: [16, 10751], keywords: [10614, 1647]});
+const enjoue = film(431, {genres: [16, 10751], keywords: [325782]});
+check('ton : les mots-clés d\'humeur départagent deux films d\'animation',
+    F.toneOf(sombre) < F.toneOf(enjoue));
+check('promesse : plus sombre garde le film triste, pas le film enjoué',
+    F.keepsTweak(sombre, enjoue, 'darker') &&
+    !F.keepsTweak(enjoue, enjoue, 'darker'));
+check('promesse : plus récent exige une décennie plus tard',
+    F.keepsTweak(new2010, old1990, 'recent') &&
+    !F.keepsTweak(old1990, old1990, 'recent'));
+check('promesse : moins connu exige deux fois moins de votes',
+    F.keepsTweak(new2010, old1990, 'lesser') &&
+    !F.keepsTweak(old1990, new2010, 'lesser'));
+check('retouche inconnue refusée', F.tweakKeyOf('louder') === null);
+
+const refinedPool = [sameMaker1, otherVein, unrelated, ...crowd.slice(0, 6)]
+    .map((f) => ({fiche: f, listed: false, shift: 0}));
+const withSecond = F.rankPicks(refinedPool, pivot, [], nearCmp,
+    {second: otherVein});
+check('second film : ce qui ressemble aux deux passe devant',
+    withSecond[0].fiche.id !== sameMaker1.id ||
+    withSecond[0].terms.similarity < 0.5);
+check('sans second film, rien ne change',
+    F.rankPicks(refinedPool, pivot, [], nearCmp)[0].terms.tweak === 0);
+
+/* ------------------------------------------------------------------ *
  *  Performance : une soirée réelle compare ~70 candidats à ~30 films
  * ------------------------------------------------------------------ */
 

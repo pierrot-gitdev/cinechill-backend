@@ -14216,7 +14216,9 @@ export const getCineMatchDaily = onRequest(
         // sans film choisi : la ressemblance aux coups de cœur et la
         // réception. Le rang suit le jour de l'année, pour ne pas reproposer
         // le même film tant que la galerie ne bouge pas.
-        const request: PicksRequest = {anchorId: null, style: null, count: 5};
+        const request: PicksRequest = {
+          anchorId: null, secondId: null, tweak: null, style: null, count: 5,
+        };
         const dayIndex = ((dayOfYearFrom(today) % 5) + 5) % 5;
 
         if (format === 'series') {
@@ -14388,7 +14390,7 @@ const PICKS_TASTE_SEEDS = 8;
  * de lui qu'on cherche ce soir.
  */
 const PICK_SOURCE_WEIGHTS: Record<string, number> = {
-  anchor: 3, keywords: 2, crew: 2, genre: 2, style: 1, taste: 1,
+  anchor: 3, second: 3, keywords: 2, crew: 2, genre: 2, style: 1, taste: 1,
   watchlist: 1, catalogue: 0,
 };
 /**
@@ -14397,9 +14399,15 @@ const PICK_SOURCE_WEIGHTS: Record<string, number> = {
  * d'Interstellar évinçaient les films de Christopher Nolan.
  */
 const PICK_SOURCE_QUOTAS: Record<string, number> = {
-  anchor: 20, crew: 12, keywords: 12, genre: 14, style: 8, taste: 24,
-  watchlist: 8, catalogue: 10,
+  anchor: 20, second: 12, crew: 12, keywords: 12, genre: 14, style: 8,
+  taste: 24, watchlist: 8, catalogue: 10,
 };
+/**
+ * Les films de la galerie dont on paie la fiche pour trouver les voisins du
+ * film choisi (« Plutôt du côté de… ? ») : ceux qui partagent le plus de
+ * genres avec lui. Au-delà, un voisin réel serait rarissime.
+ */
+const NEAR_CANDIDATES = 40;
 /**
  * L'avance d'un film qui tient la durée et les plateformes demandées, quand
  * il a fallu élargir pour en trouver assez : la même que dans le moteur v2.
@@ -14665,6 +14673,60 @@ async function knownFilmsOfStyle(
 }
 
 /**
+ * L'écran « Plutôt du côté de… ? » : les films de la galerie proches du film
+ * choisi, différents entre eux, et les retouches qui ont un sens pour lui.
+ * On ne compare que les films qui partagent au moins un genre avec lui :
+ * un voisin sans genre commun est rarissime, et chaque fiche se paie.
+ * @param {Firestore} db Firestore.
+ * @param {CineMatchFormat} format Films ou séries.
+ * @param {number} nearId Le film choisi.
+ * @param {StarterFilm[]} gallery La galerie.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Object>} `{near, films, tweaks}`.
+ */
+async function nearStarters(
+    db: Firestore,
+    format: CineMatchFormat,
+    nearId: number,
+    gallery: StarterFilm[],
+    ctx: TMDBContext,
+): Promise<Record<string, unknown>> {
+  const load = (ids: number[], max: number) => format === 'series' ?
+    loadSeriesFiches(db, ids, ctx, max) : loadMovieFiches(db, ids, ctx, max);
+  const anchor = (await load([nearId], 1)).get(nearId);
+  if (!anchor) return {near: nearId, films: [], tweaks: []};
+  const close = gallery
+      .filter((film) => film.id !== nearId)
+      .map((film) => ({film, overlap: genreOverlap(film.genreIds,
+          anchor.genres)}))
+      .filter((entry) => entry.overlap > 0)
+      .sort((a, b) => b.overlap - a.overlap || a.film.id - b.film.id)
+      .slice(0, NEAR_CANDIDATES)
+      .map((entry) => entry.film);
+  const sheets = await load(close.map((film) => film.id), NEAR_CANDIDATES);
+  const sheetOf = (film: StarterFilm): fiche.Fiche =>
+    sheets.get(film.id) ?? fiche.thinFiche({
+      id: film.id, genreIds: film.genreIds, releaseDate: film.releaseDate,
+    });
+  // La rareté se mesure sur toute la galerie : les films qui ne partagent
+  // aucun genre avec le film choisi y comptent par leurs genres.
+  const comparer = new fiche.FicheComparer(fiche.buildRarity(
+      [anchor, ...gallery.filter((film) => film.id !== nearId).map(sheetOf)]));
+  const order = fiche.nearFilms(anchor, close.map(sheetOf), comparer,
+      new Set(gallery.filter((film) => film.loved).map((film) => film.id)),
+      STARTERS_PER_PAGE);
+  const byId = new Map(gallery.map((film) => [film.id, film]));
+  return {
+    near: nearId,
+    films: order
+        .map((id) => byId.get(id))
+        .filter((film): film is StarterFilm => film !== undefined)
+        .map((film) => starterFilmJSON(film)),
+    tweaks: fiche.availableTweaks(anchor, new Date().getFullYear()),
+  };
+}
+
+/**
  * L'écran de départ de CinéMatch.
  *
  * Sans style : les dix styles, du plus présent dans la galerie au moins
@@ -14681,6 +14743,10 @@ async function knownFilmsOfStyle(
  * fiches du style entrent en cache (24 par appel), et une page comptée sur
  * l'ordre de l'appel précédent remontrait un film. Testé le 12 octobre sur
  * 44 thrillers : deux films de la première page revenaient à la deuxième.
+ *
+ * Avec `nearId` (le film choisi) : l'écran « Plutôt du côté de… ? », six
+ * films de la galerie proches de lui et différents entre eux, et les
+ * retouches de « Comme Heat, mais… ? » qui ont un sens pour lui.
  */
 export const getCineMatchStarters = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
@@ -14701,12 +14767,21 @@ export const getCineMatchStarters = onRequest(
           pageRaw <= 100 ? pageRaw : 0;
         const shownIds =
           new Set(parseTmdbIdList(body.shownIds, STARTERS_SHOWN_MAX));
+        const nearRaw = Number(body.nearId);
+        const nearId = Number.isInteger(nearRaw) && nearRaw > 0 ?
+          nearRaw : null;
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
         const ctx = tmdb(req, res);
         const films = await loadStarterGallery(db, userRef, format, ctx);
         const day = parisDay(new Date());
+
+        if (nearId !== null) {
+          res.status(200).json(
+              await nearStarters(db, format, nearId, films, ctx));
+          return;
+        }
 
         if (style === null) {
           const random = engine.seededRandom(`${uid}:${day}:styles`);
@@ -14802,6 +14877,10 @@ export const getCineMatchStarters = onRequest(
 /** Ce que l'app demande pour les cinq. */
 interface PicksRequest {
   anchorId: number | null;
+  /** Le second film (« Plutôt du côté de… ? »), seulement avec le premier. */
+  secondId: number | null;
+  /** La retouche (« Comme Heat, mais… ? »), seulement avec un film choisi. */
+  tweak: fiche.TweakKey | null;
   style: fiche.StyleKey | null;
   /** Nombre de films voulus : cinq, ou un par film à remplacer. */
   count: number;
@@ -14940,9 +15019,11 @@ function takePickRow(
  * film choisi ce que TMDB recommande et juge similaire, les films qui
  * partagent ses mots-clés les plus rares, ceux de son réalisateur ; les
  * films connus du style ; la watchlist. Sans film choisi, le voisinage des
- * coups de cœur récents.
+ * coups de cœur récents. Avec un second film, ce que TMDB recommande autour
+ * de lui et les films de son réalisateur.
  * @param {CineMatchSetup} setup La soirée.
  * @param {?fiche.Fiche} anchor Le film choisi.
+ * @param {?fiche.Fiche} second Le second film, s'il y en a un.
  * @param {?fiche.StyleKey} style Le style choisi.
  * @param {boolean} relaxed Aller chercher hors durée et plateformes.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
@@ -14951,6 +15032,7 @@ function takePickRow(
 async function buildFilmPickPool(
     setup: CineMatchSetup,
     anchor: fiche.Fiche | null,
+    second: fiche.Fiche | null,
     style: fiche.StyleKey | null,
     relaxed: boolean,
     ctx: TMDBContext,
@@ -14995,6 +15077,16 @@ async function buildFilmPickPool(
         }});
       }
     }
+    if (second) {
+      requests.push({source: 'second',
+        path: `/movie/${second.id}/recommendations`, query: {page: '1'}});
+      if (second.makers.length > 0) {
+        requests.push({source: 'second', path: '/discover/movie', query: {
+          ...base, with_crew: String(second.makers[0]),
+          sort_by: 'vote_count.desc', page: '1',
+        }});
+      }
+    }
   } else {
     const loved = gallery.positioned
         .filter((entry) => entry.lovedAtMillis !== null)
@@ -15019,6 +15111,7 @@ async function buildFilmPickPool(
   const excluded = new Set(setup.extraExcludedIds ?? []);
   const keepListed = (row: DiscoverRow): boolean =>
     typeof row.id === 'number' && row.id !== anchor?.id &&
+    row.id !== second?.id &&
     !gallery.seenIds.has(row.id) && !excluded.has(row.id) &&
     !(situation.company === 'family' &&
       (row.genre_ids ?? []).includes(GENRE_HORROR));
@@ -15080,6 +15173,7 @@ async function buildFilmPickPool(
  * @param {Firestore} db Firestore, pour le cache des fiches.
  * @param {CineMatchSetup} setup La soirée.
  * @param {?fiche.Fiche} anchor La série choisie.
+ * @param {?fiche.Fiche} second La seconde série, s'il y en a une.
  * @param {?fiche.StyleKey} style Le style choisi.
  * @param {boolean} relaxed Aller chercher hors durée et plateformes.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
@@ -15089,6 +15183,7 @@ async function buildSeriesPickPool(
     db: Firestore,
     setup: CineMatchSetup,
     anchor: fiche.Fiche | null,
+    second: fiche.Fiche | null,
     style: fiche.StyleKey | null,
     relaxed: boolean,
     ctx: TMDBContext,
@@ -15120,6 +15215,10 @@ async function buildSeriesPickPool(
         sort_by: 'vote_count.desc', page: '1',
       }});
     }
+    if (second) {
+      requests.push({source: 'second',
+        path: `/tv/${second.id}/recommendations`, query: {page: '1'}});
+    }
   } else {
     const loved = gallery.positioned
         .filter((entry) => entry.film.loved)
@@ -15144,7 +15243,8 @@ async function buildSeriesPickPool(
   ]);
   const excluded = new Set(setup.extraExcludedIds ?? []);
   const keep = (row: DiscoverRow): boolean =>
-    row.id !== anchor?.id && !gallery.seenIds.has(row.id) &&
+    row.id !== anchor?.id && row.id !== second?.id &&
+    !gallery.seenIds.has(row.id) &&
     !excluded.has(row.id) &&
     (row.vote_count ?? 0) >= SERIES_CINEMATCH_VOTE_FLOOR &&
     !(row.genre_ids ?? []).some((id) => TV_EXCLUDED_GENRES.includes(id));
@@ -15196,6 +15296,7 @@ async function buildSeriesPickPool(
  * @param {fiche.Fiche[]} loved Les coups de cœur.
  * @param {fiche.Fiche[]} reference La galerie, où se mesure la rareté.
  * @param {number} count Nombre de films voulus.
+ * @param {fiche.RefineOptions} refine Second film et retouche.
  * @return {Object} Les films retenus et ce qui a été élargi.
  */
 function rankPickPool<E>(
@@ -15205,6 +15306,7 @@ function rankPickPool<E>(
     loved: fiche.Fiche[],
     reference: fiche.Fiche[],
     count: number,
+    refine: fiche.RefineOptions,
 ): {
   picks: fiche.RankedPick[];
   ranked: fiche.RankedPick[];
@@ -15255,9 +15357,19 @@ function rankPickPool<E>(
   // l'écarte, sauf si l'écarter ne laisse plus de quoi choisir.
   const received = candidates.filter((c) =>
     fiche.receptionOf(c.fiche) >= PICK_MIN_RECEPTION);
+  const usable = received.length >= count * 2 ? received : candidates;
+  // « Comme Heat, mais plus récent » : chacun des cinq doit l'être, tant
+  // qu'il en reste de quoi choisir. Sinon la retouche ne fait que décaler
+  // la note (voir `fiche.keepsTweak`).
+  const tweak = refine.tweak ?? null;
+  const tweaked = anchor && tweak ? usable.filter((c) =>
+    fiche.keepsTweak(c.fiche, anchor, tweak)) : usable;
+  // Trois de plus que le nombre voulu suffisent : exiger le double laissait
+  // « Plus sombre » sans effet sur le Voyage de Chihiro (neuf films sombres
+  // parmi soixante-dix-sept).
   const ranked = fiche.rankPicks(
-      received.length >= count * 2 ? received : candidates,
-      anchor, loved, comparer);
+      tweaked.length >= count + 3 ? tweaked : usable,
+      anchor, loved, comparer, refine);
   return {
     picks: fiche.composePicks(ranked, comparer, count, anchor === null),
     ranked,
@@ -15291,16 +15403,22 @@ async function runFilmPicks(
   const galleryIds = [...lovedIds, ...entries
       .map((entry) => entry.film.id)
       .filter((id) => !lovedIds.includes(id))];
+  const chosenIds = [request.anchorId, request.secondId]
+      .filter((id): id is number => id !== null);
   const [gallerySheets, anchorSheets] = await Promise.all([
     loadMovieFiches(db, galleryIds, ctx, PICKS_LOVED_FETCH),
-    loadMovieFiches(db, request.anchorId ? [request.anchorId] : [], ctx, 1),
+    loadMovieFiches(db, chosenIds, ctx, 2),
   ]);
   const anchor = request.anchorId ?
     anchorSheets.get(request.anchorId) ?? null : null;
+  const second = anchor && request.secondId ?
+    anchorSheets.get(request.secondId) ?? null : null;
+  const refine = {second, tweak: request.tweak};
   const loved = lovedIds
       .map((id) => gallerySheets.get(id))
       .filter((sheet): sheet is fiche.Fiche =>
-        sheet !== undefined && sheet.id !== anchor?.id);
+        sheet !== undefined && sheet.id !== anchor?.id &&
+        sheet.id !== second?.id);
   const reference = entries.map((entry) =>
     gallerySheets.get(entry.film.id) ?? fiche.thinFiche({
       id: entry.film.id, genreIds: entry.film.genreIds,
@@ -15309,12 +15427,15 @@ async function runFilmPicks(
 
   const constrained = setup.situation.duration !== 'any' ||
     setup.situation.platformIds.length > 0;
-  let pool = await buildFilmPickPool(setup, anchor, request.style, false, ctx);
-  let ranked =
-    rankPickPool(pool, setup, anchor, loved, reference, request.count);
+  let pool = await buildFilmPickPool(
+      setup, anchor, second, request.style, false, ctx);
+  let ranked = rankPickPool(
+      pool, setup, anchor, loved, reference, request.count, refine);
   if (ranked.picks.length < Math.min(3, request.count) && constrained) {
-    pool = await buildFilmPickPool(setup, anchor, request.style, true, ctx);
-    ranked = rankPickPool(pool, setup, anchor, loved, reference, request.count);
+    pool = await buildFilmPickPool(
+        setup, anchor, second, request.style, true, ctx);
+    ranked = rankPickPool(
+        pool, setup, anchor, loved, reference, request.count, refine);
   }
   return {...ranked, anchor, sources: pool.sources, enriched: pool.enriched};
 }
@@ -15338,16 +15459,22 @@ async function runSeriesPicks(
       .filter((entry) => entry.film.loved)
       .map((entry) => entry.film.id);
   const sheets = await loadSeriesFiches(db, [
-    ...(request.anchorId ? [request.anchorId] : []), ...lovedIds,
+    ...(request.anchorId ? [request.anchorId] : []),
+    ...(request.anchorId && request.secondId ? [request.secondId] : []),
+    ...lovedIds,
     ...entries.map((entry) => entry.film.id)
         .filter((id) => !lovedIds.includes(id)),
   ], ctx, PICKS_LOVED_FETCH);
   const anchor = request.anchorId ?
     sheets.get(request.anchorId) ?? null : null;
+  const second = anchor && request.secondId ?
+    sheets.get(request.secondId) ?? null : null;
+  const refine = {second, tweak: request.tweak};
   const loved = lovedIds
       .map((id) => sheets.get(id))
       .filter((sheet): sheet is fiche.Fiche =>
-        sheet !== undefined && sheet.id !== anchor?.id);
+        sheet !== undefined && sheet.id !== anchor?.id &&
+        sheet.id !== second?.id);
   const reference = entries.map((entry) =>
     sheets.get(entry.film.id) ?? fiche.thinFiche({
       id: entry.film.id, genreIds: entry.film.genreIds,
@@ -15357,13 +15484,14 @@ async function runSeriesPicks(
   const constrained = setup.situation.duration !== 'any' ||
     setup.situation.platformIds.length > 0;
   let pool = await buildSeriesPickPool(
-      db, setup, anchor, request.style, false, ctx);
-  let ranked =
-    rankPickPool(pool, setup, anchor, loved, reference, request.count);
+      db, setup, anchor, second, request.style, false, ctx);
+  let ranked = rankPickPool(
+      pool, setup, anchor, loved, reference, request.count, refine);
   if (ranked.picks.length < Math.min(3, request.count) && constrained) {
     pool = await buildSeriesPickPool(
-        db, setup, anchor, request.style, true, ctx);
-    ranked = rankPickPool(pool, setup, anchor, loved, reference, request.count);
+        db, setup, anchor, second, request.style, true, ctx);
+    ranked = rankPickPool(
+        pool, setup, anchor, loved, reference, request.count, refine);
   }
   return {...ranked, anchor, sources: pool.sources, enriched: pool.enriched};
 }
@@ -15440,10 +15568,17 @@ export const getCineMatchPicks = onRequest(
         const anchorId = Number.isInteger(anchorRaw) && anchorRaw > 0 ?
           anchorRaw : null;
         const style = fiche.styleKeyOf(body.style);
+        // Le second film et la retouche n'ont de sens qu'avec un film choisi.
+        const secondRaw = Number(body.secondId);
+        const secondId = anchorId !== null && Number.isInteger(secondRaw) &&
+          secondRaw > 0 && secondRaw !== anchorId ? secondRaw : null;
+        const tweak = anchorId !== null ? fiche.tweakKeyOf(body.tweak) : null;
         const situation = parseCineMatchSituation(body.situation);
         const replace = parsePicksReplace(body.replace);
         const request: PicksRequest = {
           anchorId,
+          secondId,
+          tweak,
           style,
           count: replace ?
             replace.seenIds.length + (replace.refusedIds?.length ?? 0) : 5,
@@ -15458,7 +15593,9 @@ export const getCineMatchPicks = onRequest(
               ...(replace.refusedIds ?? []),
             ],
           } : setup;
-        const answers = {situation, anchorId, style, engine: 'fiche'};
+        const answers = {
+          situation, anchorId, secondId, tweak, style, engine: 'fiche',
+        };
 
         const db = getAdmin().firestore();
         const ctx = tmdb(req, res);

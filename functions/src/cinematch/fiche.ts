@@ -571,13 +571,26 @@ export interface PickCandidate {
 
 /** Ce qui fait la note d'un candidat, pour le journal. */
 export interface PickTerms {
-  /** Ressemblance brute au film choisi, de 0 à 1 (non pondérée). */
+  /**
+   * Ressemblance brute au film choisi, de 0 à 1 (non pondérée). Avec un
+   * second film, la ressemblance aux deux (voir `pairSimilarity`).
+   */
   similarity: number;
   anchor: number;
   taste: number;
   reception: number;
   listed: number;
   shift: number;
+  /** L'effet de « Comme Heat, mais… ? ». */
+  tweak: number;
+}
+
+/** Ce qui affine la soirée après le film choisi. */
+export interface RefineOptions {
+  /** Le second film, choisi parmi les voisins du premier. */
+  second?: Fiche | null;
+  /** La retouche de « Comme Heat, mais… ? ». */
+  tweak?: TweakKey | null;
 }
 
 export interface RankedPick {
@@ -658,6 +671,7 @@ function tasteOf(
  * @param {?Fiche} anchor Le film choisi, ou null.
  * @param {Fiche[]} loved Les coups de cœur.
  * @param {FicheComparer} comparer Le comparateur de la soirée.
+ * @param {RefineOptions} refine Second film et retouche, s'il y en a.
  * @return {RankedPick[]} Films classés, meilleur en tête.
  */
 export function rankPicks(
@@ -665,11 +679,18 @@ export function rankPicks(
     anchor: Fiche | null,
     loved: Fiche[],
     comparer: FicheComparer,
+    refine: RefineOptions = {},
 ): RankedPick[] {
   const shares = anchor ? SHARES_WITH_ANCHOR :
     loved.length > 0 ? SHARES_WITHOUT_ANCHOR : SHARES_RECEPTION_ONLY;
-  const rawAnchor = candidates.map((c) =>
-    anchor ? comparer.similarity(anchor, c.fiche) : 0);
+  const second = anchor ? refine.second ?? null : null;
+  const tweak = anchor ? refine.tweak ?? null : null;
+  const rawAnchor = candidates.map((c) => {
+    if (!anchor) return 0;
+    const first = comparer.similarity(anchor, c.fiche);
+    return second ?
+      pairSimilarity(first, comparer.similarity(second, c.fiche)) : first;
+  });
   const rawTaste = candidates.map((c) => tasteOf(c.fiche, loved, comparer));
   const rawReception = candidates.map((c) => receptionOf(c.fiche));
   const clamp = (v: number): number =>
@@ -686,9 +707,10 @@ export function rankPicks(
       reception: shares.reception * zReception[i],
       listed: c.listed ? LISTED_BONUS : 0,
       shift: c.shift,
+      tweak: anchor && tweak ? tweakShift(c.fiche, anchor, tweak) : 0,
     };
     const score = terms.anchor + terms.taste + terms.reception +
-      terms.listed + terms.shift;
+      terms.listed + terms.shift + terms.tweak;
     return {fiche: c.fiche, listed: c.listed, score, terms};
   }).sort((a, b) => b.score - a.score || a.fiche.id - b.fiche.id);
 }
@@ -818,4 +840,305 @@ export function anchorKeywords(
         (rarity.counts.get(`keywords|${a}`) ?? 0) -
         (rarity.counts.get(`keywords|${b}`) ?? 0))
       .slice(0, count);
+}
+
+/* --------------------------------------------------------------------- *
+ *  Affiner : un second film, puis « Comme Heat, mais… ? »
+ * --------------------------------------------------------------------- */
+
+/**
+ * La ressemblance à deux films à la fois. Un film proche d'un seul des deux
+ * n'est pas ce qu'on a demandé en choisissant Heat puis Drive : la plus
+ * faible des deux ressemblances compte pour moitié, la moyenne pour l'autre
+ * moitié. Collateral, proche des deux, passe devant Le Parrain, proche de
+ * Heat seulement.
+ * @param {number} first Ressemblance au premier film.
+ * @param {number} second Ressemblance au second.
+ * @return {number} De 0 à 1.
+ */
+export function pairSimilarity(first: number, second: number): number {
+  return (first + second) / 4 + Math.min(first, second) / 2;
+}
+
+/**
+ * En deçà, un film de la galerie ne passe pas pour proche du film choisi :
+ * deux films qui ne partagent qu'un genre et une décennie arrivent vers
+ * 0,08. Le seuil monte aussi à la moitié du plus proche, pour qu'une
+ * galerie riche ne propose que de vrais voisins. Réglé le 12 octobre sur
+ * la galerie de test (Heat, Chihiro, Le Prénom, Interstellar, La La Land).
+ */
+const NEAR_MIN_SIMILARITY = 0.12;
+const NEAR_RELATIVE = 0.5;
+/** Les plus proches, parmi lesquels se choisissent les six. */
+const NEAR_POOL = 12;
+/**
+ * Ce que coûte la ressemblance à un film déjà retenu : on veut six pistes.
+ * À 1, la variété l'emportait sur la proximité (Matrix et Top Gun :
+ * Maverick parmi les voisins de Heat) ; à 0,5, Léon, Les Affranchis, Kill
+ * Bill, Usual Suspects, Trainspotting, The Big Lebowski.
+ */
+const NEAR_DIVERSITY = 0.5;
+/**
+ * Un quasi-double d'un film déjà retenu (même saga, ou ressemblance au-delà
+ * de ce seuil) n'ouvre aucune piste : Kill Bill 2 après Kill Bill 1. Les
+ * films réels les plus proches restent sous 0,5 (Interstellar et Inception,
+ * 0,48).
+ */
+const NEAR_DUPLICATE = 0.75;
+/** Un coup de cœur passe devant un film à peine plus proche. */
+const NEAR_LOVED_BONUS = 0.03;
+
+/**
+ * Les films de la galerie à proposer comme second film : proches du premier,
+ * et le plus différents possible entre eux, pour que chacun tire la soirée
+ * dans sa direction. Pour Heat : Léon, Les Affranchis, Kill Bill, Usual
+ * Suspects, plutôt que quatre films de gangsters des années 1990.
+ * @param {Fiche} anchor Le film choisi.
+ * @param {Fiche[]} others Les autres films de la galerie.
+ * @param {FicheComparer} comparer Le comparateur.
+ * @param {Set<number>} loved Les coups de cœur.
+ * @param {number} count Nombre voulu.
+ * @return {number[]} Identifiants, le plus proche d'abord. Peut être court,
+ *   ou vide quand la galerie n'a rien de proche.
+ */
+export function nearFilms(
+    anchor: Fiche,
+    others: Fiche[],
+    comparer: FicheComparer,
+    loved: Set<number>,
+    count = 6,
+): number[] {
+  const scored = others
+      .filter((other) => other.id !== anchor.id)
+      .map((other) => ({
+        fiche: other,
+        similarity: comparer.similarity(anchor, other),
+        value: comparer.similarity(anchor, other) +
+          (loved.has(other.id) ? NEAR_LOVED_BONUS : 0),
+      }));
+  const closest = Math.max(0, ...scored.map((entry) => entry.similarity));
+  const floor = Math.max(NEAR_MIN_SIMILARITY, NEAR_RELATIVE * closest);
+  const pool = scored
+      .filter((entry) => entry.similarity >= floor)
+      .sort((a, b) => b.value - a.value || a.fiche.id - b.fiche.id)
+      .slice(0, NEAR_POOL);
+  const chosen: Fiche[] = [];
+  while (chosen.length < count && chosen.length < pool.length) {
+    let best: Fiche | null = null;
+    let bestValue = -Infinity;
+    for (const entry of pool) {
+      if (chosen.includes(entry.fiche)) continue;
+      const saga = entry.fiche.collection;
+      if (saga !== null && chosen.some((taken) => taken.collection === saga)) {
+        continue;
+      }
+      let closest = 0;
+      for (const taken of chosen) {
+        closest = Math.max(closest,
+            comparer.similarity(entry.fiche, taken));
+      }
+      if (closest >= NEAR_DUPLICATE) continue;
+      const value = entry.value - NEAR_DIVERSITY * closest;
+      if (value > bestValue) {
+        bestValue = value;
+        best = entry.fiche;
+      }
+    }
+    if (!best) break;
+    chosen.push(best);
+  }
+  return chosen.map((sheet) => sheet.id);
+}
+
+/** Les retouches de « Comme Heat, mais… ? ». */
+export type TweakKey = 'recent' | 'lesser' | 'lighter' | 'darker';
+export const TWEAKS: TweakKey[] = ['recent', 'lesser', 'lighter', 'darker'];
+
+/**
+ * Lit une retouche transmise par l'app.
+ * @param {unknown} raw Valeur reçue.
+ * @return {?TweakKey} La retouche, ou null.
+ */
+export function tweakKeyOf(raw: unknown): TweakKey | null {
+  return TWEAKS.find((key) => key === raw) ?? null;
+}
+
+/**
+ * Genres qui allègent un film, de films comme de séries. Le fantastique
+ * n'en est pas : Princesse Mononoké en est autant que Kiki la petite
+ * sorcière.
+ */
+const LIGHT_GENRES = new Set([35, 10751, 16, 10749, 10402, 12, 10762]);
+/** Genres qui l'assombrissent. Le drame reste neutre : il va des deux côtés. */
+const DARK_GENRES = new Set([27, 53, 80, 10752, 9648, 10768]);
+
+/**
+ * Les mots-clés d'humeur de TMDB, posés sur un film sur deux environ :
+ * eux seuls distinguent Le Tombeau des lucioles du Voyage de Chihiro, que
+ * les genres (animation, famille, fantastique) rangent ensemble.
+ */
+const LIGHT_KEYWORDS = new Set([
+  325765, // amused
+  325782, // cheerful
+  325784, // comforting
+  325824, // hopeful
+  288816, // lighthearted
+  319397, // witty
+  309974, // absurd
+  275276, // feelgood
+  324713, // whimsical
+  303310, // joyous
+  259376, // playful
+  325781, // celebratory
+  325807, // enchant
+  281585, // inspirational
+  325856, // vibrant
+  254167, // loving
+  209673, // calm
+]);
+const DARK_KEYWORDS = new Set([
+  10123, // dark comedy
+  321464, // intense
+  314730, // suspenseful
+  14707, // brutality
+  796, // police brutality
+  10614, // tragedy
+  325854, // tragic
+  323809, // depressing
+  1647, // sadness
+  4232, // melancholy
+  210162, // grim
+  280188, // grimdark
+  10292, // gore
+  325818, // frightened
+  251667, // anxious
+  259094, // dark
+  14690, // violent death
+  316832, // tense
+  211659, // somber
+  4426, // sadism
+  325839, // ominous
+  325825, // horrified
+  342828, // violent
+  325823, // harsh
+  372767, // disturbing behavior
+  177895, // dark fantasy
+]);
+
+/**
+ * Le ton d'un film, lu dans ses genres et ses mots-clés d'humeur : 1 tout
+ * léger, −1 tout sombre.
+ * @param {Fiche} sheet La fiche.
+ * @return {number} De −1 à 1, 0 sans rien de parlant.
+ */
+export function toneOf(sheet: Fiche): number {
+  const {light, dark} = toneMarks(sheet);
+  return light + dark === 0 ? 0 : (light - dark) / (light + dark);
+}
+
+/**
+ * Les marques de légèreté et de noirceur d'un film : genres et mots-clés.
+ * @param {Fiche} sheet La fiche.
+ * @return {Object} `{light, dark}`, en nombre de marques.
+ */
+function toneMarks(sheet: Fiche): {light: number; dark: number} {
+  return {
+    light: sheet.genres.filter((id) => LIGHT_GENRES.has(id)).length +
+      sheet.keywords.filter((id) => LIGHT_KEYWORDS.has(id)).length,
+    dark: sheet.genres.filter((id) => DARK_GENRES.has(id)).length +
+      sheet.keywords.filter((id) => DARK_KEYWORDS.has(id)).length,
+  };
+}
+
+/**
+ * Ce que pèse une retouche, au plus, en unités de note. Assez pour faire
+ * passer un voisin récent devant un voisin plus proche mais ancien ; trop
+ * peu pour aller chercher un film sans rapport.
+ */
+const TWEAK_WEIGHT = 0.8;
+/** En deçà, le film choisi est déjà confidentiel : pas de « Moins connu ». */
+const TWEAK_LESSER_MIN_VOTES = 1500;
+
+/**
+ * L'effet d'une retouche sur un candidat, mesuré par rapport au film choisi.
+ * @param {Fiche} candidate Le candidat.
+ * @param {Fiche} anchor Le film choisi.
+ * @param {TweakKey} tweak La retouche.
+ * @return {number} Décalage de note, de −TWEAK_WEIGHT à TWEAK_WEIGHT.
+ */
+export function tweakShift(
+    candidate: Fiche, anchor: Fiche, tweak: TweakKey,
+): number {
+  const bound = (v: number): number =>
+    TWEAK_WEIGHT * Math.max(-1, Math.min(1, v));
+  switch (tweak) {
+    case 'recent':
+    // Une décennie plus tard vaut la moitié, deux la totalité.
+      if (candidate.decade === null || anchor.decade === null) return 0;
+      return bound((candidate.decade - anchor.decade) / 20);
+    case 'lesser': {
+    // Dix fois moins de votes que le film choisi vaut la totalité.
+      const mine = Math.max(50, candidate.voteCount ?? 0);
+      const theirs = Math.max(50, anchor.voteCount ?? 0);
+      return bound(Math.log10(theirs / mine));
+    }
+    case 'lighter':
+      return bound(toneOf(candidate) - toneOf(anchor));
+    case 'darker':
+      return bound(toneOf(anchor) - toneOf(candidate));
+  }
+}
+
+/**
+ * Vrai si le candidat tient la promesse de la retouche : « Comme Heat, mais
+ * plus léger », c'est chacun des cinq plus léger que Heat. Un simple
+ * décalage de note ne suffisait pas : les films de Miyazaki, très proches du
+ * Voyage de Chihiro, restaient les cinq avec « Plus sombre ».
+ * @param {Fiche} candidate Le candidat.
+ * @param {Fiche} anchor Le film choisi.
+ * @param {TweakKey} tweak La retouche.
+ * @return {boolean} Vrai s'il peut être proposé.
+ */
+export function keepsTweak(
+    candidate: Fiche, anchor: Fiche, tweak: TweakKey,
+): boolean {
+  switch (tweak) {
+    case 'recent':
+      return candidate.decade !== null && anchor.decade !== null &&
+        candidate.decade > anchor.decade;
+    case 'lesser':
+      return (candidate.voteCount ?? 0) * 2 <= (anchor.voteCount ?? 0);
+    // Plus léger que Heat, ce n'est pas seulement moins sombre : un drame
+    // historique (Ali) passait. Il faut au moins une marque de légèreté.
+    case 'lighter':
+      return toneMarks(candidate).light > 0 &&
+        toneOf(candidate) > toneOf(anchor);
+    case 'darker':
+      return toneMarks(candidate).dark > 0 &&
+        toneOf(candidate) < toneOf(anchor);
+  }
+}
+
+/**
+ * Les retouches qui ont un sens pour ce film : « Plus récent » pour un film
+ * de 2023, « Moins connu » pour un film confidentiel, « Plus léger » pour une
+ * comédie familiale ne changeraient rien.
+ * @param {Fiche} anchor Le film choisi.
+ * @param {number} year L'année en cours.
+ * @return {TweakKey[]} Retouches proposées, dans l'ordre d'affichage.
+ */
+export function availableTweaks(anchor: Fiche, year: number): TweakKey[] {
+  const tone = toneOf(anchor);
+  return TWEAKS.filter((key) => {
+    switch (key) {
+      case 'recent':
+        return anchor.decade !== null && anchor.decade + 10 <= year - 5;
+      case 'lesser':
+        return (anchor.voteCount ?? 0) >= TWEAK_LESSER_MIN_VOTES;
+      case 'lighter':
+        return tone < 0.5;
+      case 'darker':
+        return tone > -0.5;
+    }
+  });
 }
