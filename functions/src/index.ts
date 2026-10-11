@@ -1127,6 +1127,86 @@ interface MediaItemPayload {
   nextEpisode?: number;
 }
 
+/** Longueurs maximales des textes d'un film reçus du client. */
+const MEDIA_TITLE_MAX = 300;
+const MEDIA_OVERVIEW_MAX = 3000;
+const MEDIA_DIRECTOR_MAX = 200;
+/** Un chemin d'affiche TMDB : `/kqjL17yufvn9OVLyXYpvtyrFfak.jpg`. */
+const POSTER_PATH_PATTERN = /^\/[A-Za-z0-9._-]{1,100}$/;
+/** `movie-603`, `tv-1399`, `tv-1399-s2`. */
+const MEDIA_ID_PATTERN = /^(movie|tv)-(\d{1,9})(-s\d{1,3})?$/;
+
+/**
+ * Un film ou une saison tel que le client l'envoie, vérifié et borné.
+ *
+ * Le serveur recopie ces champs dans la galerie, la watchlist, et jusque
+ * dans la boîte de suggestions de quelqu'un d'autre : sans ce contrôle, un
+ * client modifié pouvait y écrire un titre ou un synopsis de son choix, de
+ * n'importe quelle longueur, sous un identifiant sans rapport avec le film.
+ * L'identifiant doit désormais correspondre au numéro TMDB, les textes sont
+ * tronqués, l'affiche doit être un chemin TMDB. L'app envoie déjà tout cela
+ * sous cette forme : rien ne change pour elle.
+ * @param {unknown} raw L'objet reçu.
+ * @return {?MediaItemPayload} L'objet nettoyé, ou null s'il est invalide.
+ */
+function sanitizeMediaItem(raw: unknown): MediaItemPayload | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const id = typeof item.id === 'string' ? item.id : '';
+  const match = MEDIA_ID_PATTERN.exec(id);
+  const tmdbId = Number(item.tmdbId);
+  if (!match || !Number.isInteger(tmdbId) || tmdbId <= 0 ||
+    Number(match[2]) !== tmdbId || item.mediaType !== match[1]) {
+    return null;
+  }
+  // Une saison n'existe que pour une série.
+  if (match[1] === 'movie' && match[3]) return null;
+  const title = typeof item.title === 'string' ?
+    item.title.trim().slice(0, MEDIA_TITLE_MAX) : '';
+  if (!title) return null;
+  const text = (value: unknown, max: number): string | undefined =>
+    typeof value === 'string' && value.length > 0 ?
+      value.slice(0, max) : undefined;
+  const finite = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  const posterPath = typeof item.posterPath === 'string' &&
+    POSTER_PATH_PATTERN.test(item.posterPath) ? item.posterPath : undefined;
+  const releaseDate = typeof item.releaseDate === 'string' &&
+    /^\d{4}-\d{2}-\d{2}$/.test(item.releaseDate) ?
+    item.releaseDate : undefined;
+  const genreIds = Array.isArray(item.genreIds) ?
+    item.genreIds.filter((g): g is number =>
+      Number.isInteger(g) && (g as number) > 0).slice(0, 20) : [];
+  const out: MediaItemPayload & {
+    voteCount?: number | null; originalLanguage?: string | null;
+  } = {
+    id, tmdbId, mediaType: match[1], title, genreIds,
+  };
+  if (posterPath) out.posterPath = posterPath;
+  const overview = text(item.overview, MEDIA_OVERVIEW_MAX);
+  if (overview) out.overview = overview;
+  const voteAverage = finite(item.voteAverage);
+  if (voteAverage !== undefined) out.voteAverage = voteAverage;
+  if (releaseDate) out.releaseDate = releaseDate;
+  const director = text(item.director, MEDIA_DIRECTOR_MAX);
+  if (director) out.director = director;
+  const collectionId = positiveInt(item.collectionId);
+  if (collectionId !== null) out.collectionId = collectionId;
+  const collectionTotal = positiveInt(item.collectionTotal);
+  if (collectionTotal !== null && collectionTotal <= 200) {
+    out.collectionTotal = collectionTotal;
+  }
+  const nextEpisode = positiveInt(item.nextEpisode);
+  if (nextEpisode !== null) out.nextEpisode = nextEpisode;
+  const voteCount = finite(item.voteCount);
+  if (voteCount !== undefined) out.voteCount = voteCount;
+  if (typeof item.originalLanguage === 'string' &&
+    /^[a-z]{2,3}$/.test(item.originalLanguage)) {
+    out.originalLanguage = item.originalLanguage;
+  }
+  return out;
+}
+
 export const setMediaStatus = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
@@ -1140,13 +1220,13 @@ export const setMediaStatus = onRequest(
         if (!uid) return;
 
         const status = req.body?.status as MediaStatus | undefined;
-        const item = req.body?.item as MediaItemPayload | undefined;
+        const item = sanitizeMediaItem(req.body?.item);
 
         if (!status || !['toWatch', 'seen', 'none'].includes(status)) {
           res.status(400).json({error: 'invalid_status'});
           return;
         }
-        if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
+        if (!item) {
           res.status(400).json({error: 'invalid_item'});
           return;
         }
@@ -7859,11 +7939,9 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
     const decision = entry.decision;
     if (decision !== 'seen' && decision !== 'skipped' &&
       decision !== 'watchlist') continue;
-    let item =
-      entry.item as SwipeDecisionPayload['item'] | undefined;
-    if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
-      continue;
-    }
+    let item = sanitizeMediaItem(entry.item) as
+      SwipeDecisionPayload['item'] | null;
+    if (!item) continue;
     if (item.mediaType === 'tv') {
       if (decision === 'skipped') {
         // « Pas vue » vaut pour la série entière : le deck ne demande jamais
@@ -9981,8 +10059,8 @@ interface SuggestionItem {
  * @return {MediaItemPayload | null} L'item, ou `null` si déjà répondu.
  */
 function readMediaItem(req: Request, res: Response): MediaItemPayload | null {
-  const item = req.body?.item as MediaItemPayload | undefined;
-  if (!item?.id || !item?.tmdbId || !item?.mediaType || !item?.title) {
+  const item = sanitizeMediaItem(req.body?.item);
+  if (!item) {
     res.status(400).json({error: 'invalid_item'});
     return null;
   }
