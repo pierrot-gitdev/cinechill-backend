@@ -726,7 +726,7 @@ function smwOf(
  * @param {number} now Instant présent.
  * @return {number} Pénalité, positive.
  */
-function exposurePenalty(
+export function exposurePenalty(
     record: ExposureRecord | undefined, now: number,
 ): number {
   if (!record || record.lastShownAt === null) return 0;
@@ -751,7 +751,7 @@ function seriesHours(film: EngineFilm): number {
  * @param {?Engagement} engagement Le temps total accepté.
  * @return {number} Positif si elle tient, négatif sinon.
  */
-function engagementFit(
+export function engagementFit(
     film: EngineFilm, engagement: Engagement | null | undefined,
 ): number {
   if (!engagement || engagement === 'any' || engagement === 'season') return 0;
@@ -775,7 +775,7 @@ function engagementFit(
  * @param {?Engagement} engagement Le temps total accepté.
  * @return {number} Décalage brut.
  */
-function statusTerm(
+export function statusTerm(
     film: EngineFilm, engagement: Engagement | null | undefined,
 ): number {
   if (film.status === 'canceled') {

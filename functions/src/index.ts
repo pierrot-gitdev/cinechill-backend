@@ -20,6 +20,7 @@ import {
   WriteBatch,
 } from 'firebase-admin/firestore';
 import * as engine from './cinematch/engine';
+import * as fiche from './cinematch/fiche';
 import * as series from './series';
 import * as deck from './deck/engine';
 
@@ -1702,6 +1703,8 @@ interface EnrichedCandidate extends DiscoverRow {
    * Renseignées seulement à la finalisation, où le client les renvoie. */
   axes?: AxisVector;
   axisSigma?: AxisVector;
+  /** La fiche CinéMatch, tirée du même appel de détail. */
+  fiche?: fiche.Fiche;
   finalScore: number;
   reasons: string[];
 }
@@ -4164,6 +4167,9 @@ async function enrichCandidate(
       certification,
       budget: typeof detail.budget === 'number' ? detail.budget : null,
       keywordNames: keywordNames,
+      // Le même appel porte déjà l'équipe, les acteurs et les identifiants
+      // des mots-clés : la fiche ne coûte rien de plus.
+      fiche: fiche.ficheFromMovieDetail(detail),
       finalScore: 0,
       reasons: [],
     };
@@ -4449,11 +4455,12 @@ async function positionGalleryDocs(
         };
       } else {
         const detail = await tmdbGET(
-            `/movie/${tmdbId}`, {append_to_response: 'keywords'}, ctx,
+            `/movie/${tmdbId}`, {append_to_response: 'keywords,credits'}, ctx,
         );
         position = positionFilmFromDetail(detail);
         // La saga voyage dans la même fiche : la noter ici ne coûte pas un
-        // appel, et c'est autant que le deck n'aura pas à résoudre.
+        // appel, et c'est autant que le deck n'aura pas à résoudre. La
+        // fiche CinéMatch aussi, avec l'équipe et les acteurs du même appel.
         const collection = detail.belongs_to_collection as
           {id?: number} | null | undefined;
         await cacheRef.set({
@@ -4465,8 +4472,11 @@ async function positionGalleryDocs(
           collectionId: collection && typeof collection.id === 'number' ?
             collection.id : null,
           sagaAt: Timestamp.now(),
+          fiche: fiche.ficheFromMovieDetail(detail),
+          ficheV: fiche.FICHE_VERSION,
+          ficheAt: Timestamp.now(),
           updatedAt: Timestamp.now(),
-        });
+        }, {merge: true});
       }
       await doc.ref.set({
         axes: position.axes,
@@ -7401,10 +7411,14 @@ async function fetchSwipeExclusions(
  *  change de saison, de statut et de plateforme.
  * ===================================================================== */
 
-/** Monte quand le calcul d'une fiche change : les anciennes se refont. */
-const TV_META_VERSION = 1;
+/**
+ * Monte quand le calcul d'une fiche change : les anciennes se refont. 2 : la
+ * fiche CinéMatch (créateurs, acteurs, mots-clés).
+ */
+const TV_META_VERSION = 2;
 /** Ce que la fiche d'une série doit rapporter en un appel. */
-const TV_META_APPEND = 'videos,watch/providers,keywords,content_ratings';
+const TV_META_APPEND =
+  'videos,watch/providers,keywords,content_ratings,aggregate_credits';
 const TV_META_MAX_AGE_MS = 14 * 24 * 3600 * 1000;
 /**
  * La fiction seule. Une téléréalité, un talk-show ou un journal n'a ni
@@ -7438,6 +7452,8 @@ interface TvMeta {
   trailerKey: string | null;
   axes: AxisVector;
   sigma: AxisVector;
+  /** La fiche CinéMatch : créateurs, acteurs, mots-clés. */
+  fiche?: fiche.Fiche;
 }
 
 /**
@@ -7529,6 +7545,7 @@ function tvMetaFromDetail(detail: Record<string, unknown>): TvMeta {
     trailerKey: trailerKeyFrom(detail.videos),
     axes: position.axes,
     sigma: position.sigma,
+    fiche: fiche.ficheFromTvDetail(detail, genreIds),
   };
 }
 
@@ -11320,6 +11337,12 @@ function cineMatchStoreFor(format: CineMatchFormat): CineMatchStore {
 
 /** La situation telle que le client l'envoie. */
 interface CineMatchSituationPayload extends engine.Situation {
+  /**
+   * Séries seulement : le temps total qu'on accepte de donner. Il était la
+   * seconde question ; c'est une contrainte et non une envie, il rejoint
+   * donc la situation de la soirée.
+   */
+  engagement?: engine.Engagement;
   watchRegion: string;
 }
 
@@ -11362,6 +11385,8 @@ interface CineMatchReplace {
   keepIds: number[];
   /** Les films déjà vus : un remplaçant chacun. */
   seenIds: number[];
+  /** Les films écartés (« Pas celui-là ») : un remplaçant chacun aussi. */
+  refusedIds?: number[];
 }
 
 /**
@@ -11417,6 +11442,8 @@ async function writeFiveHistory(
       await ref.set({
         tmdbIds: FieldValue.arrayUnion(...ids),
         seenIds: FieldValue.arrayUnion(...replace.seenIds),
+        ...(replace.refusedIds && replace.refusedIds.length > 0 ?
+          {refusedIds: FieldValue.arrayUnion(...replace.refusedIds)} : {}),
         films: FieldValue.arrayUnion(
             ...films.map((film) => ({...film, replacement: true}))),
         replacedAt: now,
@@ -11456,6 +11483,7 @@ function parseCineMatchSituation(raw: unknown): CineMatchSituationPayload {
     duration: oneOf(record.duration, CINEMATCH_DURATIONS) ?? 'any',
     platformIds: [...new Set(platformIds)],
     watchRegion: region,
+    engagement: oneOf(record.engagement, CINEMATCH_ENGAGEMENTS) ?? 'any',
   };
 }
 
@@ -12852,22 +12880,20 @@ export const getCineMatchDaily = onRequest(
         }
 
         const ctx = tmdb(req, res);
-        const evening: CineMatchEvening = {
-          want: null, energy: null, comparisons: [], hesitations: 0,
-        };
-        const dayOfYear = dayOfYearFrom(today);
+        // La proposition du jour passe par le même classement que les cinq,
+        // sans film choisi : la ressemblance aux coups de cœur et la
+        // réception. Le rang suit le jour de l'année, pour ne pas reproposer
+        // le même film tant que la galerie ne bouge pas.
+        const request: PicksRequest = {anchorId: null, style: null, count: 5};
+        const dayIndex = ((dayOfYearFrom(today) % 5) + 5) % 5;
 
         if (format === 'series') {
           const setup = await loadSeriesSetup(db, uid, situation, ctx);
-          const {result, enriched} = await runCineMatchEngine(
-              setup, evening,
-              (relaxed) =>
-                buildSeriesCandidates(db, setup, evening, relaxed, ctx),
-              (input) => engine.pickDaily(input, dayOfYear),
-              (r) => r.top.length >= 3,
-          );
-          const pick = result.film;
-          const meta = pick ? enriched.get(pick.film.id) : undefined;
+          const result = await runSeriesPicks(db, setup, request, ctx);
+          const top = result.picks
+              .filter((pick) => result.enriched.has(pick.fiche.id));
+          const pick = top.length > 0 ? top[dayIndex % top.length] : null;
+          const meta = pick ? result.enriched.get(pick.fiche.id) : undefined;
           if (!pick || !meta) {
             res.status(200).json({film: null, date: today});
             return;
@@ -12879,8 +12905,9 @@ export const getCineMatchDaily = onRequest(
               createdAt: Timestamp.now(),
               kind: 'daily',
               tmdbIds: [meta.id],
-              films: seriesHistoryFilms([pick], enriched),
-              answers: {situation},
+              films: picksHistoryFilms([pick], result.sources,
+                  (id) => result.enriched.get(id)?.name ?? null),
+              answers: {situation, engine: 'fiche'},
             }),
           ]);
           res.status(200).json({film, date: today});
@@ -12888,15 +12915,12 @@ export const getCineMatchDaily = onRequest(
         }
 
         const setup = await loadCineMatchSetup(db, uid, situation, ctx);
-        const {result, enriched} = await runCineMatchEngine(
-            setup, evening,
-            (relaxed) => buildCineMatchCandidates(setup, evening, relaxed, ctx),
-            (input) => engine.pickDaily(input, dayOfYear),
-            (r) => r.top.length >= 3,
-        );
-
-        const pick = result.film;
-        const candidate = pick ? enriched.get(pick.film.id) : undefined;
+        const result = await runFilmPicks(db, setup, request, ctx);
+        const top = result.picks
+            .filter((pick) => result.enriched.has(pick.fiche.id));
+        const pick = top.length > 0 ? top[dayIndex % top.length] : null;
+        const candidate = pick ?
+          result.enriched.get(pick.fiche.id) : undefined;
         if (!pick || !candidate) {
           // Rien n'est mémorisé : la prochaine ouverture retentera.
           res.status(200).json({film: null, date: today});
@@ -12911,8 +12935,9 @@ export const getCineMatchDaily = onRequest(
             createdAt: now,
             kind: 'daily',
             tmdbIds: [candidate.id],
-            films: cineMatchHistoryFilms([pick], enriched),
-            answers: {situation},
+            films: picksHistoryFilms([pick], result.sources,
+                (id) => result.enriched.get(id)?.title ?? null),
+            answers: {situation, engine: 'fiche'},
           }),
         ]);
         res.status(200).json({film, date: today});
@@ -12983,6 +13008,1170 @@ export const recordCineMatchExposure = onRequest(
         res.status(200).json({ok: true});
       } catch (error) {
         logger.error('recordCineMatchExposure failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/* ===================================================================== *
+ *  CinéMatch, lot 1 : un style, un film proche, puis les cinq
+ *
+ *  Les deux questions du soir et les quatre comparaisons sont remplacées
+ *  par deux touchers : un style de films (« Tu as envie de quoi ce soir ? »),
+ *  puis un film de la galerie dans ce style (« Un film proche de… »). Les
+ *  cinq se classent par la fiche (`cinematch/fiche.ts`) : la ressemblance
+ *  au film choisi, aux coups de cœur, et la réception.
+ *
+ *  Le style ne retire aucun candidat. Mesuré le 11 octobre sur douze films :
+ *  ne garder que les candidats du style faisait perdre un bon conseil sur
+ *  quatre (Past Lives pour La La Land, RRR pour Mad Max). Il sert à choisir
+ *  les six films qu'on montre, et il ajoute une source de candidats.
+ *
+ *  L'ancien point d'entrée des cinq (`getCineMatchFive`) reste en place tant
+ *  que des apps installées l'appellent.
+ * ===================================================================== */
+
+/** Au-delà, une fiche se refait : TMDB interdit d'en garder plus de 6 mois. */
+const FICHE_MAX_AGE_MS = 150 * 24 * 3600 * 1000;
+/** Films proposés par tour de l'écran « Un film proche de… ». */
+const STARTERS_PER_PAGE = 6;
+/** Affiches par tuile de style. */
+const STYLE_TILE_FILMS = 3;
+/** Fiches payées à TMDB, au plus, pour ordonner les films d'un style. */
+const STARTERS_FICHE_FETCH = 24;
+/** Une affiche montrée dans ce délai passe après les autres. */
+const STARTER_REST_MS = 14 * 24 * 3600 * 1000;
+/** Candidats enrichis avant le classement : un appel de fiche chacun. */
+const PICKS_ENRICH_MAX = 80;
+const SERIES_PICKS_ENRICH_MAX = 50;
+/** Coups de cœur dont on paie la fiche, au plus, par soirée. */
+const PICKS_LOVED_FETCH = 20;
+/** Coups de cœur récents dont on lit le voisinage, sans film choisi. */
+const PICKS_TASTE_SEEDS = 8;
+/**
+ * Ce que pèse la source d'un candidat à la présélection. Les films trouvés
+ * autour du film choisi passent devant le catalogue général : c'est autour
+ * de lui qu'on cherche ce soir.
+ */
+const PICK_SOURCE_WEIGHTS: Record<string, number> = {
+  anchor: 3, keywords: 2, crew: 2, genre: 2, style: 1, taste: 1,
+  watchlist: 1, catalogue: 0,
+};
+/**
+ * La place de chaque source dans la présélection. Un tri unique laissait
+ * une source bavarde tout prendre : quarante films Marvel venus des genres
+ * d'Interstellar évinçaient les films de Christopher Nolan.
+ */
+const PICK_SOURCE_QUOTAS: Record<string, number> = {
+  anchor: 20, crew: 12, keywords: 12, genre: 14, style: 8, taste: 24,
+  watchlist: 8, catalogue: 10,
+};
+/**
+ * L'avance d'un film qui tient la durée et les plateformes demandées, quand
+ * il a fallu élargir pour en trouver assez : la même que dans le moteur v2.
+ */
+const PICK_CONFORMING_BONUS = 3;
+/** En deçà, un film n'est pas un long métrage de soirée. */
+const PICK_MIN_FEATURE_MINUTES = 70;
+/**
+ * La réception minimale, sur 10, après le lissage par le nombre de votes :
+ * Hacker (5,4 sur 2 200 votes) passait parmi les films proches de Heat.
+ */
+const PICK_MIN_RECEPTION = 5.8;
+/** Les genres de séries de TMDB qui existent sous un autre numéro. */
+const FILM_TO_TV_GENRES: Record<number, number> = {
+  28: 10759, 12: 10759, 878: 10765, 14: 10765, 10752: 10768, 36: 10768,
+};
+/** Les genres que `/discover/tv` connaît. */
+const TV_DISCOVER_GENRES = new Set([
+  10759, 16, 35, 80, 99, 18, 10751, 9648, 10765, 10768, 37,
+]);
+/** Des axes neutres : le filtre des cinq ne les lit pas. */
+const NEUTRAL_AXES: engine.EngineAxes =
+  {ch: 0, ry: 0, fa: 0, de: 0, an: 0, to: 0, ec: 0, in: 0};
+
+/**
+ * Les fiches de ces films, du cache commun `filmAxes` ou de TMDB.
+ * @param {Firestore} db Firestore.
+ * @param {number[]} ids Films voulus.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {number} maxFetch Fiches payées à TMDB, au plus, dans cet appel.
+ * @return {Promise<Map<number, fiche.Fiche>>} Les fiches trouvées.
+ */
+async function loadMovieFiches(
+    db: Firestore,
+    ids: number[],
+    ctx: TMDBContext,
+    maxFetch: number,
+): Promise<Map<number, fiche.Fiche>> {
+  const out = new Map<number, fiche.Fiche>();
+  const unique = Array.from(new Set(ids))
+      .filter((id) => Number.isInteger(id) && id > 0);
+  if (unique.length === 0) return out;
+  const snaps = await db.getAll(
+      ...unique.map((id) => db.collection('filmAxes').doc(String(id))));
+  const now = Date.now();
+  const missing: number[] = [];
+  snaps.forEach((snap, index) => {
+    const at = snap.get('ficheAt');
+    const stored: unknown = snap.get('fiche');
+    const fresh = snap.exists &&
+      snap.get('ficheV') === fiche.FICHE_VERSION &&
+      at instanceof Timestamp && now - at.toMillis() < FICHE_MAX_AGE_MS &&
+      fiche.isFiche(stored);
+    if (fresh) {
+      out.set(unique[index], stored as fiche.Fiche);
+    } else {
+      missing.push(unique[index]);
+    }
+  });
+  await Promise.all(missing.slice(0, maxFetch).map(async (id) => {
+    try {
+      const detail = await tmdbGET(
+          `/movie/${id}`, {append_to_response: 'keywords,credits'}, ctx);
+      const sheet = fiche.ficheFromMovieDetail(detail);
+      out.set(id, sheet);
+      await db.collection('filmAxes').doc(String(id)).set({
+        fiche: sheet,
+        ficheV: fiche.FICHE_VERSION,
+        ficheAt: Timestamp.now(),
+      }, {merge: true});
+    } catch {
+      // Une fiche injoignable : le film reste comparé par ses genres.
+    }
+  }));
+  return out;
+}
+
+/**
+ * Les fiches de ces séries, depuis leurs fiches `tvMeta`.
+ * @param {Firestore} db Firestore.
+ * @param {number[]} ids Séries voulues.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {number} maxFetch Fiches payées à TMDB, au plus, dans cet appel.
+ * @return {Promise<Map<number, fiche.Fiche>>} Les fiches trouvées.
+ */
+async function loadSeriesFiches(
+    db: Firestore,
+    ids: number[],
+    ctx: TMDBContext,
+    maxFetch: number,
+): Promise<Map<number, fiche.Fiche>> {
+  const metas = await loadTvMeta(db, ids, ctx, maxFetch);
+  const out = new Map<number, fiche.Fiche>();
+  for (const [id, meta] of metas) {
+    if (meta.fiche) out.set(id, meta.fiche);
+  }
+  return out;
+}
+
+/** Un film (ou une série) de la galerie, tel que l'écran de départ le lit. */
+interface StarterFilm {
+  id: number;
+  title: string | null;
+  posterPath: string | null;
+  releaseDate: string | null;
+  genreIds: number[];
+  loved: boolean;
+  lovedAtMillis: number | null;
+}
+
+/**
+ * La galerie, pour l'écran de départ : tous les films vus, positionnés ou
+ * non (seuls leurs genres comptent pour les styles), ou une entrée par série.
+ * @param {Firestore} db Firestore.
+ * @param {DocumentReference} userRef Document utilisateur.
+ * @param {CineMatchFormat} format Films ou séries.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<StarterFilm[]>} Les films de la galerie.
+ */
+async function loadStarterGallery(
+    db: Firestore,
+    userRef: DocumentReference,
+    format: CineMatchFormat,
+    ctx: TMDBContext,
+): Promise<StarterFilm[]> {
+  if (format === 'series') {
+    const gallery = await loadSeriesGallery(db, userRef, ctx);
+    return gallery.positioned.map((entry) => ({
+      id: entry.film.id,
+      title: entry.title,
+      posterPath: entry.posterPath,
+      releaseDate: entry.releaseDate,
+      genreIds: entry.film.genreIds,
+      loved: entry.film.loved,
+      lovedAtMillis: entry.lovedAtMillis,
+    }));
+  }
+  const snap = await filmsIn(userRef.collection('gallery')).get();
+  const out: StarterFilm[] = [];
+  for (const doc of snap.docs) {
+    const id = Number(doc.get('tmdbId'));
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const genreIds = doc.get('genreIds');
+    const title = doc.get('title');
+    const posterPath = doc.get('posterPath');
+    const releaseDate = doc.get('releaseDate');
+    const lovedAtMillis = millisOf(doc.get('lovedAt'));
+    out.push({
+      id,
+      title: typeof title === 'string' ? title : null,
+      posterPath: typeof posterPath === 'string' ? posterPath : null,
+      releaseDate: typeof releaseDate === 'string' ? releaseDate : null,
+      genreIds: Array.isArray(genreIds) ?
+        genreIds.filter((g): g is number => typeof g === 'number') : [],
+      loved: lovedAtMillis !== null,
+      lovedAtMillis,
+    });
+  }
+  return out;
+}
+
+/**
+ * La forme JSON d'un film de l'écran de départ.
+ * @param {StarterFilm} film Le film.
+ * @param {boolean} inGallery Faux pour un film connu ajouté faute de mieux.
+ * @return {Object} Film du contrat.
+ */
+function starterFilmJSON(film: StarterFilm, inGallery = true) {
+  return {
+    id: film.id,
+    title: film.title,
+    poster_path: film.posterPath,
+    release_date: film.releaseDate,
+    genre_ids: film.genreIds,
+    loved: film.loved,
+    in_gallery: inGallery,
+  };
+}
+
+/**
+ * Les trois affiches d'une tuile : des films qu'on reconnaît d'un coup
+ * d'œil. D'abord les coups de cœur dont c'est le genre principal, puis les
+ * autres films de ce genre principal, puis le reste ; le jour fait tourner
+ * les affiches à rang égal.
+ * @param {StarterFilm[]} members Les films du style.
+ * @param {fiche.StyleKey} style Le style.
+ * @param {function(): number} random Tirage du jour.
+ * @return {StarterFilm[]} Trois films au plus.
+ */
+function tileFilms(
+    members: StarterFilm[],
+    style: fiche.StyleKey,
+    random: () => number,
+): StarterFilm[] {
+  const rank = (film: StarterFilm): number =>
+    (fiche.isCoreStyle(film.genreIds, style) ? 2 : 0) + (film.loved ? 1 : 0);
+  return members
+      .map((film) => ({film, rank: rank(film), jitter: random()}))
+      .sort((a, b) => b.rank - a.rank || a.jitter - b.jitter)
+      .slice(0, STYLE_TILE_FILMS)
+      .map((entry) => entry.film);
+}
+
+/**
+ * Les genres `/discover/tv` d'un style.
+ * @param {fiche.StyleKey} style Le style.
+ * @return {number[]} Genres de séries, peut-être aucun.
+ */
+function tvGenresOfStyle(style: fiche.StyleKey): number[] {
+  return Array.from(new Set(fiche.styleGenres(style)
+      .map((id) => FILM_TO_TV_GENRES[id] ?? id)
+      .filter((id) => TV_DISCOVER_GENRES.has(id))));
+}
+
+/**
+ * Des films connus d'un style, quand la galerie n'en a pas six : on les
+ * reconnaît même sans les avoir vus.
+ * @param {fiche.StyleKey} style Le style.
+ * @param {CineMatchFormat} format Films ou séries.
+ * @param {Set<number>} exclude Films déjà montrés.
+ * @param {number} count Nombre voulu.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Object[]>} Films du contrat.
+ */
+async function knownFilmsOfStyle(
+    style: fiche.StyleKey,
+    format: CineMatchFormat,
+    exclude: Set<number>,
+    count: number,
+    ctx: TMDBContext,
+): Promise<ReturnType<typeof starterFilmJSON>[]> {
+  if (count <= 0) return [];
+  const genres = format === 'series' ?
+    tvGenresOfStyle(style) : fiche.styleGenres(style);
+  if (genres.length === 0) return [];
+  const payload = await tmdbGET(
+      format === 'series' ? '/discover/tv' : '/discover/movie', {
+        'with_genres': genres.join('|'),
+        'sort_by': 'vote_count.desc',
+        'include_adult': 'false',
+        'page': '1',
+      }, ctx);
+  const raw = Array.isArray(payload.results) ?
+    payload.results as Record<string, unknown>[] : [];
+  const rows = format === 'series' ?
+    raw.map(seriesRowFrom).filter((r): r is DiscoverRow => r !== null) :
+    raw as unknown as DiscoverRow[];
+  return rows
+      .filter((row) => typeof row.id === 'number' && !exclude.has(row.id))
+      .slice(0, count)
+      .map((row) => starterFilmJSON({
+        id: row.id,
+        title: row.title ?? null,
+        posterPath: row.poster_path ?? null,
+        releaseDate: row.release_date ?? null,
+        genreIds: row.genre_ids ?? [],
+        loved: false,
+        lovedAtMillis: null,
+      }, false));
+}
+
+/**
+ * L'écran de départ de CinéMatch.
+ *
+ * Sans style : les dix styles, du plus présent dans la galerie au moins
+ * présent, chacun avec son nombre de films et trois affiches. L'app montre
+ * les six premiers ; les autres vont sous « Un autre style ».
+ *
+ * Avec un style : six films de la galerie dans ce style, variés, les coups
+ * de cœur d'abord, ceux montrés ces quatorze derniers jours en dernier. Les
+ * mêmes toute la journée ; `page` passe aux six suivants (« Pas ceux-là »)
+ * et revient au début une fois le style parcouru.
+ */
+export const getCineMatchStarters = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const format = cineMatchFormatOf(body.format);
+        const style = fiche.styleKeyOf(body.style);
+        const pageRaw = Number(body.page);
+        const page = Number.isInteger(pageRaw) && pageRaw >= 0 &&
+          pageRaw <= 100 ? pageRaw : 0;
+
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const ctx = tmdb(req, res);
+        const films = await loadStarterGallery(db, userRef, format, ctx);
+        const day = parisDay(new Date());
+
+        if (style === null) {
+          const random = engine.seededRandom(`${uid}:${day}:styles`);
+          const styles = fiche.STYLES
+              .map((entry, order) => {
+                const members = films.filter((film) =>
+                  fiche.inStyle(film.genreIds, entry.key));
+                return {
+                  order,
+                  json: {
+                    key: entry.key,
+                    count: members.length,
+                    films: tileFilms(members, entry.key, random)
+                        .map((film) => starterFilmJSON(film)),
+                  },
+                };
+              })
+              .sort((a, b) => b.json.count - a.json.count || a.order - b.order)
+              .map((entry) => entry.json);
+          res.status(200).json({styles});
+          return;
+        }
+
+        const members = films.filter((film) =>
+          fiche.inStyle(film.genreIds, style));
+        const ids = members.map((film) => film.id);
+        const [posterSnap, sheets] = await Promise.all([
+          userRef.collection(cineMatchStoreFor(format).exposure)
+              .where('posterLastShownAt', '>',
+                  Timestamp.fromMillis(Date.now() - STARTER_REST_MS))
+              .get(),
+          format === 'series' ?
+            loadSeriesFiches(db, ids, ctx, STARTERS_FICHE_FETCH) :
+            loadMovieFiches(db, ids, ctx, STARTERS_FICHE_FETCH),
+        ]);
+        const recent = new Set(posterSnap.docs
+            .map((doc) => Number(doc.get('tmdbId') ?? doc.id))
+            .filter((id) => Number.isInteger(id)));
+        const memberFiches = members.map((film) => sheets.get(film.id) ??
+          fiche.thinFiche({
+            id: film.id, genreIds: film.genreIds,
+            releaseDate: film.releaseDate,
+          }));
+        const comparer =
+          new fiche.FicheComparer(fiche.buildRarity(memberFiches));
+        const order = fiche.orderVaried(memberFiches, comparer, {
+          random: engine.seededRandom(`${uid}:${day}:${style}`),
+          loved: new Set(members.filter((f) => f.loved).map((f) => f.id)),
+          recent,
+          core: new Set(members
+              .filter((f) => fiche.isCoreStyle(f.genreIds, style))
+              .map((f) => f.id)),
+        });
+
+        const pages = Math.max(1, Math.ceil(order.length / STARTERS_PER_PAGE));
+        const current = page % pages;
+        const byId = new Map(members.map((film) => [film.id, film]));
+        const shown = order
+            .slice(current * STARTERS_PER_PAGE,
+                (current + 1) * STARTERS_PER_PAGE)
+            .map((id) => byId.get(id))
+            .filter((film): film is StarterFilm => film !== undefined);
+        const filler = await knownFilmsOfStyle(style, format, new Set(ids),
+            STARTERS_PER_PAGE - shown.length, ctx);
+        res.status(200).json({
+          style,
+          page: current,
+          films: [...shown.map((film) => starterFilmJSON(film)), ...filler],
+          hasMore: pages > 1,
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCineMatchStarters failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Ce que l'app demande pour les cinq. */
+interface PicksRequest {
+  anchorId: number | null;
+  style: fiche.StyleKey | null;
+  /** Nombre de films voulus : cinq, ou un par film à remplacer. */
+  count: number;
+}
+
+/** Les candidats d'une soirée, prêts à classer. */
+interface PickPool<E> {
+  films: engine.EngineFilm[];
+  fiches: Map<number, fiche.Fiche>;
+  sources: Map<number, string>;
+  enriched: Map<number, E>;
+}
+
+/** Le résultat d'une soirée. */
+interface PicksResult<E> {
+  picks: fiche.RankedPick[];
+  /** Tout le classement, pour le diagnostic sur émulateur. */
+  ranked: fiche.RankedPick[];
+  widened: engine.Widening | null;
+  anchor: fiche.Fiche | null;
+  sources: Map<number, string>;
+  enriched: Map<number, E>;
+}
+
+/**
+ * La part des genres d'un film que partage le film choisi.
+ * @param {number[]} genres Genres du candidat.
+ * @param {number[]} anchorGenres Genres du film choisi.
+ * @return {number} De 0 à 1.
+ */
+function genreOverlap(genres: number[], anchorGenres: number[]): number {
+  if (genres.length === 0 || anchorGenres.length === 0) return 0;
+  const shared = genres.filter((id) => anchorGenres.includes(id)).length;
+  return shared / new Set([...genres, ...anchorGenres]).size;
+}
+
+/**
+ * Les genres du film choisi qui le distinguent : les moins courants dans la
+ * galerie d'abord. « Drame », porté par la moitié des films, passe en
+ * dernier.
+ * @param {number[]} genres Genres du film choisi.
+ * @param {CineMatchGallery} gallery La galerie.
+ * @param {number} count Nombre voulu.
+ * @return {number[]} Genres.
+ */
+function distinctiveGenres(
+    genres: number[], gallery: CineMatchGallery, count = 2,
+): number[] {
+  const frequency = new Map<number, number>();
+  for (const entry of gallery.positioned) {
+    for (const id of entry.film.genreIds) {
+      frequency.set(id, (frequency.get(id) ?? 0) + 1);
+    }
+  }
+  return genres
+      .map((id, order) => ({id, order, n: frequency.get(id) ?? 0}))
+      .sort((a, b) => a.n - b.n || a.order - b.order)
+      .slice(0, count)
+      .map((entry) => entry.id);
+}
+
+/**
+ * Présélectionne les lignes qui méritent une fiche complète : chaque source
+ * a sa place, et dans chaque source passent d'abord les films qui partagent
+ * les genres du film choisi, puis les plus connus.
+ * @param {DiscoverRow[]} rows Lignes servables.
+ * @param {Map<number, string>} sources Source de chaque ligne.
+ * @param {?fiche.Fiche} anchor Le film choisi.
+ * @param {number} max Lignes gardées.
+ * @return {DiscoverRow[]} Lignes à enrichir.
+ */
+function preselectPickRows(
+    rows: DiscoverRow[],
+    sources: Map<number, string>,
+    anchor: fiche.Fiche | null,
+    max: number,
+): DiscoverRow[] {
+  const votes = rows.map((row) => row.vote_count ?? 0).sort((a, b) => a - b);
+  const votePercentile = (count: number): number => {
+    if (votes.length <= 1) return 0.5;
+    let below = 0;
+    while (below < votes.length && votes[below] < count) below++;
+    return below / (votes.length - 1);
+  };
+  const value = (row: DiscoverRow): number =>
+    (anchor ? 2 * genreOverlap(row.genre_ids ?? [], anchor.genres) : 0) +
+    0.5 * votePercentile(row.vote_count ?? 0);
+  const ranked = rows
+      .map((row) => ({row, value: value(row),
+        source: sources.get(row.id) ?? 'catalogue'}))
+      .sort((a, b) => b.value - a.value || a.row.id - b.row.id);
+  // Chaque source a sa place ; ce qui reste se remplit par le classement.
+  const taken = new Set<number>();
+  const out: DiscoverRow[] = [];
+  const used = new Map<string, number>();
+  for (const entry of ranked) {
+    if (out.length >= max) break;
+    const quota = PICK_SOURCE_QUOTAS[entry.source] ?? 0;
+    const count = used.get(entry.source) ?? 0;
+    if (count >= quota) continue;
+    used.set(entry.source, count + 1);
+    taken.add(entry.row.id);
+    out.push(entry.row);
+  }
+  for (const entry of ranked) {
+    if (out.length >= max) break;
+    if (!taken.has(entry.row.id)) out.push(entry.row);
+  }
+  return out;
+}
+
+/**
+ * Note la source d'une ligne, en gardant la plus forte si elle en a deux.
+ * @param {Map<number, DiscoverRow>} rows Lignes déjà retenues.
+ * @param {Map<number, string>} sources Leur source.
+ * @param {DiscoverRow} row La ligne.
+ * @param {string} source Sa source.
+ */
+function takePickRow(
+    rows: Map<number, DiscoverRow>,
+    sources: Map<number, string>,
+    row: DiscoverRow,
+    source: string,
+): void {
+  if (!rows.has(row.id)) rows.set(row.id, row);
+  const previous = sources.get(row.id);
+  if (previous === undefined ||
+      (PICK_SOURCE_WEIGHTS[source] ?? 0) >
+        (PICK_SOURCE_WEIGHTS[previous] ?? 0)) {
+    sources.set(row.id, source);
+  }
+}
+
+/**
+ * Les candidats d'une soirée de films : le catalogue habituel, et autour du
+ * film choisi ce que TMDB recommande et juge similaire, les films qui
+ * partagent ses mots-clés les plus rares, ceux de son réalisateur ; les
+ * films connus du style ; la watchlist. Sans film choisi, le voisinage des
+ * coups de cœur récents.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {?fiche.Fiche} anchor Le film choisi.
+ * @param {?fiche.StyleKey} style Le style choisi.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<PickPool<EnrichedCandidate>>} Candidats enrichis.
+ */
+async function buildFilmPickPool(
+    setup: CineMatchSetup,
+    anchor: fiche.Fiche | null,
+    style: fiche.StyleKey | null,
+    relaxed: boolean,
+    ctx: TMDBContext,
+): Promise<PickPool<EnrichedCandidate>> {
+  const {situation, gallery} = setup;
+  const base = cineMatchDiscoverParams(situation, relaxed);
+  const requests: {source: string; path: string;
+    query: Record<string, string>}[] = [];
+  if (anchor) {
+    const at = `/movie/${anchor.id}`;
+    requests.push({source: 'anchor', path: `${at}/recommendations`,
+      query: {page: '1'}});
+    requests.push({source: 'anchor', path: `${at}/recommendations`,
+      query: {page: '2'}});
+    requests.push({source: 'anchor', path: `${at}/similar`,
+      query: {page: '1'}});
+    const keywords = fiche.anchorKeywords(anchor, null);
+    if (keywords.length > 0) {
+      requests.push({source: 'keywords', path: '/discover/movie', query: {
+        ...base, with_keywords: keywords.join('|'),
+        sort_by: 'vote_count.desc', page: '1',
+      }});
+    }
+    const makers = anchor.makers.slice(0, 2);
+    if (makers.length > 0) {
+      requests.push({source: 'crew', path: '/discover/movie', query: {
+        ...base, with_crew: makers.join('|'),
+        sort_by: 'vote_count.desc', page: '1',
+      }});
+    }
+    // Les films qui ont les mêmes genres, ensemble : c'est là que se
+    // trouvent les voisins que ni les recommandations de TMDB ni le
+    // réalisateur ne ramènent. Les deux genres les moins courants de la
+    // galerie : « Aventure et Science-fiction » pour Interstellar, et non
+    // « Aventure et Drame », ses deux premiers genres TMDB.
+    const genres = distinctiveGenres(anchor.genres, gallery);
+    if (genres.length > 0) {
+      for (const page of ['1', '2']) {
+        requests.push({source: 'genre', path: '/discover/movie', query: {
+          ...base, with_genres: genres.join(','),
+          sort_by: 'vote_count.desc', page,
+        }});
+      }
+    }
+  } else {
+    const loved = gallery.positioned
+        .filter((entry) => entry.lovedAtMillis !== null)
+        .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0))
+        .slice(0, PICKS_TASTE_SEEDS);
+    for (const entry of loved) {
+      requests.push({source: 'taste',
+        path: `/movie/${entry.film.id}/recommendations`, query: {page: '1'}});
+    }
+  }
+  if (style) {
+    requests.push({source: 'style', path: '/discover/movie', query: {
+      ...base, with_genres: fiche.styleGenres(style).join('|'),
+      sort_by: 'vote_count.desc', page: '1',
+    }});
+  }
+
+  const [catalogue, settled] = await Promise.all([
+    fetchCineMatchCatalogue(situation, relaxed, ctx),
+    Promise.allSettled(requests.map((r) => tmdbGET(r.path, r.query, ctx))),
+  ]);
+  const excluded = new Set(setup.extraExcludedIds ?? []);
+  const keepListed = (row: DiscoverRow): boolean =>
+    typeof row.id === 'number' && row.id !== anchor?.id &&
+    !gallery.seenIds.has(row.id) && !excluded.has(row.id) &&
+    !(situation.company === 'family' &&
+      (row.genre_ids ?? []).includes(GENRE_HORROR));
+  // Le plancher de votes du catalogue vaut pour toutes les sources : les
+  // recommandations de TMDB ramenaient sans lui des téléfilms que personne
+  // n'a vus (« Monster High » parmi les films proches du Voyage de Chihiro).
+  const keep = (row: DiscoverRow): boolean => keepListed(row) &&
+    (row.vote_count ?? 0) >= CINEMATCH_VOTE_FLOOR;
+
+  const rows = new Map<number, DiscoverRow>();
+  const sources = new Map<number, string>();
+  for (const row of catalogue) {
+    if (keep(row)) takePickRow(rows, sources, row, 'catalogue');
+  }
+  settled.forEach((result, index) => {
+    for (const row of rowsFrom(result, 'results')) {
+      if (keep(row)) takePickRow(rows, sources, row, requests[index].source);
+    }
+  });
+  for (const row of setup.watchlistRows.slice(0, CINEMATCH_WATCHLIST_MAX)) {
+    if (keepListed(row)) takePickRow(rows, sources, row, 'watchlist');
+  }
+
+  const servable = (await servableRows(
+      getAdmin().firestore(), [...rows.values()], ctx))
+      .filter((row) =>
+        !engine.isResting(setup.exposure.get(row.id), setup.now));
+  const shortlist =
+    preselectPickRows(servable, sources, anchor, PICKS_ENRICH_MAX);
+  const enrichedList = await Promise.all(
+      shortlist.map((row) => enrichCandidate(row, ctx)));
+
+  const films: engine.EngineFilm[] = [];
+  const fiches = new Map<number, fiche.Fiche>();
+  const enriched = new Map<number, EnrichedCandidate>();
+  for (const candidate of enrichedList) {
+    if (!candidate || !candidate.fiche) continue;
+    enriched.set(candidate.id, candidate);
+    fiches.set(candidate.id, candidate.fiche);
+    films.push({
+      id: candidate.id,
+      axes: NEUTRAL_AXES,
+      genreIds: candidate.genre_ids ?? [],
+      year: yearOf(candidate.release_date),
+      voteCount: candidate.vote_count ?? null,
+      runtime: candidate.runtimeMinutes,
+      providerIds: candidate.providerIds,
+      keywordNames: [],
+      listed: setup.watchlistIds.has(candidate.id),
+      certification: candidate.certification ?? null,
+    });
+  }
+  return {films, fiches, sources, enriched};
+}
+
+/**
+ * Les candidats d'une soirée de séries : même principe que pour les films,
+ * sur `/discover/tv` et les fiches `tvMeta`.
+ * @param {Firestore} db Firestore, pour le cache des fiches.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {?fiche.Fiche} anchor La série choisie.
+ * @param {?fiche.StyleKey} style Le style choisi.
+ * @param {boolean} relaxed Aller chercher hors durée et plateformes.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<PickPool<TvMeta>>} Candidats enrichis.
+ */
+async function buildSeriesPickPool(
+    db: Firestore,
+    setup: CineMatchSetup,
+    anchor: fiche.Fiche | null,
+    style: fiche.StyleKey | null,
+    relaxed: boolean,
+    ctx: TMDBContext,
+): Promise<PickPool<TvMeta>> {
+  const {situation, gallery} = setup;
+  const base = seriesDiscoverParams(situation, relaxed);
+  const requests: {source: string; path: string;
+    query: Record<string, string>}[] = [];
+  if (anchor) {
+    const at = `/tv/${anchor.id}`;
+    requests.push({source: 'anchor', path: `${at}/recommendations`,
+      query: {page: '1'}});
+    requests.push({source: 'anchor', path: `${at}/similar`,
+      query: {page: '1'}});
+    const keywords = fiche.anchorKeywords(anchor, null);
+    if (keywords.length > 0) {
+      requests.push({source: 'keywords', path: '/discover/tv', query: {
+        ...base, with_keywords: keywords.join('|'),
+        sort_by: 'vote_count.desc', page: '1',
+      }});
+    }
+    const genres = Array.from(new Set(
+        distinctiveGenres(anchor.genres, gallery, 3)
+            .map((id) => FILM_TO_TV_GENRES[id] ?? id)
+            .filter((id) => TV_DISCOVER_GENRES.has(id)))).slice(0, 2);
+    if (genres.length > 0) {
+      requests.push({source: 'genre', path: '/discover/tv', query: {
+        ...base, with_genres: genres.join(','),
+        sort_by: 'vote_count.desc', page: '1',
+      }});
+    }
+  } else {
+    const loved = gallery.positioned
+        .filter((entry) => entry.film.loved)
+        .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0))
+        .slice(0, PICKS_TASTE_SEEDS);
+    for (const entry of loved) {
+      requests.push({source: 'taste',
+        path: `/tv/${entry.film.id}/recommendations`, query: {page: '1'}});
+    }
+  }
+  const styleTv = style ? tvGenresOfStyle(style) : [];
+  if (styleTv.length > 0) {
+    requests.push({source: 'style', path: '/discover/tv', query: {
+      ...base, with_genres: styleTv.join('|'),
+      sort_by: 'vote_count.desc', page: '1',
+    }});
+  }
+
+  const [catalogue, settled] = await Promise.all([
+    fetchSeriesCatalogue(situation, relaxed, ctx),
+    Promise.allSettled(requests.map((r) => tmdbGET(r.path, r.query, ctx))),
+  ]);
+  const excluded = new Set(setup.extraExcludedIds ?? []);
+  const keep = (row: DiscoverRow): boolean =>
+    row.id !== anchor?.id && !gallery.seenIds.has(row.id) &&
+    !excluded.has(row.id) &&
+    (row.vote_count ?? 0) >= SERIES_CINEMATCH_VOTE_FLOOR &&
+    !(row.genre_ids ?? []).some((id) => TV_EXCLUDED_GENRES.includes(id));
+
+  const rows = new Map<number, DiscoverRow>();
+  const sources = new Map<number, string>();
+  for (const row of catalogue) {
+    if (keep(row)) takePickRow(rows, sources, row, 'catalogue');
+  }
+  settled.forEach((result, index) => {
+    for (const raw of rowsFrom(result, 'results')) {
+      const row = seriesRowFrom(raw as unknown as Record<string, unknown>);
+      if (row && keep(row)) {
+        takePickRow(rows, sources, row, requests[index].source);
+      }
+    }
+  });
+  for (const id of setup.watchlistIds) {
+    if (gallery.seenIds.has(id) || excluded.has(id)) continue;
+    if (!rows.has(id)) rows.set(id, {id, media_type: 'tv'});
+    takePickRow(rows, sources, rows.get(id) as DiscoverRow, 'watchlist');
+  }
+
+  const candidates = [...rows.values()].filter((row) =>
+    !engine.isResting(setup.exposure.get(row.id), setup.now));
+  const shortlist = preselectPickRows(
+      candidates, sources, anchor, SERIES_PICKS_ENRICH_MAX);
+  const metas = await loadTvMeta(
+      db, shortlist.map((row) => row.id), ctx, shortlist.length);
+
+  const films: engine.EngineFilm[] = [];
+  const fiches = new Map<number, fiche.Fiche>();
+  const enriched = new Map<number, TvMeta>();
+  for (const row of shortlist) {
+    const meta = metas.get(row.id);
+    if (!meta || !isKeptSeries(meta) || !meta.fiche) continue;
+    enriched.set(row.id, meta);
+    fiches.set(row.id, meta.fiche);
+    films.push(engineSeriesFrom(meta, setup.watchlistIds.has(row.id)));
+  }
+  return {films, fiches, sources, enriched};
+}
+
+/**
+ * Classe et compose les cinq à partir d'un ensemble de candidats.
+ * @param {PickPool} pool Les candidats.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {?fiche.Fiche} anchor Le film choisi.
+ * @param {fiche.Fiche[]} loved Les coups de cœur.
+ * @param {fiche.Fiche[]} reference La galerie, où se mesure la rareté.
+ * @param {number} count Nombre de films voulus.
+ * @return {Object} Les films retenus et ce qui a été élargi.
+ */
+function rankPickPool<E>(
+    pool: PickPool<E>,
+    setup: CineMatchSetup,
+    anchor: fiche.Fiche | null,
+    loved: fiche.Fiche[],
+    reference: fiche.Fiche[],
+    count: number,
+): {
+  picks: fiche.RankedPick[];
+  ranked: fiche.RankedPick[];
+  widened: engine.Widening | null;
+} {
+  const excludedIds = new Set(setup.gallery.seenIds);
+  for (const id of setup.extraExcludedIds ?? []) excludedIds.add(id);
+  const filtered = engine.applyFilters(pool.films, {
+    situation: setup.situation,
+    excludedIds,
+    exposure: setup.exposure,
+    now: setup.now,
+  });
+  const isSeries = setup.situation.kind === 'series';
+  const engagement = setup.situation.engagement ?? 'any';
+  // Le remake d'un film vu n'apprend rien à personne : même histoire, autre
+  // langue. On le reconnaît à l'œuvre d'origine qu'il crédite.
+  const seenMakers = new Set<number>();
+  for (const sheet of [...reference, ...loved]) {
+    for (const id of sheet.makers) seenMakers.add(id);
+  }
+  const candidates: fiche.PickCandidate[] = [];
+  for (const film of filtered.eligible) {
+    const sheet = pool.fiches.get(film.id);
+    if (!sheet || fiche.isRemakeOfSeen(sheet, seenMakers)) continue;
+    // Un épisode spécial ou un court métrage n'est pas un film de soirée
+    // (« Doctor Who : Douce nuit » parmi les films proches d'Interstellar).
+    if (!isSeries && film.runtime !== null &&
+        film.runtime < PICK_MIN_FEATURE_MINUTES) continue;
+    let shift = -engine.exposurePenalty(
+        setup.exposure.get(film.id), setup.now);
+    if (filtered.widened && filtered.conforming.has(film.id)) {
+      shift += PICK_CONFORMING_BONUS;
+    }
+    if (isSeries) {
+      shift += engine.engagementFit(film, engagement) +
+        engine.statusTerm(film, engagement);
+    }
+    candidates.push({fiche: sheet, listed: film.listed, shift});
+  }
+  // La rareté se mesure sur la galerie et le catalogue général, jamais sur
+  // les films réunis autour du film choisi (voir `fiche.Rarity`).
+  const neutral = [...pool.fiches.values()].filter((sheet) =>
+    pool.sources.get(sheet.id) === 'catalogue');
+  const comparer = new fiche.FicheComparer(
+      fiche.buildRarity([...reference, ...neutral]));
+  // Un film mal reçu ne fait pas la soirée, même s'il ressemble : on
+  // l'écarte, sauf si l'écarter ne laisse plus de quoi choisir.
+  const received = candidates.filter((c) =>
+    fiche.receptionOf(c.fiche) >= PICK_MIN_RECEPTION);
+  const ranked = fiche.rankPicks(
+      received.length >= count * 2 ? received : candidates,
+      anchor, loved, comparer);
+  return {
+    picks: fiche.composePicks(ranked, comparer, count, anchor === null),
+    ranked,
+    widened: filtered.widened,
+  };
+}
+
+/**
+ * Les cinq d'une soirée de films. Si la durée ou les plateformes laissent
+ * trop peu de films, un second passage va chercher plus large.
+ * @param {Firestore} db Firestore.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {PicksRequest} request Film choisi, style, nombre voulu.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<PicksResult<EnrichedCandidate>>} Les films retenus.
+ */
+async function runFilmPicks(
+    db: Firestore,
+    setup: CineMatchSetup,
+    request: PicksRequest,
+    ctx: TMDBContext,
+): Promise<PicksResult<EnrichedCandidate>> {
+  const entries = setup.gallery.positioned;
+  const lovedIds = entries
+      .filter((entry) => entry.lovedAtMillis !== null)
+      .map((entry) => entry.film.id);
+  // Toute la galerie : les coups de cœur pour le goût, et l'ensemble pour
+  // mesurer la rareté. Les coups de cœur passent en premier quand il faut
+  // payer des fiches ; les autres films comptent par leurs genres en
+  // attendant la leur.
+  const galleryIds = [...lovedIds, ...entries
+      .map((entry) => entry.film.id)
+      .filter((id) => !lovedIds.includes(id))];
+  const [gallerySheets, anchorSheets] = await Promise.all([
+    loadMovieFiches(db, galleryIds, ctx, PICKS_LOVED_FETCH),
+    loadMovieFiches(db, request.anchorId ? [request.anchorId] : [], ctx, 1),
+  ]);
+  const anchor = request.anchorId ?
+    anchorSheets.get(request.anchorId) ?? null : null;
+  const loved = lovedIds
+      .map((id) => gallerySheets.get(id))
+      .filter((sheet): sheet is fiche.Fiche =>
+        sheet !== undefined && sheet.id !== anchor?.id);
+  const reference = entries.map((entry) =>
+    gallerySheets.get(entry.film.id) ?? fiche.thinFiche({
+      id: entry.film.id, genreIds: entry.film.genreIds,
+      releaseDate: entry.releaseDate,
+    }));
+
+  const constrained = setup.situation.duration !== 'any' ||
+    setup.situation.platformIds.length > 0;
+  let pool = await buildFilmPickPool(setup, anchor, request.style, false, ctx);
+  let ranked =
+    rankPickPool(pool, setup, anchor, loved, reference, request.count);
+  if (ranked.picks.length < Math.min(3, request.count) && constrained) {
+    pool = await buildFilmPickPool(setup, anchor, request.style, true, ctx);
+    ranked = rankPickPool(pool, setup, anchor, loved, reference, request.count);
+  }
+  return {...ranked, anchor, sources: pool.sources, enriched: pool.enriched};
+}
+
+/**
+ * Les cinq d'une soirée de séries.
+ * @param {Firestore} db Firestore.
+ * @param {CineMatchSetup} setup La soirée.
+ * @param {PicksRequest} request Série choisie, style, nombre voulu.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<PicksResult<TvMeta>>} Les séries retenues.
+ */
+async function runSeriesPicks(
+    db: Firestore,
+    setup: CineMatchSetup,
+    request: PicksRequest,
+    ctx: TMDBContext,
+): Promise<PicksResult<TvMeta>> {
+  const entries = setup.gallery.positioned;
+  const lovedIds = entries
+      .filter((entry) => entry.film.loved)
+      .map((entry) => entry.film.id);
+  const sheets = await loadSeriesFiches(db, [
+    ...(request.anchorId ? [request.anchorId] : []), ...lovedIds,
+    ...entries.map((entry) => entry.film.id)
+        .filter((id) => !lovedIds.includes(id)),
+  ], ctx, PICKS_LOVED_FETCH);
+  const anchor = request.anchorId ?
+    sheets.get(request.anchorId) ?? null : null;
+  const loved = lovedIds
+      .map((id) => sheets.get(id))
+      .filter((sheet): sheet is fiche.Fiche =>
+        sheet !== undefined && sheet.id !== anchor?.id);
+  const reference = entries.map((entry) =>
+    sheets.get(entry.film.id) ?? fiche.thinFiche({
+      id: entry.film.id, genreIds: entry.film.genreIds,
+      releaseDate: entry.releaseDate,
+    }));
+
+  const constrained = setup.situation.duration !== 'any' ||
+    setup.situation.platformIds.length > 0;
+  let pool = await buildSeriesPickPool(
+      db, setup, anchor, request.style, false, ctx);
+  let ranked =
+    rankPickPool(pool, setup, anchor, loved, reference, request.count);
+  if (ranked.picks.length < Math.min(3, request.count) && constrained) {
+    pool = await buildSeriesPickPool(
+        db, setup, anchor, request.style, true, ctx);
+    ranked = rankPickPool(pool, setup, anchor, loved, reference, request.count);
+  }
+  return {...ranked, anchor, sources: pool.sources, enriched: pool.enriched};
+}
+
+/**
+ * Le bloc `films` d'une séance des cinq : rang, note, ce qui la fait, et
+ * d'où vient le film. C'est ce qui permettra de régler les parts de la
+ * note sur ce que les gens lancent et aiment.
+ * @param {fiche.RankedPick[]} picks Films retenus, dans l'ordre.
+ * @param {Map<number, string>} sources Source de chaque film.
+ * @param {function(number): ?string} titleOf Titre d'un film.
+ * @return {Object[]} Films, rang à partir de 1.
+ */
+function picksHistoryFilms(
+    picks: fiche.RankedPick[],
+    sources: Map<number, string>,
+    titleOf: (id: number) => string | null,
+): Record<string, unknown>[] {
+  return picks.map((pick, index) => ({
+    id: pick.fiche.id,
+    title: titleOf(pick.fiche.id),
+    rank: index + 1,
+    score: pick.score,
+    terms: pick.terms,
+    source: sources.get(pick.fiche.id) ?? 'catalogue',
+  }));
+}
+
+/**
+ * Relit le bloc `replace` d'une demande des cinq : les films vus et les
+ * films écartés, chacun à remplacer, et ceux qui restent.
+ * @param {unknown} raw Bloc `replace` du corps de requête.
+ * @return {CineMatchReplace | null} Le remplacement, ou `null`.
+ */
+function parsePicksReplace(raw: unknown): CineMatchReplace | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  const seenIds = parseTmdbIdList(record.seenIds, 5);
+  const refusedIds = parseTmdbIdList(record.refusedIds, 5)
+      .filter((id) => !seenIds.includes(id));
+  if (seenIds.length + refusedIds.length === 0) return null;
+  const sessionId = typeof record.sessionId === 'string' &&
+    /^[A-Za-z0-9]{1,64}$/.test(record.sessionId) ? record.sessionId : null;
+  return {
+    sessionId,
+    keepIds: parseTmdbIdList(record.keepIds, 5).filter((id) =>
+      !seenIds.includes(id) && !refusedIds.includes(id)),
+    seenIds,
+    refusedIds,
+  };
+}
+
+/**
+ * Les cinq d'une soirée, à partir du film choisi (ou sans, « Peu importe »).
+ *
+ * L'app envoie la situation, le film choisi et le style ; elle reçoit cinq
+ * films prêts à être montrés. Un remplacement (films vus ou écartés) ne
+ * renvoie que les remplaçants, dans l'ordre, et complète la même séance.
+ */
+export const getCineMatchPicks = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const format = cineMatchFormatOf(body.format);
+        const anchorRaw = Number(body.anchorId);
+        const anchorId = Number.isInteger(anchorRaw) && anchorRaw > 0 ?
+          anchorRaw : null;
+        const style = fiche.styleKeyOf(body.style);
+        const situation = parseCineMatchSituation(body.situation);
+        const replace = parsePicksReplace(body.replace);
+        const request: PicksRequest = {
+          anchorId,
+          style,
+          count: replace ?
+            replace.seenIds.length + (replace.refusedIds?.length ?? 0) : 5,
+        };
+        const withReplace = (setup: CineMatchSetup): CineMatchSetup =>
+          replace ? {
+            ...setup,
+            extraExcludedIds: [
+              ...(setup.extraExcludedIds ?? []),
+              ...replace.keepIds,
+              ...replace.seenIds,
+              ...(replace.refusedIds ?? []),
+            ],
+          } : setup;
+        const answers = {situation, anchorId, style, engine: 'fiche'};
+
+        const db = getAdmin().firestore();
+        const ctx = tmdb(req, res);
+        const userRef = db.collection('users').doc(uid);
+
+        if (format === 'series') {
+          const setup = withReplace(
+              await loadSeriesSetup(db, uid, situation, ctx));
+          const result = await runSeriesPicks(db, setup, request, ctx);
+          const picks = result.picks
+              .filter((pick) => result.enriched.has(pick.fiche.id));
+          if (picks.length === 0) {
+            if (replace) {
+              res.status(200).json({films: [], widened: result.widened});
+            } else {
+              res.status(409).json({error: 'no_candidates'});
+            }
+            return;
+          }
+          const sessionId = await writeFiveHistory(
+              userRef.collection(cineMatchStoreFor('series').history),
+              replace,
+              picks.map((pick) => pick.fiche.id),
+              picksHistoryFilms(picks, result.sources,
+                  (id) => result.enriched.get(id)?.name ?? null),
+              answers,
+          );
+          res.status(200).json({
+            films: picks.map((pick) => cineMatchSeriesJSON(
+                result.enriched.get(pick.fiche.id) as TvMeta)),
+            widened: result.widened,
+            sessionId,
+          });
+          return;
+        }
+
+        const setup = withReplace(
+            await loadCineMatchSetup(db, uid, situation, ctx));
+        const result = await runFilmPicks(db, setup, request, ctx);
+        const picks = result.picks
+            .filter((pick) => result.enriched.has(pick.fiche.id));
+        if (picks.length === 0) {
+          if (replace) {
+            res.status(200).json({films: [], widened: result.widened});
+          } else {
+            res.status(409).json({error: 'no_candidates'});
+          }
+          return;
+        }
+        const sessionId = await writeFiveHistory(
+            userRef.collection('recommendationHistory'),
+            replace,
+            picks.map((pick) => pick.fiche.id),
+            picksHistoryFilms(picks, result.sources,
+                (id) => result.enriched.get(id)?.title ?? null),
+            answers,
+        );
+        // Sur émulateur seulement : le classement complet, pour régler.
+        const debug = process.env.FUNCTIONS_EMULATOR === 'true' &&
+          body.debug === true ?
+          picksHistoryFilms(result.ranked.slice(0, 25), result.sources,
+              (id) => result.enriched.get(id)?.title ?? null) : undefined;
+        res.status(200).json({
+          films: picks.map((pick) => cineMatchFiveFilmJSON(
+              result.enriched.get(pick.fiche.id) as EnrichedCandidate)),
+          widened: result.widened,
+          sessionId,
+          ...(debug ? {debug} : {}),
+        });
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('getCineMatchPicks failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
