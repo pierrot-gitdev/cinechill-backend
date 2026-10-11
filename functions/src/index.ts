@@ -10098,6 +10098,13 @@ function readMediaItem(req: Request, res: Response): MediaItemPayload | null {
 }
 
 /**
+ * Recommandations envoyées par jour et par compte, au plus. Bien au-dessus
+ * d'un usage réel ; assez bas pour qu'un compte ne puisse pas noyer la
+ * boîte de quelqu'un.
+ */
+const SUGGESTIONS_PER_DAY = 30;
+
+/**
  * Recommande un film déjà vu par l'expéditeur à quelqu'un qu'il suit, qui ne
  * l'a pas encore vu.
  */
@@ -10129,18 +10136,26 @@ export const sendSuggestion = onRequest(
         const senderProfileRef = db.collection('publicProfiles').doc(fromUid);
         const suggestionRef = db.collection('users').doc(targetUid)
             .collection('suggestions').doc(`${fromUid}_${item.id}`);
+        // Le compteur du jour, hors de `preferences` : le client ne peut
+        // pas l'écrire (aucune règle ne l'ouvre).
+        const quotaRef = db.collection('users').doc(fromUid)
+            .collection('limits').doc('suggestions');
+        const today = todayISO();
 
         const outcome = await db.runTransaction(async (tx) => {
           const [
             followingSnap, senderGallerySnap, targetGallerySnap,
-            senderProfileSnap, existingSnap,
+            senderProfileSnap, existingSnap, quotaSnap,
           ] = await Promise.all([
             tx.get(followingRef),
             tx.get(senderGalleryRef),
             tx.get(targetGalleryRef),
             tx.get(senderProfileRef),
             tx.get(suggestionRef),
+            tx.get(quotaRef),
           ]);
+          const sentToday = quotaSnap.get('day') === today ?
+            Number(quotaSnap.get('count')) || 0 : 0;
 
           if (!senderProfileSnap.exists) {
             return {
@@ -10163,7 +10178,17 @@ export const sendSuggestion = onRequest(
           if (existingSnap.exists) {
             return {status: 409 as const, error: 'already_suggested' as const};
           }
+          if (sentToday >= SUGGESTIONS_PER_DAY) {
+            return {status: 429 as const, error: 'daily_limit' as const};
+          }
 
+          // Le film recommandé est celui de la galerie de l'expéditeur, tel
+          // que le serveur l'y a écrit, et non ce que la requête raconte : un
+          // client modifié pouvait sinon déposer chez quelqu'un un titre et
+          // un synopsis de son choix.
+          const own = senderGallerySnap;
+          const read = <T>(key: string, type: string): T | null =>
+            typeof own.get(key) === type ? own.get(key) as T : null;
           tx.set(suggestionRef, {
             fromUid,
             fromHandle: senderProfileSnap.get('handle') ?? null,
@@ -10171,17 +10196,19 @@ export const sendSuggestion = onRequest(
             fromAvatarURL: senderProfileSnap.get('avatarURL') ?? null,
             item: {
               id: item.id,
-              tmdbId: item.tmdbId,
-              mediaType: item.mediaType,
-              title: item.title,
-              posterPath: item.posterPath ?? null,
-              overview: item.overview ?? null,
-              voteAverage: item.voteAverage ?? null,
-              genreIds: item.genreIds ?? [],
-              releaseDate: item.releaseDate ?? null,
+              tmdbId: read<number>('tmdbId', 'number') ?? item.tmdbId,
+              mediaType: read<string>('mediaType', 'string') ?? item.mediaType,
+              title: read<string>('title', 'string') ?? item.title,
+              posterPath: read<string>('posterPath', 'string'),
+              overview: read<string>('overview', 'string'),
+              voteAverage: read<number>('voteAverage', 'number'),
+              genreIds: Array.isArray(own.get('genreIds')) ?
+                own.get('genreIds') : [],
+              releaseDate: read<string>('releaseDate', 'string'),
             },
             createdAt: Timestamp.now(),
           });
+          tx.set(quotaRef, {day: today, count: sentToday + 1});
 
           return {status: 200 as const};
         });
