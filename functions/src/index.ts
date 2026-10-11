@@ -13035,6 +13035,8 @@ export const recordCineMatchExposure = onRequest(
 const FICHE_MAX_AGE_MS = 150 * 24 * 3600 * 1000;
 /** Films proposés par tour de l'écran « Un film proche de… ». */
 const STARTERS_PER_PAGE = 6;
+/** Films déjà montrés pendant la visite que l'app renvoie, au plus. */
+const STARTERS_SHOWN_MAX = 120;
 /** Affiches par tuile de style. */
 const STYLE_TILE_FILMS = 3;
 /** Fiches payées à TMDB, au plus, pour ordonner les films d'un style. */
@@ -13338,6 +13340,12 @@ async function knownFilmsOfStyle(
  * de cœur d'abord, ceux montrés ces quatorze derniers jours en dernier. Les
  * mêmes toute la journée ; `page` passe aux six suivants (« Pas ceux-là »)
  * et revient au début une fois le style parcouru.
+ *
+ * `shownIds` : les films déjà montrés pendant la visite. Ils sont écartés
+ * des six suivants, quel que soit l'ordre du moment : il bouge tant que les
+ * fiches du style entrent en cache (24 par appel), et une page comptée sur
+ * l'ordre de l'appel précédent remontrait un film. Testé le 12 octobre sur
+ * 44 thrillers : deux films de la première page revenaient à la deuxième.
  */
 export const getCineMatchStarters = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
@@ -13356,6 +13364,8 @@ export const getCineMatchStarters = onRequest(
         const pageRaw = Number(body.page);
         const page = Number.isInteger(pageRaw) && pageRaw >= 0 &&
           pageRaw <= 100 ? pageRaw : 0;
+        const shownIds =
+          new Set(parseTmdbIdList(body.shownIds, STARTERS_SHOWN_MAX));
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
@@ -13417,11 +13427,24 @@ export const getCineMatchStarters = onRequest(
         });
 
         const pages = Math.max(1, Math.ceil(order.length / STARTERS_PER_PAGE));
-        const current = page % pages;
+        // Sans liste, la page dit où l'on en est. Avec, on prend les six
+        // premiers pas encore montrés, et l'on repart du début une fois le
+        // style parcouru (`restarted`, pour que l'app remette sa liste à
+        // zéro).
+        let current = page % pages;
+        let pageIds: number[];
+        let restarted = false;
+        if (shownIds.size === 0) {
+          pageIds = order.slice(current * STARTERS_PER_PAGE,
+              (current + 1) * STARTERS_PER_PAGE);
+        } else {
+          const unseen = order.filter((id) => !shownIds.has(id));
+          restarted = unseen.length === 0;
+          if (restarted) current = 0;
+          pageIds = (restarted ? order : unseen).slice(0, STARTERS_PER_PAGE);
+        }
         const byId = new Map(members.map((film) => [film.id, film]));
-        const shown = order
-            .slice(current * STARTERS_PER_PAGE,
-                (current + 1) * STARTERS_PER_PAGE)
+        const shown = pageIds
             .map((id) => byId.get(id))
             .filter((film): film is StarterFilm => film !== undefined);
         const filler = await knownFilmsOfStyle(style, format, new Set(ids),
@@ -13431,6 +13454,7 @@ export const getCineMatchStarters = onRequest(
           page: current,
           films: [...shown.map((film) => starterFilmJSON(film)), ...filler],
           hasMore: pages > 1,
+          restarted,
         });
       } catch (error) {
         if (sendTMDBError(error, res)) return;
