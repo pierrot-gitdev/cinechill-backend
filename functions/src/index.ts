@@ -9810,6 +9810,53 @@ function normalizeSearchText(raw: string): string {
 }
 
 /**
+ * Longueur au-delà de laquelle un mot n'est plus indexé : la recherche
+ * côté client coupe le mot tapé à la même longueur.
+ */
+const SEARCH_PREFIX_MAX_LENGTH = 20;
+/** Plafond du tableau, loin des limites d'un document Firestore. */
+const SEARCH_PREFIXES_MAX = 300;
+
+/**
+ * Tous les débuts de mots d'un profil, pour la recherche par `array-contains`.
+ *
+ * Une requête Firestore ne sait chercher qu'un préfixe du champ entier :
+ * « martin » ne trouvait pas « Léa Martin », seulement « léa m… ». En
+ * indexant le début de chaque mot du nom et du pseudo, le premier mot tapé
+ * suffit, où qu'il tombe dans le nom. Le découpage suit les séparateurs
+ * qu'on trouve réellement dans les noms (« Jean-Luc », « O'Brien », « Dr.
+ * House ») et dans les pseudos (« lea.martin », « lea_m »).
+ *
+ * Le script `scripts/backfill-search-prefixes.mjs` en porte une copie :
+ * toute modification ici doit y être reportée à l'identique.
+ * @param {string} handle Pseudo, normalisé ou non.
+ * @param {string} displayName Nom affiché.
+ * @return {string[]} Préfixes normalisés, sans doublon.
+ */
+function searchPrefixesFor(handle: string, displayName: string): string[] {
+  const name = normalizeSearchText(displayName);
+  const normalizedHandle = normalizeSearchText(handle);
+  const words = [
+    ...name.split(/[\s\-'’._]+/),
+    // Le pseudo entier, séparateurs compris : « lea.m » doit se trouver tel
+    // quel, pas seulement par « lea » puis « m ».
+    normalizedHandle,
+    ...normalizedHandle.split(/[._-]+/),
+  ];
+  const prefixes = new Set<string>();
+  for (const word of words) {
+    // Par points de code, pas par unités UTF-16 : un préfixe ne doit jamais
+    // couper un emoji en deux.
+    const chars = [...word];
+    const longest = Math.min(chars.length, SEARCH_PREFIX_MAX_LENGTH);
+    for (let length = 1; length <= longest; length++) {
+      prefixes.add(chars.slice(0, length).join(''));
+    }
+  }
+  return [...prefixes].slice(0, SEARCH_PREFIXES_MAX);
+}
+
+/**
  * Un pseudo utilisable : longueur et alphabet, une fois normalisé.
  * @param {string} normalized Pseudo déjà normalisé.
  * @return {boolean} Vrai si le pseudo respecte le format attendu.
@@ -9897,9 +9944,15 @@ export const claimHandle = onRequest(
           tx.set(usernameRef, {uid, createdAt: now});
 
           if (profileSnap.exists) {
+            // Les préfixes de l'ancien pseudo partent avec lui : sans ça, le
+            // profil resterait trouvable sous un nom qu'il ne porte plus.
+            const storedName = profileSnap.get('displayName');
+            const currentName = typeof storedName === 'string' && storedName ?
+              storedName : handleNormalized;
             tx.update(profileRef, {
               handle: rawHandle.trim(),
               handleNormalized,
+              searchPrefixes: searchPrefixesFor(handleNormalized, currentName),
               handleChangeCount: FieldValue.increment(1),
               updatedAt: now,
             });
@@ -9912,6 +9965,7 @@ export const claimHandle = onRequest(
               // Sans ce champ, la recherche ne trouverait un profil que par
               // pseudo — jamais par prénom ou nom.
               displayNameNormalized: normalizeSearchText(displayName),
+              searchPrefixes: searchPrefixesFor(handleNormalized, displayName),
               avatarURL: null,
               badgeSignature: null,
               followerCount: 0,
@@ -9984,6 +10038,69 @@ export const handleAvailable = onRequest(
         res.status(200).json({available: !snap.exists});
       } catch (error) {
         logger.error('handleAvailable failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Nom affiché le plus long accepté, en points de code, comme le client. */
+const DISPLAY_NAME_MAX_LENGTH = 60;
+
+/**
+ * Change le nom affiché du profil public, et tout ce que la recherche en tire.
+ *
+ * Le client écrivait jusqu'ici `displayName` lui-même. Il ne peut pas écrire
+ * `searchPrefixes`, et ne doit pas le pouvoir : un tableau libre permettrait à
+ * n'importe qui d'y glisser des mots pour sortir dans les recherches des
+ * autres. Le nom passe donc par ici, et les préfixes en sont dérivés.
+ *
+ * En transaction avec la lecture du pseudo : un changement de pseudo
+ * simultané (claimHandle) ne peut pas faire écrire les préfixes d'un pseudo
+ * qui n'est déjà plus le bon.
+ */
+export const setPublicName = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const raw = req.body?.displayName;
+        const displayName = typeof raw === 'string' ? raw.trim() : '';
+        const length = [...displayName].length;
+        if (length === 0 || length > DISPLAY_NAME_MAX_LENGTH) {
+          res.status(400).json({error: 'invalid_name'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const profileRef = db.collection('publicProfiles').doc(uid);
+        const found = await db.runTransaction(async (tx) => {
+          const profileSnap = await tx.get(profileRef);
+          if (!profileSnap.exists) return false;
+          const handle = profileSnap.get('handleNormalized');
+          tx.update(profileRef, {
+            displayName,
+            displayNameNormalized: normalizeSearchText(displayName),
+            searchPrefixes: searchPrefixesFor(
+                typeof handle === 'string' ? handle : '', displayName,
+            ),
+            updatedAt: Timestamp.now(),
+          });
+          return true;
+        });
+
+        if (!found) {
+          res.status(404).json({error: 'own_profile_missing'});
+          return;
+        }
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('setPublicName failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },

@@ -111,6 +111,10 @@ service cloud.firestore {
       // displayName (voir SocialStore.syncDisplayName) : c'est ce qui
       // permet à la recherche de trouver un profil par prénom/nom, pas
       // seulement par pseudo.
+      // searchPrefixes n'est pas dans la liste, et ne doit pas y entrer :
+      // un tableau libre permettrait à n'importe qui d'y glisser des mots
+      // pour sortir dans les recherches des autres. Seuls claimHandle et
+      // setPublicName l'écrivent.
       // avatarURL et badgeSignature ne sont plus ouverts : l'app ne les
       // écrit pas, et une URL d'avatar libre faisait télécharger une image
       // de n'importe quel serveur à quiconque regardait le profil. Le nom
