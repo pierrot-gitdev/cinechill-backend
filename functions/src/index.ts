@@ -8896,21 +8896,37 @@ async function fetchTrendingPages(
       {page: String(page)},
       ctx,
   )));
-  return settled.flatMap((result) => rowsFrom(result, 'results'))
-      .flatMap((row): DiscoverRow[] => {
-        const raw = row as DiscoverRow & {
-          name?: string; first_air_date?: string; media_type?: string;
-        };
-        if (raw.media_type === 'movie') return [{...raw, media_type: 'movie'}];
-        if (raw.media_type !== 'tv') return [];
-        return [{
-          ...raw,
-          media_type: 'tv',
-          title: raw.name,
-          release_date: raw.first_air_date ?? null,
-          genre_ids: series.normalizeTvGenres(raw.genre_ids),
-        }];
-      });
+  return mediaRowsFromMulti(
+      settled.flatMap((result) => rowsFrom(result, 'results')),
+  );
+}
+
+/**
+ * Les films et les séries d'une liste mêlée de TMDB (`/trending/all`,
+ * `/search/multi`), ramenés à une seule forme de ligne.
+ *
+ * Les séries y portent `name` et `first_air_date` là où les films portent
+ * `title` et `release_date`, et leurs genres propres : on les aligne ici
+ * pour que tout ce qui suit lise une série comme un film. Les personnes,
+ * que ces listes renvoient aussi, sont écartées.
+ * @param {DiscoverRow[]} rows Lignes brutes de TMDB.
+ * @return {DiscoverRow[]} Films et séries, dans l'ordre reçu.
+ */
+function mediaRowsFromMulti(rows: DiscoverRow[]): DiscoverRow[] {
+  return rows.flatMap((row): DiscoverRow[] => {
+    const raw = row as DiscoverRow & {
+      name?: string; first_air_date?: string; media_type?: string;
+    };
+    if (raw.media_type === 'movie') return [{...raw, media_type: 'movie'}];
+    if (raw.media_type !== 'tv') return [];
+    return [{
+      ...raw,
+      media_type: 'tv',
+      title: raw.name,
+      release_date: raw.first_air_date ?? null,
+      genre_ids: series.normalizeTvGenres(raw.genre_ids),
+    }];
+  });
 }
 
 /**
@@ -9163,6 +9179,79 @@ export const getHomeRows = onRequest(
       } catch (error) {
         if (sendTMDBError(error, res)) return;
         logger.error('getHomeRows failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ===========================================================================
+// Recherche de titres — searchTitles
+// ===========================================================================
+
+/** Longueur maximale d'une recherche transmise à TMDB. */
+const SEARCH_TITLES_QUERY_MAX = 80;
+/** Résultats renvoyés au plus. */
+const SEARCH_TITLES_MAX = 20;
+
+/**
+ * Cherche des films et des séries par leur titre.
+ *
+ * Rien n'est filtré ni selon les genres refusés ni selon la bibliothèque :
+ * une recherche explicite rend ce qui a été demandé. Écarter un film qu'on
+ * vient de taper mot pour mot laisserait croire qu'il n'existe pas.
+ *
+ * Le titre exact remonte en tête, le reste garde l'ordre de pertinence de
+ * TMDB. Sans ce coup de pouce, « Alien » se perd derrière les suites plus
+ * populaires dont le titre le contient.
+ */
+export const searchTitles = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const raw = req.body?.query;
+        const query = typeof raw === 'string' ?
+          raw.trim().slice(0, SEARCH_TITLES_QUERY_MAX) : '';
+        if ([...query].length < 2) {
+          res.status(400).json({error: 'invalid_query'});
+          return;
+        }
+
+        const ctx = tmdb(req, res);
+        const payload = await tmdbGET('/search/multi', {
+          query,
+          include_adult: 'false',
+          page: '1',
+        }, ctx);
+        const results = Array.isArray(payload.results) ?
+          payload.results as DiscoverRow[] : [];
+
+        const wanted = normalizeSearchText(query);
+        const ranked = mediaRowsFromMulti(results)
+            .filter((row) => !!row.title?.trim())
+            .map((row, index) => ({
+              row,
+              index,
+              exact: normalizeSearchText(row.title ?? '') === wanted,
+            }))
+            // L'index départage explicitement : l'ordre de TMDB est celui
+            // de la pertinence, on ne le perd pas au tri.
+            .sort((a, b) => Number(b.exact) - Number(a.exact) ||
+              a.index - b.index)
+            .slice(0, SEARCH_TITLES_MAX)
+            .map((entry) => entry.row);
+
+        const rows = await withSeasonCounts(ranked, ctx);
+        res.status(200).json({results: rows.map(homeRowToJSON)});
+      } catch (error) {
+        if (sendTMDBError(error, res)) return;
+        logger.error('searchTitles failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
