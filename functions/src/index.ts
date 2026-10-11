@@ -6,6 +6,8 @@ import {Response} from 'express';
 import {initializeApp, getApps} from 'firebase-admin/app';
 import {getAppCheck} from 'firebase-admin/app-check';
 import {getAuth} from 'firebase-admin/auth';
+import {getMessaging, TokenMessage} from 'firebase-admin/messaging';
+import {createHash} from 'crypto';
 import {
   CollectionReference,
   DocumentReference,
@@ -29,12 +31,14 @@ import * as deck from './deck/engine';
  * qu'avait l'ancien espace de noms `admin` : `getAdmin().firestore()`,
  * `.auth()`, `.appCheck()`. La v14 du SDK a supprimé cet espace de noms ;
  * garder la même forme d'appel évite de réécrire les cent cinquante sites
- * qui s'en servent, et ne change rien à ce qu'ils obtiennent.
+ * qui s'en servent, et ne change rien à ce qu'ils obtiennent. `.messaging()`
+ * s'y ajoute pour les notifications, sous la même forme.
  */
 const adminServices = {
   firestore: (): Firestore => getFirestore(),
   auth: () => getAuth(),
   appCheck: () => getAppCheck(),
+  messaging: () => getMessaging(),
 };
 
 /**
@@ -1229,6 +1233,31 @@ function sanitizeMediaItem(raw: unknown): MediaItemPayload | null {
   return out;
 }
 
+/**
+ * Les champs communs d'une entrée de galerie ou de watchlist, tirés d'un
+ * film déjà nettoyé.
+ * @param {MediaItemPayload} item Le film, passé par `sanitizeMediaItem`.
+ * @param {Timestamp} now Date d'ajout.
+ * @return {Object} Les champs à écrire.
+ */
+function mediaEntryFields(item: MediaItemPayload, now: Timestamp) {
+  return {
+    id: item.id,
+    tmdbId: item.tmdbId,
+    mediaType: item.mediaType,
+    title: item.title,
+    posterPath: item.posterPath ?? null,
+    overview: item.overview ?? null,
+    voteAverage: item.voteAverage ?? null,
+    director: item.director ?? null,
+    collectionId: item.collectionId ?? null,
+    collectionTotal: item.collectionTotal ?? null,
+    genreIds: item.genreIds ?? [],
+    releaseDate: item.releaseDate ?? null,
+    addedAt: now,
+  };
+}
+
 export const setMediaStatus = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public'},
     async (req: Request, res: Response) => {
@@ -1285,12 +1314,21 @@ export const setMediaStatus = onRequest(
         const galleryRef = userRef.collection('gallery').doc(item.id);
 
         // L'écriture remplace le document : on relit d'abord ce que la
-        // Galerie sait déjà (coup de cœur, pays d'origine enrichi) pour ne
-        // pas l'effacer quand le film reste vu.
-        const previousSnap = status === 'seen' ?
-          await galleryRef.get() : null;
+        // Galerie sait déjà (coup de cœur, « pas aimé », pays d'origine
+        // enrichi, recommandeurs) pour ne pas l'effacer quand le film reste
+        // vu. La watchlist aussi : ses recommandeurs suivent le film en
+        // galerie, pour que la notification N3 parte maintenant et qu'un
+        // coup de cœur posé plus tard sache encore à qui la dire.
+        const [previousSnap, queuedSnap] = status === 'seen' ?
+          await Promise.all([galleryRef.get(), watchlistRef.get()]) :
+          [null, null];
         const previousLovedAt = previousSnap?.get('lovedAt');
+        const previousDislikedAt = previousSnap?.get('dislikedAt');
         const previousOrigin = previousSnap?.get('originCountry');
+        const recommendedBy = mergeRecommenders(
+            previousSnap?.get('recommendedBy'),
+            queuedSnap?.get('recommendedBy'),
+        );
 
         // L'abandon : retirer de la file une saison commencée. Rien n'en
         // reste dans la bibliothèque — on l'a décidé, un abandon n'est pas un
@@ -1319,19 +1357,7 @@ export const setMediaStatus = onRequest(
 
         const now = Timestamp.now();
         const data = {
-          id: item.id,
-          tmdbId: item.tmdbId,
-          mediaType: item.mediaType,
-          title: item.title,
-          posterPath: item.posterPath ?? null,
-          overview: item.overview ?? null,
-          voteAverage: item.voteAverage ?? null,
-          director: item.director ?? null,
-          collectionId: item.collectionId ?? null,
-          collectionTotal: item.collectionTotal ?? null,
-          genreIds: item.genreIds ?? [],
-          releaseDate: item.releaseDate ?? null,
-          addedAt: now,
+          ...mediaEntryFields(item, now),
           ...seasonExtras,
         };
 
@@ -1345,8 +1371,11 @@ export const setMediaStatus = onRequest(
             ...data,
             ...(previousLovedAt instanceof Timestamp ?
               {lovedAt: previousLovedAt} : {}),
+            ...(previousDislikedAt instanceof Timestamp ?
+              {dislikedAt: previousDislikedAt} : {}),
             ...(Array.isArray(previousOrigin) ?
               {originCountry: previousOrigin} : {}),
+            ...(recommendedBy.length > 0 ? {recommendedBy} : {}),
           });
         }
 
@@ -1364,6 +1393,13 @@ export const setMediaStatus = onRequest(
           } catch (error) {
             logger.warn('setMediaStatus: positioning failed', {error});
           }
+        }
+
+        // N3, à l'entrée en galerie seulement : reclasser un film déjà vu
+        // n'apprend rien de neuf à ceux qui l'avaient recommandé.
+        if (status === 'seen' && !previousSnap?.exists &&
+          recommendedBy.length > 0) {
+          await notifyRecommenders(db, uid, item, recommendedBy, false);
         }
 
         res.status(200).json({ok: true});
@@ -1415,10 +1451,24 @@ export const setGalleryLove = onRequest(
         if (loved) {
           // Re-poser un cœur déjà posé ne rajeunit pas le signal : la date
           // d'origine reste, c'est elle que la demi-vie du trait regarde.
+          // Le cœur contredit « pas aimé » : le geste le plus récent gagne.
           if (!(snap.get('lovedAt') instanceof Timestamp)) {
             await galleryRef.set(
-                {lovedAt: Timestamp.now()}, {merge: true},
+                {lovedAt: Timestamp.now(), dislikedAt: FieldValue.delete()},
+                {merge: true},
             );
+            // N3, variante « adoré », pour qui avait recommandé le film.
+            const title = snap.get('title');
+            const tmdbId = snap.get('tmdbId');
+            const mediaType = snap.get('mediaType');
+            if (typeof title === 'string' && typeof tmdbId === 'number' &&
+              typeof mediaType === 'string') {
+              await notifyRecommenders(a.firestore(), uid, {
+                id: itemId, mediaType, tmdbId, title,
+                posterPath: snap.get('posterPath') ?? null,
+                releaseDate: snap.get('releaseDate') ?? null,
+              }, snap.get('recommendedBy'), true);
+            }
           }
         } else {
           await galleryRef.set(
@@ -1429,6 +1479,125 @@ export const setGalleryLove = onRequest(
         res.status(200).json({ok: true});
       } catch (error) {
         logger.error('setGalleryLove failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Les quatre réponses de la notification du lendemain (N5). */
+const FILM_VERDICTS = ['loved', 'liked', 'disliked', 'notWatched'] as const;
+
+/**
+ * L'avis sur un film regardé la veille, donné depuis la notification N5 ou
+ * la fiche du film.
+ *
+ * Les trois avis rangent le film en galerie, comme `setMediaStatus` « vu » :
+ * il compte comme vu partout (propositions, « Films vus », « Genres variés »).
+ * « Pas aimé » pose `dislikedAt`, que les lecteurs de goût écartent : un
+ * film vu et pas aimé ne doit ni tirer le profil vers lui, ni servir de
+ * graine, ni passer pour un coup de cœur. « Pas regardé » ne touche à rien.
+ */
+export const setFilmVerdict = onRequest(
+    {secrets: [tmdbApiKey], invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const verdict = oneOf(req.body?.verdict, FILM_VERDICTS);
+        if (!verdict) {
+          res.status(400).json({error: 'invalid_verdict'});
+          return;
+        }
+        const item = sanitizeMediaItem(req.body?.item);
+        if (!item) {
+          res.status(400).json({error: 'invalid_item'});
+          return;
+        }
+        // La notification du lendemain ne part que pour un film : une saison
+        // se range épisode par épisode, par un autre chemin.
+        if (item.mediaType !== 'movie') {
+          res.status(400).json({error: 'invalid_media_type'});
+          return;
+        }
+        if (verdict === 'notWatched') {
+          res.status(200).json({ok: true});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const galleryRef = userRef.collection('gallery').doc(item.id);
+        const watchlistRef = userRef.collection('watchlist').doc(item.id);
+
+        const outcome = await db.runTransaction(async (tx) => {
+          const [gallerySnap, watchlistSnap] = await Promise.all([
+            tx.get(galleryRef),
+            tx.get(watchlistRef),
+          ]);
+          const now = Timestamp.now();
+          const lovedAt = gallerySnap.get('lovedAt');
+          const dislikedAt = gallerySnap.get('dislikedAt');
+          const wasLoved = lovedAt instanceof Timestamp;
+          // Les recommandeurs de la watchlist suivent le film en galerie,
+          // pour la notification N3 et pour un cœur posé plus tard.
+          const recommendedBy = mergeRecommenders(
+              gallerySnap.get('recommendedBy'),
+              watchlistSnap.get('recommendedBy'),
+          );
+          // Redire le même avis ne rajeunit pas sa date : c'est elle que la
+          // demi-vie du trait regarde.
+          const keptLoved = wasLoved ? lovedAt : now;
+          const keptDisliked = dislikedAt instanceof Timestamp ?
+            dislikedAt : now;
+
+          if (watchlistSnap.exists) tx.delete(watchlistRef);
+          if (gallerySnap.exists) {
+            tx.update(galleryRef, {
+              lovedAt: verdict === 'loved' ? keptLoved : FieldValue.delete(),
+              dislikedAt: verdict === 'disliked' ?
+                keptDisliked : FieldValue.delete(),
+              ...(recommendedBy.length > 0 ? {recommendedBy} : {}),
+            });
+          } else {
+            tx.set(galleryRef, {
+              ...mediaEntryFields(item, now),
+              ...(verdict === 'loved' ? {lovedAt: now} : {}),
+              ...(verdict === 'disliked' ? {dislikedAt: now} : {}),
+              ...(recommendedBy.length > 0 ? {recommendedBy} : {}),
+            });
+          }
+          return {entered: !gallerySnap.exists, wasLoved, recommendedBy};
+        });
+
+        // C1 : le film qui vient d'entrer reçoit sa position, comme dans
+        // setMediaStatus. Elle sert à l'exclusion et aux comptes ; les
+        // lecteurs de goût l'ignorent quand le film porte `dislikedAt`.
+        try {
+          const snap = await galleryRef.get();
+          if (snap.exists && snap.get('axesV') !== AXES_VERSION) {
+            await positionGalleryDocs([snap], tmdb(req, res), db);
+          }
+        } catch (error) {
+          logger.warn('setFilmVerdict: positioning failed', {error});
+        }
+
+        // N3 : à l'entrée en galerie, ou quand l'avis devient « adoré ».
+        const loved = verdict === 'loved';
+        if (outcome.recommendedBy.length > 0 &&
+          (outcome.entered || (loved && !outcome.wasLoved))) {
+          await notifyRecommenders(
+              db, uid, item, outcome.recommendedBy, loved,
+          );
+        }
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('setFilmVerdict failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
@@ -2283,6 +2452,8 @@ interface PoolLibrary {
   lovedSeeds: number[];
   /** Titres connus, par tmdbId — pour nommer les graines (C5). */
   titles: Map<number, string>;
+  /** Films vus et « pas aimés » : exclus comme les autres, jamais graines. */
+  disliked: Set<number>;
 }
 
 /**
@@ -2312,12 +2483,14 @@ async function fetchLibraryForPool(
   ]);
 
   const excluded = new Set<number>();
+  const disliked = new Set<number>();
   const titles = new Map<number, string>();
   const loved: {tmdbId: number; at: number}[] = [];
   for (const doc of gallerySnap.docs) {
     const id = doc.get('tmdbId');
     if (typeof id !== 'number') continue;
     excluded.add(id);
+    if (doc.get('dislikedAt') instanceof Timestamp) disliked.add(id);
     const title = doc.get('title');
     if (typeof title === 'string') titles.set(id, title);
     const lovedAt = doc.get('lovedAt');
@@ -2365,6 +2538,7 @@ async function fetchLibraryForPool(
     watchlistRows,
     lovedSeeds: loved.sort((a, b) => b.at - a.at).map((entry) => entry.tmdbId),
     titles,
+    disliked,
   };
 }
 
@@ -3386,6 +3560,13 @@ const PREFS_MATURE_SIZE = 8;
  * refus d'un trio, mais à la bonne granularité. */
 const TRAIT_WEIGHT_PASSED_FILM = 0.3;
 /**
+ * Un film de la Galerie marqué « pas aimé ». Négatif : la même preuve
+ * *contre* sa position que « ce n'est pas lui », au même poids. Il aurait pu
+ * peser plus, le film ayant été vu jusqu'au bout ; on reste prudent tant
+ * qu'aucune soirée ne l'a calibré.
+ */
+const TRAIT_WEIGHT_GALLERY_DISLIKED = -TRAIT_WEIGHT_PASSED_FILM;
+/**
  * Une intention, pas une expérience — le soi projeté, à croire avec prudence.
  */
 const TRAIT_WEIGHT_WATCHLIST = 0.2;
@@ -3410,6 +3591,9 @@ interface TraitEntry {
   /** Coup de cœur posé sur l'entrée. L'absence ne dit pas « pas aimé » :
    * elle dit « rien déclaré », et ne pénalise jamais. */
   loved: boolean;
+  /** « Pas aimé », dit après coup (`dislikedAt`). Le film compte comme vu,
+   * mais pèse contre sa position au lieu de tirer le profil vers elle. */
+  disliked: boolean;
   /** La position réelle du film (C1), quand la Galerie l'a déjà apprise.
    * Sans elle, le trait retombe sur la lecture des genres, comme avant. */
   axes: Partial<AxisVector> | null;
@@ -3636,6 +3820,9 @@ function buildTraitProfile(
   );
   const prefsMature = prefs.size >= PREFS_MATURE_SIZE;
   ingest(gallery, (entry) => {
+    // « Pas aimé » passe avant le graphe et le cœur : un film vu et pas aimé
+    // ne doit jamais tirer le profil vers lui, quel que soit son score.
+    if (entry.disliked) return TRAIT_WEIGHT_GALLERY_DISLIKED;
     let weight = TRAIT_WEIGHT_GALLERY;
     if (prefsMature) {
       const elo = entry.tmdbId !== null ? prefs.get(entry.tmdbId) : undefined;
@@ -3773,6 +3960,7 @@ function traitEntriesFrom(
       inCollection: typeof doc.get('collectionId') === 'number',
       addedAtMillis: millis,
       loved: doc.get('lovedAt') instanceof Timestamp,
+      disliked: doc.get('dislikedAt') instanceof Timestamp,
       axes,
     });
   }
@@ -4869,8 +5057,11 @@ export const recordSessionOutcome = onRequest(
             if (gallerySnap.exists &&
               !(gallerySnap.get('lovedAt') instanceof
                 Timestamp)) {
+              // Dit après la soirée, « je l'ai adoré » l'emporte sur un
+              // « pas aimé » plus ancien.
               await galleryRef.set(
-                  {lovedAt: Timestamp.now()}, {merge: true},
+                  {lovedAt: Timestamp.now(), dislikedAt: FieldValue.delete()},
+                  {merge: true},
               );
             }
             // Et il parle au graphe : « resté avec moi » vaut un duel gagné
@@ -5068,7 +5259,11 @@ export const getGalleryAxes = onRequest(
           );
         }
 
+        // Les duels demandent « lequel reverrais-tu ? » : un film « pas
+        // aimé » n'a rien à y faire, et un duel gagné par défaut lui
+        // donnerait un score de préférence qu'il n'a pas.
         const candidates = gallerySnap.docs
+            .filter((doc) => !(doc.get('dislikedAt') instanceof Timestamp))
             .map((doc) => {
               const tmdbId = Number(doc.get('tmdbId'));
               if (!Number.isFinite(tmdbId)) return null;
@@ -5170,7 +5365,10 @@ export const backfillGallery = onRequest(
                 .doc(`movie-${tmdbId}`);
             const snap = await galleryRef.get();
             const already = snap.get('lovedAt');
-            if (snap.exists && !(already instanceof Timestamp)) {
+            // Un « pas aimé » donné depuis est plus récent que la soirée : le
+            // rattrapage ne le contredit pas.
+            if (snap.exists && !(already instanceof Timestamp) &&
+              !(snap.get('dislikedAt') instanceof Timestamp)) {
               // La date du lancement, pas celle du rattrapage : la demi-vie
               // du trait doit voir la soirée où elle a eu lieu.
               await galleryRef.set({
@@ -5344,6 +5542,9 @@ export const getCandidatePool = onRequest(
           for (const [id, rating] of
             [...prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
             if (rating <= ELO_START) break;
+            // Un film gagnant en duel puis dit « pas aimé » : le dernier mot
+            // l'emporte, il ne sème rien.
+            if (library.disliked.has(id)) continue;
             pushSeed(id);
           }
           for (const id of library.lovedSeeds) pushSeed(id);
@@ -6463,7 +6664,10 @@ function deckSeeds(
 ): number[] {
   const millis = (value: unknown) =>
     value instanceof Timestamp ? value.toMillis() : 0;
+  // Un film « pas aimé » reste vu, mais son voisinage TMDB n'est pas ce
+  // qu'on veut proposer : il ne sème pas.
   const entries = docs
+      .filter((doc) => !(doc.get('dislikedAt') instanceof Timestamp))
       .map((doc) => ({
         tmdbId: doc.get('tmdbId') as unknown,
         addedAt: millis(doc.get('addedAt')),
@@ -7695,9 +7899,13 @@ async function buildSeriesDeck(
   // La galerie des séries, série par série : trois saisons de Dark sont une
   // série, pas trois.
   const bySeries = new Map<number, {genreIds: number[]; addedAt: number}>();
+  // Une série dont une saison est « pas aimée » compte pour la couverture,
+  // mais ne sème rien et ne nourrit pas le goût de genre.
+  const dislikedSeries = new Set<number>();
   for (const doc of tvGalleryDocs) {
     const id = Number(doc.get('tmdbId'));
     if (!Number.isFinite(id)) continue;
+    if (doc.get('dislikedAt') instanceof Timestamp) dislikedSeries.add(id);
     const added = (doc.get('addedAt') as Timestamp | undefined)
         ?.toMillis() ?? 0;
     const known = bySeries.get(id);
@@ -7708,9 +7916,13 @@ async function buildSeriesDeck(
     }
   }
   const genreCounts = new Map<number, number>();
-  for (const entry of bySeries.values()) {
+  const likedGenreCounts = new Map<number, number>();
+  for (const [seriesId, entry] of bySeries) {
     for (const id of entry.genreIds) {
       genreCounts.set(id, (genreCounts.get(id) ?? 0) + 1);
+      if (!dislikedSeries.has(seriesId)) {
+        likedGenreCounts.set(id, (likedGenreCounts.get(id) ?? 0) + 1);
+      }
     }
   }
   const banned = declared.bannedGenreIDs;
@@ -7719,6 +7931,7 @@ async function buildSeriesDeck(
       .filter((id) => (genreCounts.get(id) ?? 0) < SERIES_COVERAGE_TARGET)
       .sort((a, b) => (genreCounts.get(a) ?? 0) - (genreCounts.get(b) ?? 0));
   const seeds = [...bySeries.entries()]
+      .filter(([id]) => !dislikedSeries.has(id))
       .sort((a, b) => b[1].addedAt - a[1].addedAt)
       .slice(0, SERIES_SEEDS)
       .map(([id]) => id);
@@ -7767,7 +7980,7 @@ async function buildSeriesDeck(
   // Le score : la notoriété d'abord, sur l'échelle des séries (cent votes
   // pour une inconnue, quinze mille pour une évidence), puis ce qu'elle
   // couvre, puis un goût de genre encore grossier.
-  const maxCount = Math.max(1, ...genreCounts.values());
+  const maxCount = Math.max(1, ...likedGenreCounts.values());
   const scored = [...pool.values()].map((row) => {
     const notoriety = clamp01(
         (Math.log10(Math.max(1, row.vote_count ?? 0)) - 2) / 2.2);
@@ -7781,7 +7994,7 @@ async function buildSeriesDeck(
         cover = Math.max(cover, clamp01(
             (SERIES_COVERAGE_TARGET - owned) / SERIES_COVERAGE_TARGET));
       }
-      taste = Math.max(taste, owned / maxCount);
+      taste = Math.max(taste, (likedGenreCounts.get(id) ?? 0) / maxCount);
     }
     const bonus = row.source === 'neighbors' ? 4 : 2;
     return {
@@ -8081,6 +8294,8 @@ export const recordSwipes = onRequest(
         // portait déjà.
         const previousGallery = new Map<string, {
           lovedAt: Timestamp | null;
+          dislikedAt: Timestamp | null;
+          recommendedBy: unknown[] | null;
           originCountry: string[] | null;
         }>();
         const seenIds = decisions
@@ -8093,10 +8308,16 @@ export const recordSwipes = onRequest(
           for (const snap of snaps) {
             if (!snap.exists) continue;
             const lovedAt = snap.get('lovedAt');
+            const dislikedAt = snap.get('dislikedAt');
+            const recommendedBy = snap.get('recommendedBy');
             const originCountry = snap.get('originCountry');
             previousGallery.set(snap.id, {
               lovedAt: lovedAt instanceof Timestamp ?
                 lovedAt : null,
+              dislikedAt: dislikedAt instanceof Timestamp ?
+                dislikedAt : null,
+              recommendedBy: Array.isArray(recommendedBy) ?
+                recommendedBy : null,
               originCountry: Array.isArray(originCountry) ?
                 originCountry.filter(
                     (c): c is string => typeof c === 'string',
@@ -8238,10 +8459,16 @@ export const recordSwipes = onRequest(
           if (decision === 'seen') {
             const previous = previousGallery.get(item.id);
             const lovedAt = loved ? now : previous?.lovedAt ?? null;
+            // Un cœur au swipe contredit un « pas aimé » antérieur : le geste
+            // le plus récent gagne.
+            const dislikedAt = loved ? null : previous?.dislikedAt ?? null;
             batch.delete(watchlistRef);
             batch.set(galleryRef, {
               ...data,
               ...(lovedAt ? {lovedAt} : {}),
+              ...(dislikedAt ? {dislikedAt} : {}),
+              ...(previous?.recommendedBy ?
+                {recommendedBy: previous.recommendedBy} : {}),
               ...(previous?.originCountry ?
                 {originCountry: previous.originCountry} : {}),
             });
@@ -8771,6 +8998,47 @@ async function detachFromFollowGraph(
 }
 
 /**
+ * Efface les traces d'un compte dans les arbres des autres : les blocages
+ * qui le visent, l'index inverse de ceux qu'il avait posés, et le registre
+ * de ses jetons d'appareil.
+ *
+ * `recursiveDelete` efface ses propres `blocks`, `blockedBy` et `devices`,
+ * mais pas ce qui pointe vers lui depuis ailleurs. Un blocage resté chez
+ * quelqu'un viserait un compte qui n'existe plus, et apparaîtrait dans sa
+ * liste sans profil à montrer.
+ * @param {Firestore} db Firestore.
+ * @param {string} uid Compte sur le point d'être supprimé.
+ * @return {Promise<void>}
+ */
+async function detachFromBlocksAndDevices(
+    db: Firestore, uid: string,
+): Promise<void> {
+  const userRef = db.collection('users').doc(uid);
+  const [blocksSnap, blockedBySnap, devicesSnap] = await Promise.all([
+    userRef.collection('blocks').select().get(),
+    userRef.collection('blockedBy').select().get(),
+    userRef.collection('devices').select().get(),
+  ]);
+  const refs: DocumentReference[] = [
+    ...blocksSnap.docs.map((doc) => blockedByRef(db, doc.id, uid)),
+    ...blockedBySnap.docs.map((doc) => blockRef(db, doc.id, uid)),
+  ];
+  // Un jeton passé depuis à un autre compte reste au registre de celui-ci.
+  if (!devicesSnap.empty) {
+    const registry = await db.getAll(...devicesSnap.docs
+        .map((doc) => db.collection('deviceTokens').doc(doc.id)));
+    for (const snap of registry) {
+      if (snap.get('uid') === uid) refs.push(snap.ref);
+    }
+  }
+  for (let i = 0; i < refs.length; i += DELETE_BATCH_SIZE) {
+    const batch = db.batch();
+    for (const ref of refs.slice(i, i + DELETE_BATCH_SIZE)) batch.delete(ref);
+    await batch.commit();
+  }
+}
+
+/**
  * Libère le pseudo et efface le profil public d'un compte.
  * @param {Firestore} db Firestore.
  * @param {string} uid Compte sur le point d'être supprimé.
@@ -8819,6 +9087,7 @@ export const deleteAccount = onRequest(
         const userRef = db.collection('users').doc(uid);
 
         await detachFromFollowGraph(db, uid);
+        await detachFromBlocksAndDevices(db, uid);
         await deletePublicIdentity(db, uid);
 
         // Deux documents tenus par le serveur hors de l'arbre du compte :
@@ -8830,8 +9099,9 @@ export const deleteAccount = onRequest(
         await cleanup.commit();
 
         // `recursiveDelete` descend dans toutes les sous-collections, y compris
-        // celles ajoutées plus tard (`dismissedFollowSuggestions` comprise) :
-        // rien à maintenir ici quand le schéma évolue.
+        // celles ajoutées plus tard (`dismissedFollowSuggestions`, `blocks`,
+        // `blockedBy`, `devices` comprises) : rien à maintenir ici quand le
+        // schéma évolue.
         await db.recursiveDelete(userRef);
         await a.auth().deleteUser(uid);
 
@@ -9117,7 +9387,10 @@ export const getHomeRows = onRequest(
         // ne pas se refermer sur la dernière lubie ; l'accueil, lui, a besoin
         // d'être compris du premier coup d'œil, et « parce que tu as vu X »
         // n'est lisible que si X est le film qu'on vient de marquer.
+        // Sauf s'il est « pas aimé » : « parce que tu as vu X » proposerait
+        // alors exactement ce qu'on vient de dire ne pas vouloir.
         const seedId = gallerySnap.docs
+            .filter((doc) => !(doc.get('dislikedAt') instanceof Timestamp))
             .map((doc) => ({
               id: doc.get('tmdbId') as unknown,
               addedAt: doc.get('addedAt') as
@@ -10145,6 +10418,8 @@ export const setPublicName = onRequest(
 interface FollowChangeOutcome {
   status: number;
   error?: string;
+  /** Vrai quand le lien a réellement changé : seul ce cas notifie. */
+  changed?: boolean;
 }
 
 /**
@@ -10171,14 +10446,25 @@ async function applyFollowChange(
   const targetProfileRef = db.collection('publicProfiles').doc(targetUid);
 
   return db.runTransaction(async (tx) => {
-    const [linkSnap, ownProfileSnap, targetProfileSnap] = await Promise.all([
+    const [
+      linkSnap, ownProfileSnap, targetProfileSnap, blockedSnap, blockerSnap,
+    ] = await Promise.all([
       tx.get(followingRef),
       tx.get(ownProfileRef),
       tx.get(targetProfileRef),
+      tx.get(blockRef(db, targetUid, followerUid)),
+      tx.get(blockRef(db, followerUid, targetUid)),
     ]);
 
     if (!ownProfileSnap.exists) {
       return {status: 404, error: 'own_profile_missing'};
+    }
+    // Un blocage, dans un sens ou dans l'autre, se présente comme un profil
+    // introuvable : la même réponse que pour un compte supprimé, qui ne dit
+    // pas à l'un que l'autre l'a bloqué. Se désabonner reste toujours
+    // possible.
+    if (follow && (blockedSnap.exists || blockerSnap.exists)) {
+      return {status: 404, error: 'target_not_found'};
     }
     if (follow && !targetProfileSnap.exists) {
       return {status: 404, error: 'target_not_found'};
@@ -10207,7 +10493,7 @@ async function applyFollowChange(
       });
     }
 
-    return {status: 200};
+    return {status: 200, changed: true};
   });
 }
 
@@ -10250,6 +10536,9 @@ export const followUser = onRequest(
 
         const db = getAdmin().firestore();
         const outcome = await applyFollowChange(db, uid, targetUid, true);
+        // N4, seulement pour un abonnement neuf : suivre deux fois de suite
+        // ne dit rien de plus la seconde fois.
+        if (outcome.changed) await notifyNewFollower(db, targetUid, uid);
         res.status(outcome.status).json(
             outcome.status === 200 ? {ok: true} : {error: outcome.error},
         );
@@ -10655,20 +10944,25 @@ export const getFollowSuggestions = onRequest(
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
         const cacheRef = db.collection('followSuggestionCache').doc(uid);
-        const [followingSnap, followersSnap, dismissedSnap, cacheSnap] =
-          await Promise.all([
-            userRef.collection('following').get(),
-            userRef.collection('followers').select().get(),
-            userRef.collection('dismissedFollowSuggestions').select().get(),
-            cacheRef.get(),
-          ]);
+        const [followingSnap, followersSnap, dismissedSnap, cacheSnap,
+          blocked] = await Promise.all([
+          userRef.collection('following').get(),
+          userRef.collection('followers').select().get(),
+          userRef.collection('dismissedFollowSuggestions').select().get(),
+          cacheRef.get(),
+          blockedSet(db, uid),
+        ]);
         const following = new Set(followingSnap.docs.map((doc) => doc.id));
         const followers = new Set(followersSnap.docs.map((doc) => doc.id));
         const dismissed = new Set(dismissedSnap.docs.map((doc) => doc.id));
+        // Le blocage, comme l'écart, est relu à chaque appel : le cache de
+        // douze heures ne doit pas remontrer quelqu'un qu'on vient de bloquer,
+        // ni montrer à quelqu'un le compte qui l'a bloqué.
         const visible = (candidate: FollowSuggestion) =>
           candidate.uid !== uid &&
           !following.has(candidate.uid) &&
-          !dismissed.has(candidate.uid);
+          !dismissed.has(candidate.uid) &&
+          !blocked.has(candidate.uid);
 
         const createdAt = cacheSnap.get('createdAt');
         const cached = cacheSnap.get('candidates');
@@ -10845,11 +11139,13 @@ export const sendSuggestion = onRequest(
         const quotaRef = db.collection('users').doc(fromUid)
             .collection('limits').doc('suggestions');
         const today = todayISO();
+        let sentItem: SuggestionItem | null = null;
 
         const outcome = await db.runTransaction(async (tx) => {
           const [
             followingSnap, senderGallerySnap, targetGallerySnap,
             senderProfileSnap, existingSnap, quotaSnap,
+            blockedSnap, blockerSnap,
           ] = await Promise.all([
             tx.get(followingRef),
             tx.get(senderGalleryRef),
@@ -10857,6 +11153,8 @@ export const sendSuggestion = onRequest(
             tx.get(senderProfileRef),
             tx.get(suggestionRef),
             tx.get(quotaRef),
+            tx.get(blockRef(db, targetUid, fromUid)),
+            tx.get(blockRef(db, fromUid, targetUid)),
           ]);
           const sentToday = quotaSnap.get('day') === today ?
             Number(quotaSnap.get('count')) || 0 : 0;
@@ -10866,6 +11164,11 @@ export const sendSuggestion = onRequest(
               status: 404 as const,
               error: 'own_profile_missing' as const,
             };
+          }
+          // Avant « pas abonné » : bloquer défait l'abonnement, et répondre
+          // `not_following` dirait à l'expéditeur que quelque chose a changé.
+          if (blockedSnap.exists || blockerSnap.exists) {
+            return {status: 404 as const, error: 'target_not_found' as const};
           }
           if (!followingSnap.exists) {
             return {status: 403 as const, error: 'not_following' as const};
@@ -10893,30 +11196,39 @@ export const sendSuggestion = onRequest(
           const own = senderGallerySnap;
           const read = <T>(key: string, type: string): T | null =>
             typeof own.get(key) === type ? own.get(key) as T : null;
+          const stored: SuggestionItem = {
+            id: item.id,
+            tmdbId: read<number>('tmdbId', 'number') ?? item.tmdbId,
+            mediaType: read<string>('mediaType', 'string') ?? item.mediaType,
+            title: read<string>('title', 'string') ?? item.title,
+            posterPath: read<string>('posterPath', 'string'),
+            overview: read<string>('overview', 'string'),
+            voteAverage: read<number>('voteAverage', 'number'),
+            genreIds: Array.isArray(own.get('genreIds')) ?
+              own.get('genreIds') : [],
+            releaseDate: read<string>('releaseDate', 'string'),
+          };
           tx.set(suggestionRef, {
             fromUid,
             fromHandle: senderProfileSnap.get('handle') ?? null,
             fromDisplayName: senderProfileSnap.get('displayName') ?? null,
             fromAvatarURL: senderProfileSnap.get('avatarURL') ?? null,
-            item: {
-              id: item.id,
-              tmdbId: read<number>('tmdbId', 'number') ?? item.tmdbId,
-              mediaType: read<string>('mediaType', 'string') ?? item.mediaType,
-              title: read<string>('title', 'string') ?? item.title,
-              posterPath: read<string>('posterPath', 'string'),
-              overview: read<string>('overview', 'string'),
-              voteAverage: read<number>('voteAverage', 'number'),
-              genreIds: Array.isArray(own.get('genreIds')) ?
-                own.get('genreIds') : [],
-              releaseDate: read<string>('releaseDate', 'string'),
-            },
+            item: stored,
             createdAt: Timestamp.now(),
           });
+          sentItem = stored;
           tx.set(quotaRef, {day: today, count: sentToday + 1});
 
           return {status: 200 as const};
         });
 
+        // N1. `sentItem` vient de la dernière exécution de la transaction,
+        // celle qui a réussi.
+        if (outcome.status === 200 && sentItem) {
+          await notifySuggestion(
+              db, targetUid, fromUid, suggestionRef.id, sentItem,
+          );
+        }
         res.status(outcome.status).json(
             outcome.status === 200 ? {ok: true} : {error: outcome.error},
         );
@@ -10978,7 +11290,7 @@ export const respondToSuggestion = onRequest(
 
           if (!accept) {
             tx.delete(suggestionRef);
-            return {status: 200 as const, alreadySeen: false};
+            return {status: 200 as const, alreadySeen: false, accepted: null};
           }
 
           const item = suggestionSnap.get('item') as SuggestionItem;
@@ -10993,7 +11305,7 @@ export const respondToSuggestion = onRequest(
             // Vu entretemps, par un autre chemin : la recommandation n'a
             // simplement plus d'objet.
             tx.delete(suggestionRef);
-            return {status: 200 as const, alreadySeen: true};
+            return {status: 200 as const, alreadySeen: true, accepted: null};
           }
 
           const now = Timestamp.now();
@@ -11025,12 +11337,25 @@ export const respondToSuggestion = onRequest(
           }
 
           tx.delete(suggestionRef);
-          return {status: 200 as const, alreadySeen: false};
+          const fromUid = suggestionSnap.get('fromUid');
+          return {
+            status: 200 as const,
+            alreadySeen: false,
+            accepted: typeof fromUid === 'string' ?
+              {fromUid, title: item.title} : null,
+          };
         });
 
         if (outcome.status !== 200) {
           res.status(outcome.status).json({error: outcome.error});
           return;
+        }
+        // N2, pour l'expéditeur. Pas quand le film était déjà vu : rien
+        // n'a été ajouté à la watchlist.
+        if (outcome.accepted) {
+          await notifySuggestionAccepted(
+              db, outcome.accepted.fromUid, uid, outcome.accepted.title,
+          );
         }
         res.status(200).json({ok: true, alreadySeen: outcome.alreadySeen});
       } catch (error) {
@@ -11067,9 +11392,14 @@ export const getSuggestionTargets = onRequest(
         }
 
         const db = getAdmin().firestore();
-        const followingSnap = await db.collection('users').doc(uid)
-            .collection('following').get();
-        const targetUids = followingSnap.docs.map((doc) => doc.id);
+        const [followingSnap, blocked] = await Promise.all([
+          db.collection('users').doc(uid).collection('following').get(),
+          blockedSet(db, uid),
+        ]);
+        // Bloquer défait déjà l'abonnement ; le filtre couvre la course
+        // entre les deux écritures.
+        const targetUids = followingSnap.docs.map((doc) => doc.id)
+            .filter((id) => !blocked.has(id));
         if (targetUids.length === 0) {
           res.status(200).json({targets: []});
           return;
@@ -11155,25 +11485,33 @@ export const getPublicProfile = onRequest(
         }
 
         const db = getAdmin().firestore();
-        const [profileSnap, gallerySnap] = await Promise.all([
+        const [profileSnap, gallerySnap, blockerSnap] = await Promise.all([
           db.collection('publicProfiles').doc(targetUid).get(),
           filmsIn(
               db.collection('users').doc(targetUid).collection('gallery'),
           ).get(),
+          targetUid === uid ? null : blockRef(db, targetUid, uid).get(),
         ]);
 
-        if (!profileSnap.exists) {
+        // Qui a été bloqué voit un profil introuvable. Le bloqueur, lui,
+        // voit encore le profil qu'il a bloqué : c'est de là qu'il débloque.
+        if (!profileSnap.exists || blockerSnap?.exists) {
           res.status(404).json({error: 'target_not_found'});
           return;
         }
 
         const docs = gallerySnap.docs;
+        // L'ADN et les affiches se lisent comme des goûts : un film « pas
+        // aimé » n'y figure pas. Il reste compté dans `galleryCount`, qui dit
+        // combien de films ont été vus.
+        const liked = docs
+            .filter((doc) => !(doc.get('dislikedAt') instanceof Timestamp));
 
         // Répartition par genre, sur le premier genre de chaque film — le
         // même choix que la galerie côté client, pour que les deux écrans
         // racontent la même chose.
         const counts = new Map<number, number>();
-        for (const doc of docs) {
+        for (const doc of liked) {
           const ids = doc.get('genreIds');
           if (!Array.isArray(ids) || ids.length === 0) continue;
           const primary = ids[0];
@@ -11205,7 +11543,7 @@ export const getPublicProfile = onRequest(
         }
 
         // Les plus récemment ajoutés, affiche obligatoire.
-        const posters = docs
+        const posters = liked
             .map((doc) => ({
               posterPath: doc.get('posterPath') as string | null,
               title: doc.get('title') as string | null,
@@ -11240,6 +11578,988 @@ export const getPublicProfile = onRequest(
       }
     },
 );
+
+// ---------------------------------------------------------------------------
+// Blocage et signalement.
+//
+// Bloquer coupe le lien dans les deux sens, et sans le dire : celui qui est
+// bloqué ne voit qu'un profil introuvable (`target_not_found`), le même que
+// pour un compte supprimé. Le dire lui apprendrait qui l'a bloqué, et c'est
+// précisément ce qu'on ne veut pas qu'il sache.
+//
+// `users/{uid}/blocks/{cible}` est la liste du bloqueur, qu'il peut relire.
+// `users/{cible}/blockedBy/{uid}` en est l'index inverse, que personne ne lit
+// côté client : il permet d'exclure en une lecture ceux qui m'ont bloqué, et
+// de nettoyer les listes des autres à la suppression d'un compte sans requête
+// de groupe de collections (qui exigerait un index à déployer).
+// ---------------------------------------------------------------------------
+
+/**
+ * Un uid reçu du client, utilisable comme identifiant de document.
+ * @param {unknown} raw Valeur reçue.
+ * @param {string} self Compte appelant : on ne se vise pas soi-même.
+ * @return {string | null} L'uid, ou `null` s'il est invalide.
+ */
+function parseOtherUid(raw: unknown, self: string): string | null {
+  // Un `/` ferait de l'identifiant un chemin, et un uid Firebase ne dépasse
+  // pas 128 caractères.
+  if (typeof raw !== 'string' || !raw || raw === self ||
+    raw.includes('/') || raw.length > 128) {
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Le document qui dit que `owner` a bloqué `target`.
+ * @param {Firestore} db Firestore.
+ * @param {string} owner Celui qui bloque.
+ * @param {string} target Celui qui est bloqué.
+ * @return {DocumentReference} La référence.
+ */
+function blockRef(
+    db: Firestore, owner: string, target: string,
+): DocumentReference {
+  return db.collection('users').doc(owner).collection('blocks').doc(target);
+}
+
+/**
+ * L'index inverse : chez `target`, la trace que `owner` l'a bloqué.
+ * @param {Firestore} db Firestore.
+ * @param {string} target Celui qui est bloqué.
+ * @param {string} owner Celui qui bloque.
+ * @return {DocumentReference} La référence.
+ */
+function blockedByRef(
+    db: Firestore, target: string, owner: string,
+): DocumentReference {
+  return db.collection('users').doc(target)
+      .collection('blockedBy').doc(owner);
+}
+
+/**
+ * Les comptes avec lesquels le lien est coupé, dans un sens ou dans l'autre.
+ * @param {Firestore} db Firestore.
+ * @param {string} uid Compte concerné.
+ * @return {Promise<Set<string>>} Ceux qu'il a bloqués et ceux qui l'ont
+ *   bloqué.
+ */
+async function blockedSet(db: Firestore, uid: string): Promise<Set<string>> {
+  const userRef = db.collection('users').doc(uid);
+  const [blocks, blockedBy] = await Promise.all([
+    userRef.collection('blocks').select().get(),
+    userRef.collection('blockedBy').select().get(),
+  ]);
+  return new Set([...blocks.docs, ...blockedBy.docs].map((doc) => doc.id));
+}
+
+/**
+ * Supprime les recommandations en attente de `fromUid` chez `toUid`.
+ * @param {Firestore} db Firestore.
+ * @param {string} fromUid Expéditeur.
+ * @param {string} toUid Destinataire.
+ * @return {Promise<void>}
+ */
+async function deletePendingSuggestions(
+    db: Firestore, fromUid: string, toUid: string,
+): Promise<void> {
+  const snap = await db.collection('users').doc(toUid)
+      .collection('suggestions').where('fromUid', '==', fromUid)
+      .select().get();
+  for (let i = 0; i < snap.docs.length; i += DELETE_BATCH_SIZE) {
+    const batch = db.batch();
+    for (const doc of snap.docs.slice(i, i + DELETE_BATCH_SIZE)) {
+      batch.delete(doc.ref);
+    }
+    await batch.commit();
+  }
+}
+
+/**
+ * Bloque un compte.
+ *
+ * Idempotente : bloquer deux fois garde la date du premier blocage. Les
+ * abonnements tombent dans les deux sens, compteurs compris, et les
+ * recommandations en attente aussi : laisser dans la boîte de quelqu'un un
+ * film envoyé par la personne qu'il vient de bloquer serait le contraire de
+ * ce qu'il a demandé.
+ */
+export const blockUser = onRequest(
+    {invoker: 'public', timeoutSeconds: 60},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = parseOtherUid(req.body?.targetUid, uid);
+        if (!targetUid) {
+          res.status(400).json({error: 'invalid_target'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        await db.runTransaction(async (tx) => {
+          const existing = await tx.get(blockRef(db, uid, targetUid));
+          if (existing.exists) return;
+          const now = Timestamp.now();
+          tx.set(blockRef(db, uid, targetUid), {at: now});
+          tx.set(blockedByRef(db, targetUid, uid), {at: now});
+        });
+
+        // Le blocage est écrit d'abord : un `followUser` qui arriverait
+        // entre-temps le lit dans sa transaction et refuse.
+        await applyFollowChange(db, uid, targetUid, false);
+        await applyFollowChange(db, targetUid, uid, false);
+        await Promise.all([
+          deletePendingSuggestions(db, uid, targetUid),
+          deletePendingSuggestions(db, targetUid, uid),
+        ]);
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('blockUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Débloque un compte. Aucun abonnement n'est rétabli : ils ont été défaits
+ * au blocage, et c'est à chacun de décider s'il veut les refaire.
+ */
+export const unblockUser = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const targetUid = parseOtherUid(req.body?.targetUid, uid);
+        if (!targetUid) {
+          res.status(400).json({error: 'invalid_target'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const batch = db.batch();
+        batch.delete(blockRef(db, uid, targetUid));
+        batch.delete(blockedByRef(db, targetUid, uid));
+        await batch.commit();
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('unblockUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Les comptes bloqués, les plus récents d'abord, avec de quoi les
+ * reconnaître. Un compte supprimé depuis n'a plus de profil : il est omis,
+ * il n'y a plus personne à débloquer.
+ */
+export const getBlockedUsers = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const db = getAdmin().firestore();
+        const snap = await db.collection('users').doc(uid)
+            .collection('blocks').orderBy('at', 'desc').get();
+        const ids = snap.docs.map((doc) => doc.id);
+        const profiles = await readPublicProfiles(db, ids);
+        const users = ids.flatMap((id) => {
+          const profile = profiles.get(id);
+          if (!profile?.exists) return [];
+          return [{
+            uid: id,
+            handle: profile.get('handle') ?? null,
+            displayName: profile.get('displayName') ?? null,
+            avatarURL: profile.get('avatarURL') ?? null,
+          }];
+        });
+
+        res.status(200).json({users});
+      } catch (error) {
+        logger.error('getBlockedUsers failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/** Les motifs d'un signalement, tels que l'app les propose. */
+const REPORT_REASONS = ['spam', 'offensive', 'impersonation', 'other'] as const;
+/** La note libre, en points de code. */
+const REPORT_NOTE_MAX = 500;
+/**
+ * Signalements par jour et par compte, au plus : bien au-delà d'un usage de
+ * bonne foi, assez bas pour qu'un compte ne puisse pas noyer la modération.
+ */
+const REPORTS_PER_DAY = 20;
+
+/**
+ * Signale un compte.
+ *
+ * Le rapport garde le nom et le pseudo que la cible portait au moment du
+ * signalement : un compte qui en change aussitôt après ne doit pas pouvoir
+ * effacer ce qu'on a vu. `reports` est fermé au client, en lecture comme en
+ * écriture : seule la console le lit.
+ */
+export const reportUser = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const targetUid = parseOtherUid(body.targetUid, uid);
+        if (!targetUid) {
+          res.status(400).json({error: 'invalid_target'});
+          return;
+        }
+        const reason = oneOf(body.reason, REPORT_REASONS);
+        if (!reason) {
+          res.status(400).json({error: 'invalid_reason'});
+          return;
+        }
+        if (body.note !== undefined && body.note !== null &&
+          typeof body.note !== 'string') {
+          res.status(400).json({error: 'invalid_note'});
+          return;
+        }
+        // Tronquée plutôt que refusée : un signalement trop bavard reste un
+        // signalement, et l'app borne déjà la saisie.
+        const note = typeof body.note === 'string' ?
+          [...body.note.trim()].slice(0, REPORT_NOTE_MAX).join('') : '';
+        const rawContext = body.context && typeof body.context === 'object' ?
+          body.context as Record<string, unknown> : null;
+        const context: Record<string, string> = {};
+        if (typeof rawContext?.suggestionId === 'string' &&
+          rawContext.suggestionId.length > 0) {
+          context.suggestionId = rawContext.suggestionId.slice(0, 300);
+        }
+        if (typeof rawContext?.itemId === 'string' &&
+          MEDIA_ID_PATTERN.test(rawContext.itemId)) {
+          context.itemId = rawContext.itemId;
+        }
+
+        const db = getAdmin().firestore();
+        const quotaRef = db.collection('users').doc(uid)
+            .collection('limits').doc('reports');
+        const targetProfileRef = db.collection('publicProfiles').doc(targetUid);
+        const reportRef = db.collection('reports').doc();
+        const today = todayISO();
+
+        const outcome = await db.runTransaction(async (tx) => {
+          const [quotaSnap, targetSnap] = await Promise.all([
+            tx.get(quotaRef),
+            tx.get(targetProfileRef),
+          ]);
+          const sentToday = quotaSnap.get('day') === today ?
+            Number(quotaSnap.get('count')) || 0 : 0;
+          if (sentToday >= REPORTS_PER_DAY) {
+            return {status: 429 as const, error: 'daily_limit' as const};
+          }
+          tx.set(reportRef, {
+            reporterUid: uid,
+            targetUid,
+            reason,
+            note,
+            context: Object.keys(context).length > 0 ? context : null,
+            at: Timestamp.now(),
+            target: {
+              handle: targetSnap.get('handle') ?? null,
+              displayName: targetSnap.get('displayName') ?? null,
+            },
+          });
+          tx.set(quotaRef, {day: today, count: sentToday + 1});
+          return {status: 200 as const};
+        });
+
+        res.status(outcome.status).json(
+            outcome.status === 200 ? {ok: true} : {error: outcome.error},
+        );
+      } catch (error) {
+        logger.error('reportUser failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Les appareils — registerDevice / unregisterDevice.
+//
+// Un document par jeton FCM, sous `users/{uid}/devices/{empreinte}`, avec la
+// langue choisie dans l'app et le fuseau de l'appareil : la notification se
+// rédige dans la langue de chaque téléphone, et la nuit se compte à son heure
+// à lui. `deviceTokens/{empreinte}` dit à quel compte un jeton appartient :
+// sur un iPhone partagé, le jeton passe d'un compte à l'autre, et l'ancien ne
+// doit plus rien y recevoir.
+// ---------------------------------------------------------------------------
+
+/** Les langues que l'app propose dans ses réglages. */
+const DEVICE_LANGUAGES = ['fr', 'en'] as const;
+type DeviceLanguage = typeof DEVICE_LANGUAGES[number];
+/** Le fuseau quand l'appareil n'en a pas donné de valide. */
+const DEFAULT_DEVICE_TIMEZONE = 'Europe/Paris';
+/** Un jeton FCM fait environ 160 caractères ; la borne est large. */
+const DEVICE_TOKEN_MAX = 4096;
+
+/**
+ * L'identifiant d'un appareil : l'empreinte de son jeton, tronquée. Le jeton
+ * entier n'a rien à faire dans un chemin de document.
+ * @param {string} token Jeton FCM.
+ * @return {string} 32 caractères hexadécimaux.
+ */
+function deviceIdFor(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 32);
+}
+
+/**
+ * Un fuseau IANA que le moteur d'Intl sait lire, ou `null`.
+ * @param {unknown} raw Valeur reçue ou stockée.
+ * @return {string | null} Le fuseau.
+ */
+function validTimeZone(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw || raw.length > 64) return null;
+  try {
+    new Intl.DateTimeFormat('en-US', {timeZone: raw});
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Le jeton d'une requête d'appareil.
+ * @param {unknown} raw Valeur reçue.
+ * @return {string | null} Le jeton, ou `null` s'il est invalide.
+ */
+function parseDeviceToken(raw: unknown): string | null {
+  return typeof raw === 'string' && raw.length > 0 &&
+    raw.length <= DEVICE_TOKEN_MAX ? raw : null;
+}
+
+/**
+ * Rattache un appareil au compte, ou met à jour sa langue et son fuseau.
+ * L'app l'appelle à chaque lancement et à chaque changement de langue.
+ */
+export const registerDevice = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const token = parseDeviceToken(body.token);
+        if (!token) {
+          res.status(400).json({error: 'invalid_device_token'});
+          return;
+        }
+        // Une langue ou un fuseau illisible ne doit pas priver l'appareil de
+        // notifications : le défaut de l'app prend le relais.
+        const language = oneOf(body.language, DEVICE_LANGUAGES) ?? 'fr';
+        const timeZone = validTimeZone(body.timeZone) ??
+          DEFAULT_DEVICE_TIMEZONE;
+        const appVersion = typeof body.appVersion === 'string' ?
+          body.appVersion.slice(0, 32) : null;
+
+        const db = getAdmin().firestore();
+        const id = deviceIdFor(token);
+        const registryRef = db.collection('deviceTokens').doc(id);
+        const deviceRef = db.collection('users').doc(uid)
+            .collection('devices').doc(id);
+
+        await db.runTransaction(async (tx) => {
+          const registry = await tx.get(registryRef);
+          const previousUid = registry.get('uid');
+          if (typeof previousUid === 'string' && previousUid !== uid) {
+            // iPhone partagé : le compte précédent ne doit plus recevoir les
+            // notifications de celui qui tient maintenant le téléphone.
+            tx.delete(db.collection('users').doc(previousUid)
+                .collection('devices').doc(id));
+          }
+          const now = Timestamp.now();
+          tx.set(deviceRef, {token, language, timeZone, appVersion,
+            updatedAt: now});
+          tx.set(registryRef, {uid, updatedAt: now});
+        });
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('registerDevice failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * Détache un appareil du compte. Appelée à la déconnexion, avant `signOut` :
+ * après, le jeton d'identité n'existe plus pour le demander.
+ */
+export const unregisterDevice = onRequest(
+    {invoker: 'public'},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+
+        const token = parseDeviceToken(req.body?.token);
+        if (!token) {
+          res.status(400).json({error: 'invalid_device_token'});
+          return;
+        }
+
+        const db = getAdmin().firestore();
+        const id = deviceIdFor(token);
+        const registryRef = db.collection('deviceTokens').doc(id);
+        await db.runTransaction(async (tx) => {
+          const registry = await tx.get(registryRef);
+          tx.delete(db.collection('users').doc(uid)
+              .collection('devices').doc(id));
+          if (registry.get('uid') === uid) tx.delete(registryRef);
+        });
+
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('unregisterDevice failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Les notifications — notify et ses quatre déclencheurs.
+//
+// Un seul point de sortie, `notify`, que chaque déclencheur appelle après
+// avoir réussi son propre travail. Il ne lève jamais : une notification
+// perdue ne vaut pas une recommandation refusée. Il est attendu avant la
+// réponse, et non lancé après : une fonction v2 qui a répondu peut perdre
+// son processeur, et l'envoi avec.
+//
+// Deux réglages de délicatesse, sans tâche planifiée ni report : la nuit
+// (22 h 30 à 9 h, à l'heure de l'appareil) et au-delà de trois notifications
+// dans la journée, la notification arrive en mode passif, sans son ni
+// réveil de l'écran, rangée dans le centre de notifications.
+// ---------------------------------------------------------------------------
+
+/** Notifications actives par jour, au plus ; les suivantes sont passives. */
+const NOTIFY_ACTIVE_PER_DAY = 3;
+/** Début de la nuit, en minutes depuis minuit : 22 h 30. */
+const NOTIFY_NIGHT_START = 22 * 60 + 30;
+/** Fin de la nuit : 9 h. */
+const NOTIFY_NIGHT_END = 9 * 60;
+/** Fenêtre de regroupement des recommandations et des abonnés. */
+const NOTIFY_GROUP_WINDOW_MS = 3600 * 1000;
+/** Un réabonnement dans ce délai ne renotifie pas. */
+const NOTIFY_REFOLLOW_WINDOW_MS = 24 * 3600 * 1000;
+/** Au-delà, voir un film recommandé n'est plus une nouvelle pour personne. */
+const NOTIFY_RECOMMENDATION_MAX_AGE_MS = 90 * 24 * 3600 * 1000;
+/** Les erreurs FCM qui disent qu'un jeton ne servira plus jamais. */
+const DEAD_TOKEN_ERRORS = new Set([
+  'messaging/registration-token-not-registered',
+  'messaging/invalid-registration-token',
+]);
+
+type PushType =
+  'suggestion' | 'suggestionAccepted' | 'recommendedSeen' | 'follower';
+
+/** Une notification, rédigée dans chacune des langues de l'app. */
+interface PushMessage {
+  type: PushType;
+  /** L'autre personne, dont le geste déclenche l'envoi. */
+  fromUid: string;
+  text: Record<DeviceLanguage, {title: string; body: string}>;
+  /** Les champs de données, en chaînes, que l'app lit au toucher. */
+  data: Record<string, string>;
+  threadId: string;
+  collapseId?: string;
+  category?: string;
+}
+
+/**
+ * Le jour civil et l'heure, en minutes, dans un fuseau donné.
+ * @param {Date} date Instant.
+ * @param {string} timeZone Fuseau IANA, déjà validé.
+ * @return {Object} `{day: 'YYYY-MM-DD', minutes}`.
+ */
+function localClock(
+    date: Date, timeZone: string,
+): {day: string; minutes: number} {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const part = (type: string) =>
+    parts.find((p) => p.type === type)?.value ?? '00';
+  return {
+    day: `${part('year')}-${part('month')}-${part('day')}`,
+    minutes: Number(part('hour')) * 60 + Number(part('minute')),
+  };
+}
+
+/**
+ * Dit si une heure locale tombe la nuit.
+ * @param {number} minutes Minutes depuis minuit.
+ * @return {boolean} Vrai entre 22 h 30 et 9 h.
+ */
+function isNightMinutes(minutes: number): boolean {
+  return minutes >= NOTIFY_NIGHT_START || minutes < NOTIFY_NIGHT_END;
+}
+
+/**
+ * Le nom d'une personne dans une notification : son nom affiché, sinon son
+ * pseudo précédé de `@`.
+ * @param {DocumentSnapshot} snap Profil public.
+ * @return {string | null} Le nom, ou `null` sans profil.
+ */
+function pushName(snap: DocumentSnapshot): string | null {
+  if (!snap.exists) return null;
+  const displayName = snap.get('displayName');
+  if (typeof displayName === 'string' && displayName.trim()) {
+    return displayName.trim();
+  }
+  const handle = snap.get('handle');
+  return typeof handle === 'string' && handle ? `@${handle}` : null;
+}
+
+/**
+ * Le film tel que l'app l'ouvre depuis une notification, en JSON.
+ * @param {Object} item Champs du film, d'où qu'ils viennent.
+ * @return {string} `{id, mediaType, tmdbId, title, posterPath, year}`.
+ */
+function pushItemJSON(item: {
+  id: string; mediaType: string; tmdbId: number; title: string;
+  posterPath?: string | null; releaseDate?: string | null;
+}): string {
+  const year = typeof item.releaseDate === 'string' ?
+    Number(item.releaseDate.slice(0, 4)) : NaN;
+  return JSON.stringify({
+    id: item.id,
+    mediaType: item.mediaType,
+    tmdbId: item.tmdbId,
+    title: item.title,
+    posterPath: item.posterPath ?? null,
+    year: Number.isInteger(year) && year > 0 ? year : null,
+  });
+}
+
+/**
+ * Envoie une notification à tous les appareils d'un compte. Ne lève jamais.
+ * @param {string} uid Destinataire.
+ * @param {PushMessage} message La notification.
+ * @return {Promise<void>}
+ */
+async function notify(uid: string, message: PushMessage): Promise<void> {
+  try {
+    await deliverPush(uid, message);
+  } catch (error) {
+    logger.warn('notify failed', {uid, type: message.type, error});
+  }
+}
+
+/**
+ * Le travail de `notify`, qui peut lever.
+ * @param {string} uid Destinataire.
+ * @param {PushMessage} message La notification.
+ * @return {Promise<void>}
+ */
+async function deliverPush(uid: string, message: PushMessage): Promise<void> {
+  if (uid === message.fromUid) return;
+  const db = getAdmin().firestore();
+  const userRef = db.collection('users').doc(uid);
+  const [prefSnap, blockSnaps, devicesSnap] = await Promise.all([
+    userRef.collection('preferences').doc('notifications').get(),
+    db.getAll(
+        blockRef(db, uid, message.fromUid),
+        blockRef(db, message.fromUid, uid),
+    ),
+    userRef.collection('devices').get(),
+  ]);
+  // Absent vaut oui : seul un « non » explicite coupe.
+  if (prefSnap.get('social') === false) return;
+  if (blockSnaps.some((snap) => snap.exists)) return;
+
+  const emulator = process.env.FUNCTIONS_EMULATOR === 'true';
+  const devices = devicesSnap.docs
+      .filter((doc) => typeof doc.get('token') === 'string')
+      .map((doc) => ({
+        id: doc.id,
+        token: doc.get('token') as string,
+        language: oneOf(doc.get('language'), DEVICE_LANGUAGES) ?? 'fr',
+        timeZone: validTimeZone(doc.get('timeZone')) ??
+          DEFAULT_DEVICE_TIMEZONE,
+        updatedAt: millisOf(doc.get('updatedAt')) ?? 0,
+      }))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  // En émulateur, un appareil fictif suffit à journaliser le texte rédigé.
+  if (devices.length === 0) {
+    if (!emulator) return;
+    devices.push({id: 'none', token: '', language: 'fr',
+      timeZone: DEFAULT_DEVICE_TIMEZONE, updatedAt: 0});
+  }
+
+  const now = new Date();
+  const targets = devices.map((device) => ({
+    ...device, night: isNightMinutes(localClock(now, device.timeZone).minutes),
+  }));
+  // Le budget se compte au jour de l'appareil servi le plus récemment : un
+  // compte n'a qu'une journée, même avec deux téléphones.
+  const today = localClock(now, devices[0].timeZone).day;
+  const wantsActive = targets.some((target) => !target.night);
+  const budgetRef = userRef.collection('limits').doc('notifications');
+  const activeAllowed = wantsActive && await db.runTransaction(async (tx) => {
+    const snap = await tx.get(budgetRef);
+    const count = snap.get('day') === today ?
+      Number(snap.get('count')) || 0 : 0;
+    if (count >= NOTIFY_ACTIVE_PER_DAY) return false;
+    tx.set(budgetRef, {day: today, count: count + 1});
+    return true;
+  });
+
+  const prepared = targets.map((target) => {
+    const passive = target.night || !activeAllowed;
+    const text = message.text[target.language];
+    const aps: Record<string, unknown> = {
+      'alert': {title: text.title, body: text.body},
+      'threadId': message.threadId,
+      'interruption-level': passive ? 'passive' : 'active',
+    };
+    if (!passive) aps.sound = 'default';
+    if (message.category) aps.category = message.category;
+    const tokenMessage: TokenMessage = {
+      token: target.token,
+      data: message.data,
+      apns: {
+        headers: message.collapseId ?
+          {'apns-collapse-id': message.collapseId} : {},
+        payload: {aps},
+      },
+    };
+    return {target, passive, text, tokenMessage};
+  });
+
+  if (emulator) {
+    // Les tests lisent ce journal : rien ne part vers FCM depuis un poste.
+    await db.collection('notificationLog').add({
+      to: uid,
+      from: message.fromUid,
+      type: message.type,
+      data: message.data,
+      threadId: message.threadId,
+      collapseId: message.collapseId ?? null,
+      category: message.category ?? null,
+      deliveries: prepared.map(({target, passive, text}) => ({
+        deviceId: target.id,
+        language: target.language,
+        level: passive ? 'passive' : 'active',
+        sound: !passive,
+        title: text.title,
+        body: text.body,
+      })),
+      at: Timestamp.now(),
+    });
+    return;
+  }
+
+  const result = await getAdmin().messaging()
+      .sendEach(prepared.map((p) => p.tokenMessage));
+  const dead: string[] = [];
+  result.responses.forEach((response, index) => {
+    const code = response.error?.code;
+    if (!code) return;
+    if (DEAD_TOKEN_ERRORS.has(code)) {
+      dead.push(prepared[index].target.id);
+    } else {
+      logger.warn('notify: send failed', {uid, code});
+    }
+  });
+  if (dead.length > 0) {
+    // Le jeton d'une app désinstallée ne reviendra pas : le garder ferait
+    // payer un envoi raté à chaque notification.
+    const batch = db.batch();
+    for (const id of dead) {
+      batch.delete(userRef.collection('devices').doc(id));
+      batch.delete(db.collection('deviceTokens').doc(id));
+    }
+    await batch.commit();
+  }
+}
+
+/**
+ * N1 : une recommandation reçue. Au-delà d'une recommandation du même
+ * expéditeur dans l'heure, une seule notification les annonce toutes, et
+ * remplace la précédente.
+ * @param {Firestore} db Firestore.
+ * @param {string} toUid Destinataire.
+ * @param {string} fromUid Expéditeur.
+ * @param {string} suggestionId La suggestion qui vient d'être écrite.
+ * @param {Object} item Le film recommandé.
+ * @return {Promise<void>}
+ */
+async function notifySuggestion(
+    db: Firestore, toUid: string, fromUid: string, suggestionId: string,
+    item: SuggestionItem,
+): Promise<void> {
+  try {
+    const since = Date.now() - NOTIFY_GROUP_WINDOW_MS;
+    const [profileSnap, pendingSnap] = await Promise.all([
+      db.collection('publicProfiles').doc(fromUid).get(),
+      db.collection('users').doc(toUid).collection('suggestions')
+          .where('fromUid', '==', fromUid).select('createdAt').get(),
+    ]);
+    const name = pushName(profileSnap);
+    if (!name) return;
+    const recent = pendingSnap.docs
+        .filter((doc) => (millisOf(doc.get('createdAt')) ?? 0) >= since)
+        .length;
+    const base = {
+      type: 'suggestion' as const,
+      fromUid,
+      threadId: `user-${fromUid}`,
+      collapseId: `sugg-${fromUid}`,
+    };
+    if (recent <= 1) {
+      await notify(toUid, {
+        ...base,
+        text: {
+          fr: {title: `${name} te recommande ${item.title}`,
+            body: 'Accepte pour l\'ajouter à ta watchlist.'},
+          en: {title: `${name} recommends ${item.title}`,
+            body: 'Accept to add it to your watchlist.'},
+        },
+        data: {type: 'suggestion', route: 'suggestions', uid: fromUid,
+          suggestionId, item: pushItemJSON(item)},
+        category: 'SUGGESTION',
+      });
+    } else {
+      await notify(toUid, {
+        ...base,
+        text: {
+          fr: {title: `${name} te recommande ${recent} titres`,
+            body: 'Touche pour les voir.'},
+          en: {title: `${name} recommends ${recent} titles`,
+            body: 'Tap to see them.'},
+        },
+        data: {type: 'suggestion', route: 'suggestions', uid: fromUid},
+      });
+    }
+  } catch (error) {
+    logger.warn('notifySuggestion failed', {error});
+  }
+}
+
+/**
+ * N2 : une recommandation acceptée, dite à celui qui l'avait envoyée.
+ * @param {Firestore} db Firestore.
+ * @param {string} toUid L'expéditeur de la recommandation.
+ * @param {string} accepterUid Celui qui l'a acceptée.
+ * @param {string} title Titre du film.
+ * @return {Promise<void>}
+ */
+async function notifySuggestionAccepted(
+    db: Firestore, toUid: string, accepterUid: string, title: string,
+): Promise<void> {
+  try {
+    const name = pushName(
+        await db.collection('publicProfiles').doc(accepterUid).get(),
+    );
+    if (!name) return;
+    await notify(toUid, {
+      type: 'suggestionAccepted',
+      fromUid: accepterUid,
+      text: {
+        fr: {title: `${name} a ajouté ${title} à sa watchlist`,
+          body: 'C\'était ta recommandation.'},
+        en: {title: `${name} added ${title} to their watchlist`,
+          body: 'It was your recommendation.'},
+      },
+      data: {type: 'suggestionAccepted', route: 'profile', uid: accepterUid},
+      threadId: `user-${accepterUid}`,
+    });
+  } catch (error) {
+    logger.warn('notifySuggestionAccepted failed', {error});
+  }
+}
+
+/**
+ * Les recommandeurs d'un film, sans doublon, dans la fenêtre de 90 jours.
+ * @param {unknown[]} lists Des tableaux `recommendedBy`, d'où qu'ils
+ *   viennent.
+ * @return {Object[]} Les entrées, les plus anciennes d'abord, une par
+ *   recommandeur.
+ */
+function mergeRecommenders(...lists: unknown[]): Record<string, unknown>[] {
+  const byUid = new Map<string, Record<string, unknown>>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as Record<string, unknown>;
+      if (typeof row.uid !== 'string' || !row.uid) continue;
+      if (!byUid.has(row.uid)) byUid.set(row.uid, row);
+    }
+  }
+  return [...byUid.values()];
+}
+
+/**
+ * N3 : un film recommandé a été vu, ou adoré. Chaque recommandeur des 90
+ * derniers jours l'apprend ; l'« adoré » remplace le « vu » sur l'écran.
+ * @param {Firestore} db Firestore.
+ * @param {string} uid Celui qui a vu le film.
+ * @param {Object} item Le film.
+ * @param {unknown} recommendedBy Les recommandeurs, tels que stockés.
+ * @param {boolean} loved Vrai pour la variante « adoré ».
+ * @return {Promise<void>}
+ */
+async function notifyRecommenders(
+    db: Firestore, uid: string,
+    item: {id: string; mediaType: string; tmdbId: number; title: string;
+      posterPath?: string | null; releaseDate?: string | null},
+    recommendedBy: unknown, loved: boolean,
+): Promise<void> {
+  try {
+    const since = Date.now() - NOTIFY_RECOMMENDATION_MAX_AGE_MS;
+    const recipients = mergeRecommenders(recommendedBy)
+        .filter((row) => (millisOf(row.at) ?? 0) >= since)
+        .map((row) => row.uid as string)
+        .filter((recipient) => recipient !== uid);
+    if (recipients.length === 0) return;
+    const name = pushName(
+        await db.collection('publicProfiles').doc(uid).get(),
+    );
+    if (!name) return;
+    const message: PushMessage = {
+      type: 'recommendedSeen',
+      fromUid: uid,
+      text: {
+        fr: {title: loved ? `${name} a adoré ${item.title}` :
+          `${name} a vu ${item.title}`,
+        body: 'C\'était ta recommandation.'},
+        en: {title: loved ? `${name} loved ${item.title}` :
+          `${name} watched ${item.title}`,
+        body: 'It was your recommendation.'},
+      },
+      data: {type: 'recommendedSeen', route: 'item', uid,
+        item: pushItemJSON(item)},
+      threadId: `user-${uid}`,
+      collapseId: `seen-${uid}-${item.id}`,
+    };
+    await Promise.all(
+        recipients.map((recipient) => notify(recipient, message)),
+    );
+  } catch (error) {
+    logger.warn('notifyRecommenders failed', {error});
+  }
+}
+
+/**
+ * N4 : un nouvel abonné. Plusieurs dans l'heure se regroupent en une seule
+ * notification ; quelqu'un qui se désabonne puis se réabonne dans les 24 h
+ * ne renotifie pas, sans quoi le geste deviendrait un moyen de harceler.
+ * @param {Firestore} db Firestore.
+ * @param {string} targetUid Le compte suivi.
+ * @param {string} followerUid Le nouvel abonné.
+ * @return {Promise<void>}
+ */
+async function notifyNewFollower(
+    db: Firestore, targetUid: string, followerUid: string,
+): Promise<void> {
+  try {
+    const nowMillis = Date.now();
+    const recentRef = db.collection('users').doc(targetUid)
+        .collection('limits').doc('followNotifications');
+    const fresh = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(recentRef);
+      const stored = snap.get('recent');
+      const recent: Record<string, number> = {};
+      if (stored && typeof stored === 'object') {
+        for (const [id, at] of Object.entries(stored)) {
+          if (typeof at === 'number' &&
+            nowMillis - at < NOTIFY_REFOLLOW_WINDOW_MS) {
+            recent[id] = at;
+          }
+        }
+      }
+      if (recent[followerUid] !== undefined) return false;
+      recent[followerUid] = nowMillis;
+      tx.set(recentRef, {recent});
+      return true;
+    });
+    if (!fresh) return;
+
+    const [profileSnap, countSnap] = await Promise.all([
+      db.collection('publicProfiles').doc(followerUid).get(),
+      db.collection('users').doc(targetUid).collection('followers')
+          .where('since', '>=',
+              Timestamp.fromMillis(nowMillis - NOTIFY_GROUP_WINDOW_MS))
+          .count().get(),
+    ]);
+    const name = pushName(profileSnap);
+    if (!name) return;
+    const count = countSnap.data().count;
+    const base = {
+      type: 'follower' as const,
+      fromUid: followerUid,
+      threadId: 'followers',
+      collapseId: 'followers',
+    };
+    if (count <= 1) {
+      await notify(targetUid, {
+        ...base,
+        text: {
+          fr: {title: `${name} te suit`,
+            body: 'Touche pour voir sa galerie.'},
+          en: {title: `${name} follows you`,
+            body: 'Tap to see their gallery.'},
+        },
+        data: {type: 'follower', route: 'profile', uid: followerUid},
+      });
+    } else {
+      await notify(targetUid, {
+        ...base,
+        text: {
+          fr: {title: `${count} personnes te suivent`,
+            body: 'Touche pour voir qui.'},
+          en: {title: `${count} people follow you`, body: 'Tap to see who.'},
+        },
+        data: {type: 'follower', route: 'followers', uid: followerUid},
+      });
+    }
+  } catch (error) {
+    logger.warn('notifyNewFollower failed', {error});
+  }
+}
 
 /* ===================================================================== *
  *  CinéMatch v2 : les points d'entrée
@@ -11580,6 +12900,11 @@ async function loadCineMatchGallery(
     if (!Number.isInteger(tmdbId) || tmdbId <= 0) continue;
     seenIds.add(tmdbId);
     if (doc.get('mediaType') !== 'movie') continue;
+    // « Pas aimé » : vu, donc dans `seenIds` et dans `size`, mais hors de ce
+    // que le moteur lit comme un goût (positions des comparaisons, graines,
+    // coups de cœur, référence de rareté). Toutes les listes de candidats
+    // passent déjà par `seenIds` : il ne peut pas revenir en proposition.
+    if (doc.get('dislikedAt') instanceof Timestamp) continue;
     const position = fresh.get(doc.id);
     if (!position && doc.get('axesV') !== AXES_VERSION) continue;
     const genreIds = doc.get('genreIds');
@@ -11634,15 +12959,16 @@ async function loadSeriesGallery(
 ): Promise<CineMatchGallery> {
   const snap = await userRef.collection('gallery')
       .where('mediaType', '==', 'tv').get();
-  const bySeries =
-    new Map<number, {seasons: Set<number>; lovedAt: number | null}>();
+  const bySeries = new Map<number,
+    {seasons: Set<number>; lovedAt: number | null; disliked: boolean}>();
   for (const doc of snap.docs) {
     const id = Number(doc.get('tmdbId'));
     if (!Number.isInteger(id) || id <= 0) continue;
     const entry = bySeries.get(id) ??
-      {seasons: new Set<number>(), lovedAt: null};
+      {seasons: new Set<number>(), lovedAt: null, disliked: false};
     const season = doc.get('season');
     if (typeof season === 'number') entry.seasons.add(season);
+    if (doc.get('dislikedAt') instanceof Timestamp) entry.disliked = true;
     const loved = millisOf(doc.get('lovedAt'));
     if (loved !== null && (entry.lovedAt === null || loved > entry.lovedAt)) {
       entry.lovedAt = loved;
@@ -11654,6 +12980,9 @@ async function loadSeriesGallery(
       db, [...bySeries.keys()], ctx, SERIES_GALLERY_META_BATCH);
   const positioned: CineMatchGalleryEntry[] = [];
   for (const [id, entry] of bySeries) {
+    // Une saison « pas aimée » retire la série du goût, comme un film ; elle
+    // reste vue (`seenIds`, `size`).
+    if (entry.disliked) continue;
     const meta = metas.get(id);
     if (!meta) continue;
     const completion = entry.seasons.size / Math.max(1, meta.seasonCount);
@@ -13210,6 +14539,9 @@ async function loadStarterGallery(
   for (const doc of snap.docs) {
     const id = Number(doc.get('tmdbId'));
     if (!Number.isInteger(id) || id <= 0) continue;
+    // L'écran de départ propose de partir d'un film qu'on a aimé : un film
+    // « pas aimé » n'y a pas sa place, ni dans le compte des styles.
+    if (doc.get('dislikedAt') instanceof Timestamp) continue;
     const genreIds = doc.get('genreIds');
     const title = doc.get('title');
     const posterPath = doc.get('posterPath');

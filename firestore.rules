@@ -31,15 +31,23 @@ service cloud.firestore {
         allow read: if isOwner(uid);
         allow write: if false;
       }
-      // Le client n'écrit que trois documents de préférences : ses
-      // plateformes (home), son profil déclaré (profile) et son onboarding.
-      // Les autres (swipeProfile, badgeState, deckPool) sont tenus par le
-      // serveur, qui s'en sert pour le deck et les badges : les laisser
-      // ouverts permettait de les falsifier.
+      // Le client n'écrit que quatre documents de préférences : ses
+      // plateformes (home), son profil déclaré (profile), son onboarding et
+      // ses notifications. Les autres (swipeProfile, badgeState, deckPool)
+      // sont tenus par le serveur, qui s'en sert pour le deck et les
+      // badges : les laisser ouverts permettait de les falsifier.
+      //
+      // `notifications` ne porte qu'un booléen, `social`, que le serveur lit
+      // avant chaque notification sociale. Rien d'autre n'y entre : le
+      // document est lu par `notify`, et un champ libre serait un champ que
+      // le serveur finirait par croire.
       match /preferences/{document} {
         allow read: if isOwner(uid);
         allow write: if isOwner(uid)
-          && document in ['home', 'profile', 'onboarding'];
+          && (document in ['home', 'profile', 'onboarding']
+            || (document == 'notifications'
+              && request.resource.data.keys().hasOnly(['social'])
+              && request.resource.data.social is bool));
       }
       match /swipeSkips/{skipId} {
         allow read: if isOwner(uid);
@@ -89,6 +97,53 @@ service cloud.firestore {
       match /dismissedFollowSuggestions/{targetUid} {
         allow read, write: if false;
       }
+
+      // -----------------------------------------------------------------
+      // Blocage — écrit par blockUser / unblockUser seulement.
+      //
+      // Le propriétaire relit sa liste ; il ne l'écrit pas en direct, parce
+      // que bloquer défait aussi les abonnements et les recommandations des
+      // deux côtés, ce qu'aucune règle ne sait faire. `blockedBy` est
+      // l'index inverse : il dirait à quelqu'un qui l'a bloqué, il reste
+      // donc fermé à tous, propriétaire compris.
+      // -----------------------------------------------------------------
+      match /blocks/{targetUid} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+      match /blockedBy/{sourceUid} {
+        allow read, write: if false;
+      }
+
+      // Les appareils (jetons FCM, langue, fuseau) : tenus par
+      // registerDevice / unregisterDevice, lus par le seul serveur. Un jeton
+      // lisible permettrait d'envoyer des notifications à quelqu'un d'autre.
+      match /devices/{deviceId} {
+        allow read, write: if false;
+      }
+
+      // Les compteurs du serveur (recommandations, signalements,
+      // notifications du jour) : fermés, sans quoi on pourrait les remettre
+      // à zéro.
+      match /limits/{document} {
+        allow read, write: if false;
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // Signalements — écrits par reportUser, lus par la seule console.
+    // Le registre des jetons d'appareil (à quel compte appartient un
+    // jeton) et le journal des notifications des émulateurs suivent la
+    // même règle : rien pour le client.
+    // -----------------------------------------------------------------
+    match /reports/{reportId} {
+      allow read, write: if false;
+    }
+    match /deviceTokens/{deviceId} {
+      allow read, write: if false;
+    }
+    match /notificationLog/{entryId} {
+      allow read, write: if false;
     }
 
     // -----------------------------------------------------------------
