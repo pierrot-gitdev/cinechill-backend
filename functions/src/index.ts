@@ -55,6 +55,23 @@ const DEFAULT_LANGUAGE = 'fr-FR';
 const DEFAULT_REGION = 'FR';
 
 /**
+ * Un code pays à deux lettres, ou la région par défaut.
+ *
+ * Les points d'entrée publics recopiaient la valeur reçue dans l'URL TMDB,
+ * donc dans la clé du cache : une suite de valeurs uniques suffisait à le
+ * vider pour tout le monde.
+ * @param {unknown} raw Valeur reçue.
+ * @return {string} Code pays en majuscules.
+ */
+function regionOf(raw: unknown): string {
+  return typeof raw === 'string' && /^[A-Za-z]{2}$/.test(raw) ?
+    raw.toUpperCase() : DEFAULT_REGION;
+}
+
+/** Délai maximal d'une réponse TMDB, au-delà de quoi l'appel échoue. */
+const TMDB_TIMEOUT_MS = 10000;
+
+/**
  * Error wrapper for non-2xx TMDB responses.
  */
 class TMDBRequestError extends Error {
@@ -205,11 +222,14 @@ async function tmdbGET(
   // Le jeton ne fait pas partie de la clé : il est le même pour tout le monde,
   // et l'y mettre n'aurait fait que dupliquer chaque entrée à sa rotation.
   return cached(url, cacheTTLFor(path), async () => {
+    // Sans délai, une réponse TMDB qui ne vient jamais gardait la fonction
+    // ouverte jusqu'à son propre délai, et sa promesse dans le cache.
     const tmdbRes = await fetch(url, {
       headers: {
         Authorization: `Bearer ${ctx.token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(TMDB_TIMEOUT_MS),
     });
 
     if (!tmdbRes.ok) {
@@ -450,7 +470,7 @@ export const getPopularMovies = onRequest(
         const page = parsePage(req.query.page);
         const genreID = parseOptionalInt(req.query.genreId);
         const providerIDs = parseProviderIDs(req.query.providerIds);
-        const watchRegion = String(req.query.watchRegion ?? DEFAULT_REGION);
+        const watchRegion = regionOf(req.query.watchRegion);
 
         const useDiscover = genreID !== null || providerIDs.length > 0;
         const path = useDiscover ? '/discover/movie' : '/movie/popular';
@@ -534,6 +554,7 @@ export const getMovieDetails = onRequest(
                   Authorization: `Bearer ${tmdbApiKey.value()}`,
                   Accept: 'application/json',
                 },
+                signal: AbortSignal.timeout(TMDB_TIMEOUT_MS),
               });
               if (!tmdbRes.ok) {
                 throw new TMDBRequestError(
@@ -1087,7 +1108,7 @@ export const getMovieProviders = onRequest(
 
         if (!await passesAppCheck(req, res)) return;
 
-        const watchRegion = String(req.query.watchRegion ?? DEFAULT_REGION);
+        const watchRegion = regionOf(req.query.watchRegion);
         const data = await tmdbGET('/watch/providers/movie', {
           watch_region: watchRegion,
         }, tmdb(req, res));
@@ -1741,7 +1762,13 @@ function parseAnswers(body: unknown): QuestionnaireAnswersPayload {
 function genreIdsFor(genreSlugs: string[]): number[] {
   const ids = new Set<number>();
   for (const slug of genreSlugs) {
-    for (const id of GENRE_TMDB_IDS[slug] ?? []) ids.add(id);
+    // Propriété propre seulement : un slug « __proto__ » ou « constructor »
+    // envoyé par un client renvoyait sinon une fonction, et le serveur
+    // plantait.
+    const genreIds =
+      Object.prototype.hasOwnProperty.call(GENRE_TMDB_IDS, slug) ?
+        GENRE_TMDB_IDS[slug] : [];
+    for (const id of genreIds) ids.add(id);
   }
   return Array.from(ids);
 }
@@ -9702,7 +9729,10 @@ function isValidHandle(normalized: string): boolean {
   return (
     normalized.length >= HANDLE_MIN_LENGTH &&
     normalized.length <= HANDLE_MAX_LENGTH &&
-    HANDLE_PATTERN.test(normalized)
+    HANDLE_PATTERN.test(normalized) &&
+    // `__abc__` respecte l'alphabet, mais Firestore réserve ces
+    // identifiants : le document `usernames/__abc__` ne peut pas exister.
+    !/^__.*__$/.test(normalized)
   );
 }
 
