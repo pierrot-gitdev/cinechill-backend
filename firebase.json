@@ -21,5 +21,28 @@
         "npm --prefix \"$RESOURCE_DIR\" run build"
       ]
     }
-  ]
+  ],
+  "hosting": {
+    "public": "hosting/public",
+    "cleanUrls": true,
+    "trailingSlash": false,
+    "redirects": [
+      {
+        "source": "/",
+        "destination": "/confidentialite",
+        "type": 302
+      }
+    ],
+    "headers": [
+      {
+        "source": "**/*.@(html|css)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "max-age=3600"
+          }
+        ]
+      }
+    ]
+  }
 }
