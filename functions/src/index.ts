@@ -3,19 +3,47 @@ import {onRequest, Request} from 'firebase-functions/v2/https';
 import {defineSecret, defineString} from 'firebase-functions/params';
 import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
-import * as admin from 'firebase-admin';
+import {initializeApp, getApps} from 'firebase-admin/app';
+import {getAppCheck} from 'firebase-admin/app-check';
+import {getAuth} from 'firebase-admin/auth';
+import {
+  CollectionReference,
+  DocumentReference,
+  DocumentSnapshot,
+  FieldValue,
+  Firestore,
+  getFirestore,
+  Query,
+  QueryDocumentSnapshot,
+  QuerySnapshot,
+  Timestamp,
+  WriteBatch,
+} from 'firebase-admin/firestore';
 import * as engine from './cinematch/engine';
 import * as series from './series';
 import * as deck from './deck/engine';
 
 /**
+ * Les trois services de l'Admin SDK dont le backend se sert, sous la forme
+ * qu'avait l'ancien espace de noms `admin` : `getAdmin().firestore()`,
+ * `.auth()`, `.appCheck()`. La v14 du SDK a supprimé cet espace de noms ;
+ * garder la même forme d'appel évite de réécrire les cent cinquante sites
+ * qui s'en servent, et ne change rien à ce qu'ils obtiennent.
+ */
+const adminServices = {
+  firestore: (): Firestore => getFirestore(),
+  auth: () => getAuth(),
+  appCheck: () => getAppCheck(),
+};
+
+/**
  * Initialise l'Admin SDK une seule fois, quel que soit le nombre de fonctions
  * qui l'utilisent dans cette invocation.
- * @return {admin} L'Admin SDK, prêt à l'emploi.
+ * @return {object} Les services de l'Admin SDK, prêts à l'emploi.
  */
-function getAdmin(): typeof admin {
-  if (!admin.apps.length) admin.initializeApp();
-  return admin;
+function getAdmin(): typeof adminServices {
+  if (getApps().length === 0) initializeApp();
+  return adminServices;
 }
 
 setGlobalOptions({maxInstances: 10, region: 'europe-west1'});
@@ -204,12 +232,12 @@ async function tmdbGET(
  * Le filtre est posé à la requête plutôt qu'à chaque boucle, pour qu'aucune
  * lecture ne puisse l'oublier. Il est sûr : les quatre écrivains de la galerie
  * et de la watchlist posent `mediaType` et refusent un objet qui n'en a pas.
- * @param {admin.firestore.CollectionReference} ref Galerie ou watchlist.
- * @return {admin.firestore.Query} Les seuls films.
+ * @param {CollectionReference} ref Galerie ou watchlist.
+ * @return {Query} Les seuls films.
  */
 function filmsIn(
-    ref: admin.firestore.CollectionReference,
-): admin.firestore.Query {
+    ref: CollectionReference,
+): Query {
   return ref.where('mediaType', '==', 'movie');
 }
 
@@ -1013,7 +1041,7 @@ export const setNextEpisode = onRequest(
 
         await ref.set({
           nextEpisode: next,
-          nextEpisodeAt: admin.firestore.Timestamp.now(),
+          nextEpisodeAt: Timestamp.now(),
         }, {merge: true});
         res.status(200).json({ok: true});
       } catch (error) {
@@ -1177,17 +1205,17 @@ export const setMediaStatus = onRequest(
         const batch = db.batch();
         if (abandoned) {
           batch.set(abandonsRef, {
-            [String(item.tmdbId)]: a.firestore.Timestamp.now(),
+            [String(item.tmdbId)]: Timestamp.now(),
           }, {merge: true});
         } else if (item.mediaType === 'tv' && status !== 'none') {
           batch.set(abandonsRef, {
-            [String(item.tmdbId)]: a.firestore.FieldValue.delete(),
+            [String(item.tmdbId)]: FieldValue.delete(),
           }, {merge: true});
         }
         batch.delete(watchlistRef);
         batch.delete(galleryRef);
 
-        const now = a.firestore.Timestamp.now();
+        const now = Timestamp.now();
         const data = {
           id: item.id,
           tmdbId: item.tmdbId,
@@ -1213,7 +1241,7 @@ export const setMediaStatus = onRequest(
         } else if (status === 'seen') {
           batch.set(galleryRef, {
             ...data,
-            ...(previousLovedAt instanceof a.firestore.Timestamp ?
+            ...(previousLovedAt instanceof Timestamp ?
               {lovedAt: previousLovedAt} : {}),
             ...(Array.isArray(previousOrigin) ?
               {originCountry: previousOrigin} : {}),
@@ -1285,14 +1313,14 @@ export const setGalleryLove = onRequest(
         if (loved) {
           // Re-poser un cœur déjà posé ne rajeunit pas le signal : la date
           // d'origine reste, c'est elle que la demi-vie du trait regarde.
-          if (!(snap.get('lovedAt') instanceof a.firestore.Timestamp)) {
+          if (!(snap.get('lovedAt') instanceof Timestamp)) {
             await galleryRef.set(
-                {lovedAt: a.firestore.Timestamp.now()}, {merge: true},
+                {lovedAt: Timestamp.now()}, {merge: true},
             );
           }
         } else {
           await galleryRef.set(
-              {lovedAt: a.firestore.FieldValue.delete()}, {merge: true},
+              {lovedAt: FieldValue.delete()}, {merge: true},
           );
         }
 
@@ -2150,16 +2178,16 @@ interface PoolLibrary {
 /**
  * Lit la bibliothèque pour composer le vivier : les exclusions, la watchlist
  * candidate et les graines personnelles.
- * @param {admin.firestore.Firestore} db Firestore instance.
+ * @param {Firestore} db Firestore instance.
  * @param {string} uid Authenticated user id.
  * @return {Promise<PoolLibrary>} La bibliothèque, prête pour le vivier.
  */
 async function fetchLibraryForPool(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
 ): Promise<PoolLibrary> {
   const userRef = db.collection('users').doc(uid);
-  const cutoff = admin.firestore.Timestamp.fromMillis(
+  const cutoff = Timestamp.fromMillis(
       Date.now() - HISTORY_WINDOW_DAYS * 24 * 3600 * 1000,
   );
 
@@ -2183,7 +2211,7 @@ async function fetchLibraryForPool(
     const title = doc.get('title');
     if (typeof title === 'string') titles.set(id, title);
     const lovedAt = doc.get('lovedAt');
-    if (lovedAt instanceof admin.firestore.Timestamp) {
+    if (lovedAt instanceof Timestamp) {
       loved.push({tmdbId: id, at: lovedAt.toMillis()});
     }
   }
@@ -3604,20 +3632,20 @@ function buildTraitProfile(
 
 /**
  * Lit les entrées de bibliothèque utiles au trait.
- * @param {admin.firestore.QuerySnapshot} snap Collection Firestore.
+ * @param {QuerySnapshot} snap Collection Firestore.
  * @param {Map<string, FilmPosition>} freshPositions Positions apprises
  *   pendant l'appel en cours, pas encore visibles dans le snapshot.
  * @return {TraitEntry[]} Entrées normalisées.
  */
 function traitEntriesFrom(
-    snap: admin.firestore.QuerySnapshot,
+    snap: QuerySnapshot,
     freshPositions: Map<string, FilmPosition> = new Map(),
 ): TraitEntry[] {
   const entries: TraitEntry[] = [];
   for (const doc of snap.docs) {
     const genreIds = doc.get('genreIds');
     const addedAt = doc.get('addedAt');
-    const millis = addedAt instanceof admin.firestore.Timestamp ?
+    const millis = addedAt instanceof Timestamp ?
       addedAt.toMillis() : Date.now();
     const tmdbId = doc.get('tmdbId');
     // Les positions apprises pendant cet appel ne sont pas encore dans le
@@ -3634,7 +3662,7 @@ function traitEntriesFrom(
         genreIds.filter((g): g is number => typeof g === 'number') : [],
       inCollection: typeof doc.get('collectionId') === 'number',
       addedAtMillis: millis,
-      loved: doc.get('lovedAt') instanceof admin.firestore.Timestamp,
+      loved: doc.get('lovedAt') instanceof Timestamp,
       axes,
     });
   }
@@ -3644,11 +3672,11 @@ function traitEntriesFrom(
 /**
  * Le graphe de préférence (C2), relu : un score type Elo par film de la
  * Galerie, construit duel après duel.
- * @param {admin.firestore.DocumentSnapshot} snap Document `taste/filmPrefs`.
+ * @param {DocumentSnapshot} snap Document `taste/filmPrefs`.
  * @return {Map<number, number>} Score par tmdbId.
  */
 function parseFilmPrefs(
-    snap: admin.firestore.DocumentSnapshot,
+    snap: DocumentSnapshot,
 ): Map<number, number> {
   const prefs = new Map<number, number>();
   if (!snap.exists) return prefs;
@@ -3718,11 +3746,11 @@ interface SessionOutcomes {
 /**
  * Relit l'historique des séances : les verdicts déjà donnés, celui qu'on
  * pourrait encore demander, et ce que chaque séance laisse au trait.
- * @param {admin.firestore.QuerySnapshot} snap Historique récent.
+ * @param {QuerySnapshot} snap Historique récent.
  * @return {SessionOutcomes} Lecture.
  */
 function readSessionOutcomes(
-    snap: admin.firestore.QuerySnapshot,
+    snap: QuerySnapshot,
 ): SessionOutcomes {
   const verdicts: TraitVerdict[] = [];
   const signals: SessionSignal[] = [];
@@ -3737,7 +3765,7 @@ function readSessionOutcomes(
     const answersRaw = doc.get('answers');
     const launched = doc.get('launched');
     const hasLaunch = typeof launched === 'object' && launched !== null;
-    const createdMillis = createdAt instanceof admin.firestore.Timestamp ?
+    const createdMillis = createdAt instanceof Timestamp ?
       createdAt.toMillis() : now;
 
     // Les « Ce n'est pas lui » de la séance, rattachés à la position que le
@@ -3753,7 +3781,7 @@ function readSessionOutcomes(
           if (!Number.isFinite(tmdbId)) return null;
           const film = filmRows.find((f) => Number(f.id) === tmdbId);
           if (!film) return null;
-          const at = record.at instanceof admin.firestore.Timestamp ?
+          const at = record.at instanceof Timestamp ?
             record.at.toMillis() : createdMillis;
           return {axes: parseAxes(film.axes), atMillis: at};
         })
@@ -3774,7 +3802,7 @@ function readSessionOutcomes(
     const tmdbId = Number(record.tmdbId);
     if (!Number.isFinite(tmdbId)) continue;
 
-    const at = record.at instanceof admin.firestore.Timestamp ?
+    const at = record.at instanceof Timestamp ?
       record.at.toMillis() : 0;
     const verdict = doc.get('verdict');
 
@@ -4274,16 +4302,16 @@ function positionFilmFromDetail(
  * par `AXES_VERSION`, recalculé quand le lexique change. Chaque document de
  * galerie traité reçoit sa position, sa durée et son pays, et n'y repassera
  * plus tant que la version tient.
- * @param {admin.firestore.DocumentSnapshot[]} docs Documents à traiter.
+ * @param {DocumentSnapshot[]} docs Documents à traiter.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @return {Promise<Map<string, FilmPosition>>} Positions apprises, par id de
  *   document.
  */
 async function positionGalleryDocs(
-    docs: admin.firestore.DocumentSnapshot[],
+    docs: DocumentSnapshot[],
     ctx: TMDBContext,
-    db: admin.firestore.Firestore,
+    db: Firestore,
 ): Promise<Map<string, FilmPosition>> {
   const learned = new Map<string, FilmPosition>();
 
@@ -4329,8 +4357,8 @@ async function positionGalleryDocs(
           originCountry: position.originCountry,
           collectionId: collection && typeof collection.id === 'number' ?
             collection.id : null,
-          sagaAt: admin.firestore.Timestamp.now(),
-          updatedAt: admin.firestore.Timestamp.now(),
+          sagaAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
         });
       }
       await doc.ref.set({
@@ -4352,28 +4380,28 @@ async function positionGalleryDocs(
 /**
  * Les documents de galerie qui attendent encore leur position, dans la
  * version courante du lexique.
- * @param {admin.firestore.QuerySnapshot} gallerySnap La Galerie.
- * @return {admin.firestore.DocumentSnapshot[]} Documents à traiter.
+ * @param {QuerySnapshot} gallerySnap La Galerie.
+ * @return {DocumentSnapshot[]} Documents à traiter.
  */
 function pendingGalleryPositions(
-    gallerySnap: admin.firestore.QuerySnapshot,
-): admin.firestore.DocumentSnapshot[] {
+    gallerySnap: QuerySnapshot,
+): DocumentSnapshot[] {
   return gallerySnap.docs.filter((doc) =>
     doc.get('mediaType') === 'movie' && doc.get('axesV') !== AXES_VERSION);
 }
 
 /**
  * Mesure l'état des cinq artéfacts sur la bibliothèque telle qu'elle est.
- * @param {admin.firestore.QuerySnapshot} gallerySnap La Galerie.
- * @param {admin.firestore.QuerySnapshot} watchlistSnap La watchlist.
+ * @param {QuerySnapshot} gallerySnap La Galerie.
+ * @param {QuerySnapshot} watchlistSnap La watchlist.
  * @param {Map<string, string[]>} freshOrigins Pays appris pendant cet appel,
  *   pas encore visibles dans le snapshot.
  * @param {number} duelsCount Comparaisons jouées (`taste/duels.count`).
  * @return {DoorState} La porte, artéfact par artéfact.
  */
 function doorStateFrom(
-    gallerySnap: admin.firestore.QuerySnapshot,
-    watchlistSnap: admin.firestore.QuerySnapshot,
+    gallerySnap: QuerySnapshot,
+    watchlistSnap: QuerySnapshot,
     freshOrigins: Map<string, string[]>,
     duelsCount: number,
 ): DoorState {
@@ -4397,7 +4425,7 @@ function doorStateFrom(
         if (typeof code === 'string' && code.length > 0) countries.add(code);
       }
     }
-    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) lovedCount++;
+    if (doc.get('lovedAt') instanceof Timestamp) lovedCount++;
   }
 
   const memoire = {
@@ -4453,14 +4481,14 @@ function doorStateFrom(
  * La Mémoire compte des séries, pas des saisons : avoir vu une saison de
  * Dark, c'est connaître Dark. Le Cœur compte des saisons, parce que c'est là
  * qu'il se pose. La Promesse compte les saisons dans la file.
- * @param {admin.firestore.QuerySnapshot} tvGallerySnap Saisons vues.
- * @param {admin.firestore.QuerySnapshot} tvWatchlistSnap Saisons à voir.
+ * @param {QuerySnapshot} tvGallerySnap Saisons vues.
+ * @param {QuerySnapshot} tvWatchlistSnap Saisons à voir.
  * @param {number} duelsCount Comparaisons entre séries jouées.
  * @return {Object} La Porte, au même format que celle des films.
  */
 function seriesDoorStateFrom(
-    tvGallerySnap: admin.firestore.QuerySnapshot,
-    tvWatchlistSnap: admin.firestore.QuerySnapshot,
+    tvGallerySnap: QuerySnapshot,
+    tvWatchlistSnap: QuerySnapshot,
     duelsCount: number,
 ): Omit<DoorState, 'horizons'> {
   const seriesIds = new Set<number>();
@@ -4475,7 +4503,7 @@ function seriesDoorStateFrom(
         if (typeof genreId === 'number') genres.add(genreId);
       }
     }
-    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) loved++;
+    if (doc.get('lovedAt') instanceof Timestamp) loved++;
   }
   const artifact = (key: string, current: number, target: number) =>
     ({key, current, target, done: current >= target});
@@ -4648,7 +4676,7 @@ export const recordSessionOutcome = onRequest(
           }
           await doc.ref.set({
             rejected: true,
-            rejectedAt: admin.firestore.Timestamp.now(),
+            rejectedAt: Timestamp.now(),
           }, {merge: true});
           res.status(200).json({ok: true});
           return;
@@ -4670,7 +4698,7 @@ export const recordSessionOutcome = onRequest(
             (films as Record<string, unknown>[])
                 .find((f) => Number(f.id) === tmdbId) : undefined;
 
-          const launchedAt = admin.firestore.Timestamp.now();
+          const launchedAt = Timestamp.now();
           await doc.ref.set({
             launched: {
               tmdbId,
@@ -4723,9 +4751,9 @@ export const recordSessionOutcome = onRequest(
             const gallerySnap = await galleryRef.get();
             if (gallerySnap.exists &&
               !(gallerySnap.get('lovedAt') instanceof
-                admin.firestore.Timestamp)) {
+                Timestamp)) {
               await galleryRef.set(
-                  {lovedAt: admin.firestore.Timestamp.now()}, {merge: true},
+                  {lovedAt: Timestamp.now()}, {merge: true},
               );
             }
             // Et il parle au graphe : « resté avec moi » vaut un duel gagné
@@ -4748,9 +4776,9 @@ export const recordSessionOutcome = onRequest(
             return;
           }
           await doc.ref.set({
-            passes: admin.firestore.FieldValue.arrayUnion({
+            passes: FieldValue.arrayUnion({
               tmdbId,
-              at: admin.firestore.Timestamp.now(),
+              at: Timestamp.now(),
             }),
           }, {merge: true});
           res.status(200).json({ok: true});
@@ -4780,13 +4808,13 @@ const ELO_STAYED_BONUS = 40;
 
 /**
  * Ajoute d'office des points à un film du graphe — le chemin du verdict.
- * @param {admin.firestore.DocumentReference} userRef Le document utilisateur.
+ * @param {DocumentReference} userRef Le document utilisateur.
  * @param {number} tmdbId Le film.
  * @param {number} delta Les points à ajouter.
  * @param {string} prefsDoc Le graphe : `filmPrefs` ou `seriesPrefs`.
  */
 async function bumpFilmPref(
-    userRef: admin.firestore.DocumentReference,
+    userRef: DocumentReference,
     tmdbId: number,
     delta: number,
     prefsDoc = 'filmPrefs',
@@ -4802,7 +4830,7 @@ async function bumpFilmPref(
         r: rating + delta,
         w: wins + 1,
         l: typeof entry.l === 'number' ? entry.l : 0,
-        at: admin.firestore.Timestamp.now(),
+        at: Timestamp.now(),
       },
     }, {merge: true});
   });
@@ -4861,7 +4889,7 @@ export const recordFilmDuel = onRequest(
           const expected =
             1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
           const gain = ELO_K * (1 - expected);
-          const now = admin.firestore.Timestamp.now();
+          const now = Timestamp.now();
 
           txn.set(prefsRef, {
             [String(winnerId)]: {
@@ -4878,7 +4906,7 @@ export const recordFilmDuel = onRequest(
             },
           }, {merge: true});
           txn.set(duelsRef, {
-            count: admin.firestore.FieldValue.increment(1),
+            count: FieldValue.increment(1),
             updatedAt: now,
           }, {merge: true});
         });
@@ -5025,12 +5053,12 @@ export const backfillGallery = onRequest(
                 .doc(`movie-${tmdbId}`);
             const snap = await galleryRef.get();
             const already = snap.get('lovedAt');
-            if (snap.exists && !(already instanceof a.firestore.Timestamp)) {
+            if (snap.exists && !(already instanceof Timestamp)) {
               // La date du lancement, pas celle du rattrapage : la demi-vie
               // du trait doit voir la soirée où elle a eu lieu.
               await galleryRef.set({
-                lovedAt: launched?.at instanceof a.firestore.Timestamp ?
-                  launched.at : a.firestore.Timestamp.now(),
+                lovedAt: launched?.at instanceof Timestamp ?
+                  launched.at : Timestamp.now(),
               }, {merge: true});
               await bumpFilmPref(userRef, tmdbId, ELO_STAYED_BONUS);
               hearts += 1;
@@ -5097,7 +5125,7 @@ export const setTasteCorrection = onRequest(
 
         if (body.value === null) {
           await ref.set(
-              {[axis]: admin.firestore.FieldValue.delete()}, {merge: true},
+              {[axis]: FieldValue.delete()}, {merge: true},
           );
         } else if (typeof body.value === 'number' &&
           Number.isFinite(body.value)) {
@@ -5318,7 +5346,7 @@ export const getCandidatePool = onRequest(
         if (!reopenBelief) {
           await userRef.collection('taste').doc('lastSeeds').set({
             byCandidate: provenance,
-            at: a.firestore.Timestamp.now(),
+            at: Timestamp.now(),
           });
         }
 
@@ -5674,7 +5702,7 @@ export const finalizeRecommendations = onRequest(
 
         await userRef
             .collection('recommendationHistory').add({
-              createdAt: a.firestore.Timestamp.now(),
+              createdAt: Timestamp.now(),
               tmdbIds: finalSelection.map((c) => c.id),
               answers,
               // La position des trois films est conservée ici, et nulle part
@@ -5820,12 +5848,12 @@ const EMPTY_DECLARED_PROFILE: DeclaredProfile = {
 /**
  * Lit `users/{uid}/preferences/profile`, en tolérant son absence — la grande
  * majorité des comptes n'aura jamais ouvert les réglages.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur authentifié.
  * @return {Promise<DeclaredProfile>} Profil déclaré, vide par défaut.
  */
 async function fetchDeclaredProfile(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
 ): Promise<DeclaredProfile> {
   const snap = await db.collection('users').doc(uid)
@@ -5869,11 +5897,11 @@ function clamp01(value: number): number {
 }
 /**
  * Lit les compteurs de swipe, en tolérant un document absent ou partiel.
- * @param {admin.firestore.DocumentSnapshot} snap Snapshot du document.
+ * @param {DocumentSnapshot} snap Snapshot du document.
  * @return {SwipeCounters} Compteurs normalisés.
  */
 function parseSwipeCounters(
-    snap: admin.firestore.DocumentSnapshot,
+    snap: DocumentSnapshot,
 ): SwipeCounters {
   const data = (snap.exists ? snap.data() : {}) ?? {};
   const asRecord = (value: unknown): Record<string, number> => {
@@ -6085,7 +6113,7 @@ interface DeckPoolInput {
   mode: deck.DeckMode;
   /** Galerie, watchlist et écarts en cours : jamais dans le vivier. */
   excluded: Set<number>;
-  galleryDocs: admin.firestore.QueryDocumentSnapshot[];
+  galleryDocs: QueryDocumentSnapshot[];
   /** Films tout juste balayés « vu », pas encore écrits en galerie. */
   pendingSeenIds: number[];
   counters: SwipeCounters;
@@ -6228,7 +6256,7 @@ function homeReleaseFrom(payload: Record<string, unknown>): string | null {
  * une fois sorti en vidéo, un film le reste, et il n'est plus jamais
  * revérifié. Un film dont on n'a pas pu lire les sorties dans cet appel est
  * écarté pour ce tour : dans le doute, on ne le sert pas.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {T[]} rows Lignes candidates.
  * @param {TMDBContext} ctx Jeton et langue.
  * @param {boolean} requirePoster Exiger une affiche : la feuille de saga
@@ -6236,7 +6264,7 @@ function homeReleaseFrom(payload: Record<string, unknown>): string | null {
  * @return {Promise<T[]>} Lignes servables, dans le même ordre.
  */
 async function servableRows<T extends DiscoverRow>(
-    db: admin.firestore.Firestore, rows: T[], ctx: TMDBContext,
+    db: Firestore, rows: T[], ctx: TMDBContext,
     requirePoster = true,
 ): Promise<T[]> {
   const today = todayISO();
@@ -6258,7 +6286,7 @@ async function servableRows<T extends DiscoverRow>(
     const checked = snap.get('homeCheckedAt');
     if (typeof home === 'string' && home <= today) {
       available.add(id);
-    } else if (checked instanceof admin.firestore.Timestamp &&
+    } else if (checked instanceof Timestamp &&
       Date.now() - checked.toMillis() < HOME_RECHECK_MS) {
       // Vérifié il y a moins d'une semaine, pas encore à la maison.
     } else {
@@ -6266,7 +6294,7 @@ async function servableRows<T extends DiscoverRow>(
     }
   });
 
-  const now = admin.firestore.Timestamp.now();
+  const now = Timestamp.now();
   await Promise.all(missing.slice(0, HOME_FETCH_PER_CALL).map(async (id) => {
     try {
       const payload = await tmdbGET(`/movie/${id}/release_dates`, {}, ctx);
@@ -6309,15 +6337,15 @@ function candidateOf(row: DeckPoolRow): deck.DeckCandidate {
  *
  * Un film recommandé par plusieurs graines est le meilleur candidat du
  * vivier : la V1 n'en tenait pas compte, et ne demandait qu'à quatre films.
- * @param {admin.firestore.QueryDocumentSnapshot[]} docs Galerie.
+ * @param {QueryDocumentSnapshot[]} docs Galerie.
  * @param {number[]} pendingSeenIds Films vus pas encore écrits.
  * @return {number[]} Graines, six au plus.
  */
 function deckSeeds(
-    docs: admin.firestore.QueryDocumentSnapshot[], pendingSeenIds: number[],
+    docs: QueryDocumentSnapshot[], pendingSeenIds: number[],
 ): number[] {
   const millis = (value: unknown) =>
-    value instanceof admin.firestore.Timestamp ? value.toMillis() : 0;
+    value instanceof Timestamp ? value.toMillis() : 0;
   const entries = docs
       .map((doc) => ({
         tmdbId: doc.get('tmdbId') as unknown,
@@ -6533,19 +6561,19 @@ async function buildDeckPool(
 /**
  * Le vivier, réduit à ce qu'on peut voir chez soi.
  * @param {DeckPoolInput} input Personne.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {TMDBContext} ctx Jeton et langue.
  * @return {Promise<DeckPoolRow[]>} Lignes servables.
  */
 async function buildServablePool(
-    input: DeckPoolInput, db: admin.firestore.Firestore, ctx: TMDBContext,
+    input: DeckPoolInput, db: Firestore, ctx: TMDBContext,
 ): Promise<DeckPoolRow[]> {
   return servableRows(db, await buildDeckPool(input, ctx), ctx);
 }
 
 /**
  * Le vivier de la personne, du cache ou refait.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur.
  * @param {DeckPoolInput} input Personne.
  * @param {Set<number>} blocked Ce qui ne peut pas être servi maintenant.
@@ -6555,7 +6583,7 @@ async function buildServablePool(
  * @return {Promise<DeckPoolRow[]>} Lignes.
  */
 async function loadDeckPool(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
     input: DeckPoolInput,
     blocked: Set<number>,
@@ -6571,7 +6599,7 @@ async function loadDeckPool(
     const lots = snap.get('lots');
     const usable = snap.get('v') === DECK_POOL_VERSION &&
       Array.isArray(rows) &&
-      builtAt instanceof admin.firestore.Timestamp &&
+      builtAt instanceof Timestamp &&
       Date.now() - builtAt.toMillis() < DECK_POOL_MAX_AGE_MS &&
       typeof lots === 'number' && lots < DECK_POOL_MAX_LOTS &&
       snap.get('mode') === input.mode &&
@@ -6580,7 +6608,7 @@ async function loadDeckPool(
       const typed = rows as DeckPoolRow[];
       const servable = typed.filter((row) => !blocked.has(row.id)).length;
       if (servable >= DECK_POOL_MIN_FRESH) {
-        await ref.update({lots: admin.firestore.FieldValue.increment(1)});
+        await ref.update({lots: FieldValue.increment(1)});
         return typed;
       }
     }
@@ -6589,7 +6617,7 @@ async function loadDeckPool(
   const rows = await buildServablePool(input, db, ctx);
   await ref.set({
     v: DECK_POOL_VERSION,
-    builtAt: admin.firestore.Timestamp.now(),
+    builtAt: Timestamp.now(),
     lots: 1,
     mode: input.mode,
     phase: input.phase,
@@ -6640,12 +6668,12 @@ function observationOf(d: SwipeDecisionPayload): deck.Observation | null {
  * ne sont pas écrites : `recordSwipes` les apprendra pour de bon à leur
  * arrivée. Elles servent à ce que le lot demandé tienne compte des refus des
  * dernières secondes, que la V1 ignorait.
- * @param {admin.firestore.DocumentSnapshot} profileSnap `swipeProfile`.
+ * @param {DocumentSnapshot} profileSnap `swipeProfile`.
  * @param {SwipeDecisionPayload[]} pending Décisions en route.
  * @return {deck.DeckModel} Modèle.
  */
 function modelWithPending(
-    profileSnap: admin.firestore.DocumentSnapshot,
+    profileSnap: DocumentSnapshot,
     pending: SwipeDecisionPayload[],
 ): deck.DeckModel {
   const model = deck.parseModel(profileSnap.get('model'));
@@ -6696,16 +6724,16 @@ function newLotId(): string {
 
 /**
  * Ce que la Porte compte et que le choix des cartes doit savoir.
- * @param {admin.firestore.QueryDocumentSnapshot[]} docs Galerie.
+ * @param {QueryDocumentSnapshot[]} docs Galerie.
  * @return {{lovedCount: number, genreCount: number}} Comptes.
  */
 function galleryFacts(
-    docs: admin.firestore.QueryDocumentSnapshot[],
+    docs: QueryDocumentSnapshot[],
 ): {lovedCount: number; genreCount: number} {
   let lovedCount = 0;
   const genres = new Set<number>();
   for (const doc of docs) {
-    if (doc.get('lovedAt') instanceof admin.firestore.Timestamp) lovedCount++;
+    if (doc.get('lovedAt') instanceof Timestamp) lovedCount++;
     const ids = doc.get('genreIds');
     if (Array.isArray(ids)) {
       for (const id of ids) if (typeof id === 'number') genres.add(id);
@@ -6716,18 +6744,18 @@ function galleryFacts(
 
 /**
  * Le lot de films : vivier, notes, composition, règle des sagas.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur.
  * @param {object} args Ce que la requête a apporté.
  * @param {TMDBContext} ctx Jeton et langue.
  * @return {Promise<Record<string, unknown>>} Réponse prête à envoyer.
  */
 async function buildFilmLot(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
     args: {
       exclusions: Awaited<ReturnType<typeof fetchSwipeExclusions>>;
-      profileSnap: admin.firestore.DocumentSnapshot;
+      profileSnap: DocumentSnapshot;
       declared: DeclaredProfile;
       sessionExcluded: Set<number>;
       pending: SwipeDecisionPayload[];
@@ -6887,13 +6915,13 @@ function sagaPartFrom(raw: Record<string, unknown>): DiscoverRow | null {
  * Le cache n'a pas de date d'expiration : le nombre d'opus d'une saga bouge
  * au mieux une fois par décennie, et une suite annoncée n'a rien à faire
  * dans un deck tant qu'elle n'est pas sortie.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {number} collectionId Identifiant TMDB de la saga.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<?SagaCache>} La saga, ou null si TMDB ne la rend pas.
  */
 async function loadSaga(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     collectionId: number,
     ctx: TMDBContext,
 ): Promise<SagaCache | null> {
@@ -6932,7 +6960,7 @@ async function loadSaga(
   await ref.set({
     name: saga.name,
     parts: saga.parts,
-    updatedAt: admin.firestore.Timestamp.now(),
+    updatedAt: Timestamp.now(),
   });
   return saga;
 }
@@ -6943,13 +6971,13 @@ async function loadSaga(
  * Lit le cache global d'abord, ne paie TMDB que pour les manques, et plafonne
  * ce qu'il paie : un lot ne doit pas doubler son coût réseau parce que le
  * cache est froid. Les manques non résolus ce tour-ci le seront au suivant.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {number[]} tmdbIds Films à résoudre.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Map<number, ?number>>} Saga de chaque film, null si isolé.
  */
 async function resolveSagaIds(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     tmdbIds: number[],
     ctx: TMDBContext,
 ): Promise<Map<number, number | null>> {
@@ -6973,7 +7001,7 @@ async function resolveSagaIds(
     }
   });
 
-  const now = admin.firestore.Timestamp.now();
+  const now = Timestamp.now();
   await Promise.all(
       missing.slice(0, SWIPE_SAGA_RESOLVE_PER_BATCH).map(async (id) => {
         try {
@@ -7021,14 +7049,14 @@ function sagaHead(
  * demander, à la même place et avec le même score ; les doublons de saga
  * disparaissent. Le lot peut donc rendre moins de cartes qu'il n'en avait :
  * c'est voulu, et le client recharge bien avant d'être à sec.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {SwipeCandidate[]} deck Lot composé, dans l'ordre d'affichage.
  * @param {Set<number>} blocked Films déjà classés, en attente ou déjà servis.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<SwipeCandidate[]>} Lot corrigé.
  */
 async function applySagaRule(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     deck: SwipeCandidate[],
     blocked: Set<number>,
     ctx: TMDBContext,
@@ -7100,12 +7128,12 @@ async function applySagaRule(
  * Ne lit que le cache, jamais TMDB : un film ne peut être écarté que s'il a
  * été servi, et le deck a donc déjà résolu sa saga en le servant. Si le cache
  * ne sait rien, on ne propage rien — c'est un raccourci, pas une obligation.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {{id: string, tmdbId: number}[]} skipped Films écartés dans ce lot.
  * @return {Promise<number[]>} ids TMDB des autres opus à refroidir.
  */
 async function sagaSiblingsToCool(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     skipped: {id: string; tmdbId: number}[],
 ): Promise<number[]> {
   if (skipped.length === 0) return [];
@@ -7194,24 +7222,24 @@ export const getCollection = onRequest(
  * Charge les ids à exclure : galerie, watchlist, et films écartés dont le
  * cooldown court encore. `resurfaceAt` étant calculé à l'écriture, l'exclusion
  * tient en une seule requête indexée.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur authentifié.
  * @return {Promise<{excluded: Set<number>,
- *   galleryDocs: admin.firestore.QueryDocumentSnapshot[]}>} Exclusions et
+ *   galleryDocs: QueryDocumentSnapshot[]}>} Exclusions et
  *   documents de galerie (réutilisés pour bâtir le profil).
  */
 async function fetchSwipeExclusions(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
 ): Promise<{
   excluded: Set<number>;
   tvExcluded: Set<number>;
-  galleryDocs: admin.firestore.QueryDocumentSnapshot[];
-  tvGalleryDocs: admin.firestore.QueryDocumentSnapshot[];
+  galleryDocs: QueryDocumentSnapshot[];
+  tvGalleryDocs: QueryDocumentSnapshot[];
   watchlistSize: number;
 }> {
   const userRef = db.collection('users').doc(uid);
-  const now = admin.firestore.Timestamp.now();
+  const now = Timestamp.now();
 
   const [
     gallerySnap, watchlistSnap, tvGallerySnap, tvWatchlistSnap, skipsSnap,
@@ -7231,7 +7259,7 @@ async function fetchSwipeExclusions(
   // deck demande si on la connaît, et cette question a déjà sa réponse.
   const excluded = new Set<number>();
   const tvExcluded = new Set<number>();
-  const add = (target: Set<number>, doc: admin.firestore.DocumentSnapshot) => {
+  const add = (target: Set<number>, doc: DocumentSnapshot) => {
     const id = doc.get('tmdbId');
     if (typeof id === 'number') target.add(id);
   };
@@ -7399,14 +7427,14 @@ function tvMetaFromDetail(detail: Record<string, unknown>): TvMeta {
 
 /**
  * Les fiches de ces séries, du cache ou de TMDB.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {number[]} ids Séries voulues.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @param {number} maxFetch Fiches payées à TMDB, au plus, dans cet appel.
  * @return {Promise<Map<number, TvMeta>>} Les fiches trouvées.
  */
 async function loadTvMeta(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     ids: number[],
     ctx: TMDBContext,
     maxFetch: number,
@@ -7422,7 +7450,7 @@ async function loadTvMeta(
   snaps.forEach((snap, index) => {
     const updated = snap.get('updatedAt');
     const fresh = snap.exists && snap.get('v') === TV_META_VERSION &&
-      updated instanceof admin.firestore.Timestamp &&
+      updated instanceof Timestamp &&
       now - updated.toMillis() < TV_META_MAX_AGE_MS;
     if (fresh) {
       out.set(unique[index], snap.get('meta') as TvMeta);
@@ -7440,7 +7468,7 @@ async function loadTvMeta(
       await db.collection('tvMeta').doc(String(id)).set({
         v: TV_META_VERSION,
         meta,
-        updatedAt: admin.firestore.Timestamp.now(),
+        updatedAt: Timestamp.now(),
       });
     } catch {
       // Une fiche injoignable laisse la série de côté pour ce tour.
@@ -7526,16 +7554,16 @@ function seriesRowFrom(raw: Record<string, unknown>): DiscoverRow | null {
 
 /**
  * Le lot de cartes du deck des séries.
- * @param {admin.firestore.Firestore} db Firestore.
- * @param {admin.firestore.QueryDocumentSnapshot[]} tvGalleryDocs Saisons vues.
+ * @param {Firestore} db Firestore.
+ * @param {QueryDocumentSnapshot[]} tvGalleryDocs Saisons vues.
  * @param {Set<number>} blocked Séries rangées, écartées ou déjà servies.
  * @param {DeclaredProfile} declared Genres bannis, génération.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Record<string, unknown>[]>} Cartes prêtes à envoyer.
  */
 async function buildSeriesDeck(
-    db: admin.firestore.Firestore,
-    tvGalleryDocs: admin.firestore.QueryDocumentSnapshot[],
+    db: Firestore,
+    tvGalleryDocs: QueryDocumentSnapshot[],
     blocked: Set<number>,
     declared: DeclaredProfile,
     ctx: TMDBContext,
@@ -7546,7 +7574,7 @@ async function buildSeriesDeck(
   for (const doc of tvGalleryDocs) {
     const id = Number(doc.get('tmdbId'));
     if (!Number.isFinite(id)) continue;
-    const added = (doc.get('addedAt') as admin.firestore.Timestamp | undefined)
+    const added = (doc.get('addedAt') as Timestamp | undefined)
         ?.toMillis() ?? 0;
     const known = bySeries.get(id);
     const genreIds = Array.isArray(doc.get('genreIds')) ?
@@ -7905,7 +7933,7 @@ export const recordSwipes = onRequest(
         const a = getAdmin();
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
-        const now = a.firestore.Timestamp.now();
+        const now = Timestamp.now();
 
         // Le cooldown dépend du nombre de skips déjà encaissés : une lecture
         // groupée en amont évite une transaction par film. Une case laissée
@@ -7930,7 +7958,7 @@ export const recordSwipes = onRequest(
         // film re-balayé perdrait le coup de cœur et le pays d'origine qu'il
         // portait déjà.
         const previousGallery = new Map<string, {
-          lovedAt: admin.firestore.Timestamp | null;
+          lovedAt: Timestamp | null;
           originCountry: string[] | null;
         }>();
         const seenIds = decisions
@@ -7945,7 +7973,7 @@ export const recordSwipes = onRequest(
             const lovedAt = snap.get('lovedAt');
             const originCountry = snap.get('originCountry');
             previousGallery.set(snap.id, {
-              lovedAt: lovedAt instanceof a.firestore.Timestamp ?
+              lovedAt: lovedAt instanceof Timestamp ?
                 lovedAt : null,
               originCountry: Array.isArray(originCountry) ?
                 originCountry.filter(
@@ -7987,11 +8015,11 @@ export const recordSwipes = onRequest(
             }));
 
         const counters = {
-          genreSeen: {} as Record<string, admin.firestore.FieldValue>,
-          genreWanted: {} as Record<string, admin.firestore.FieldValue>,
-          genreSkipped: {} as Record<string, admin.firestore.FieldValue>,
-          decadeSeen: {} as Record<string, admin.firestore.FieldValue>,
-          decadeSkipped: {} as Record<string, admin.firestore.FieldValue>,
+          genreSeen: {} as Record<string, FieldValue>,
+          genreWanted: {} as Record<string, FieldValue>,
+          genreSkipped: {} as Record<string, FieldValue>,
+          decadeSeen: {} as Record<string, FieldValue>,
+          decadeSkipped: {} as Record<string, FieldValue>,
         };
         const increments = new Map<string, Map<string, number>>();
         const bump = (bucket: keyof typeof counters, key: string) => {
@@ -8051,7 +8079,7 @@ export const recordSwipes = onRequest(
               mediaType: item.mediaType,
               skipCount,
               lastSkippedAt: now,
-              resurfaceAt: a.firestore.Timestamp.fromMillis(
+              resurfaceAt: Timestamp.fromMillis(
                   now.toMillis() + skipCooldownMillis(skipCount),
               ),
             }, {merge: true});
@@ -8125,7 +8153,7 @@ export const recordSwipes = onRequest(
                 tmdbId,
                 viaSaga: true,
                 lastSkippedAt: now,
-                resurfaceAt: a.firestore.Timestamp.fromMillis(
+                resurfaceAt: Timestamp.fromMillis(
                     now.toMillis() +
                     SWIPE_SAGA_SIBLING_COOLDOWN_DAYS * 24 * 3600 * 1000,
                 ),
@@ -8137,7 +8165,7 @@ export const recordSwipes = onRequest(
         for (const [bucket, inner] of increments) {
           for (const [key, amount] of inner) {
             counters[bucket as keyof typeof counters][key] =
-              a.firestore.FieldValue.increment(amount);
+              FieldValue.increment(amount);
           }
         }
 
@@ -8148,7 +8176,7 @@ export const recordSwipes = onRequest(
               // Total exact des cartes tranchées : les compteurs par genre
               // sur-comptent (un film porte plusieurs genres) et ceux par
               // décennie ratent les mises en watchlist.
-              totalDecisions: a.firestore.FieldValue.increment(
+              totalDecisions: FieldValue.increment(
                   decisions.filter((d) => !d.soft).length),
               updatedAt: now,
             },
@@ -8500,13 +8528,13 @@ const DELETE_BATCH_SIZE = 400;
 
 /**
  * Supprime tous les documents d'une collection, par lots.
- * @param {admin.firestore.Firestore} db Firestore.
- * @param {admin.firestore.CollectionReference} ref Collection à vider.
+ * @param {Firestore} db Firestore.
+ * @param {CollectionReference} ref Collection à vider.
  * @return {Promise<number>} Nombre de documents supprimés.
  */
 async function deleteCollection(
-    db: admin.firestore.Firestore,
-    ref: admin.firestore.CollectionReference,
+    db: Firestore,
+    ref: CollectionReference,
 ): Promise<number> {
   let deleted = 0;
   for (;;) {
@@ -8566,14 +8594,13 @@ export const resetSwipeSkips = onRequest(
  * compteurs — resteraient sinon orphelines. Traité par lots de 200 entrées
  * (deux écritures chacune) pour rester loin de la limite de 500 opérations
  * d'un batch, même pour un compte à des milliers d'abonnés.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Compte sur le point d'être supprimé.
  * @return {Promise<void>}
  */
 async function detachFromFollowGraph(
-    db: admin.firestore.Firestore, uid: string,
+    db: Firestore, uid: string,
 ): Promise<void> {
-  const a = getAdmin();
   const userRef = db.collection('users').doc(uid);
 
   const [followersSnap, followingSnap] = await Promise.all([
@@ -8581,7 +8608,7 @@ async function detachFromFollowGraph(
     userRef.collection('following').get(),
   ]);
 
-  const writes: Array<(batch: admin.firestore.WriteBatch) => void> = [];
+  const writes: Array<(batch: WriteBatch) => void> = [];
 
   for (const doc of followersSnap.docs) {
     // doc.id est quelqu'un qui suit le compte supprimé : chez lui,
@@ -8593,7 +8620,7 @@ async function detachFromFollowGraph(
     writes.push((batch) => {
       batch.delete(linkRef);
       batch.update(profileRef, {
-        followingCount: a.firestore.FieldValue.increment(-1),
+        followingCount: FieldValue.increment(-1),
       });
     });
   }
@@ -8608,7 +8635,7 @@ async function detachFromFollowGraph(
     writes.push((batch) => {
       batch.delete(linkRef);
       batch.update(profileRef, {
-        followerCount: a.firestore.FieldValue.increment(-1),
+        followerCount: FieldValue.increment(-1),
       });
     });
   }
@@ -8623,12 +8650,12 @@ async function detachFromFollowGraph(
 
 /**
  * Libère le pseudo et efface le profil public d'un compte.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Compte sur le point d'être supprimé.
  * @return {Promise<void>}
  */
 async function deletePublicIdentity(
-    db: admin.firestore.Firestore, uid: string,
+    db: Firestore, uid: string,
 ): Promise<void> {
   const profileRef = db.collection('publicProfiles').doc(uid);
   const profileSnap = await profileRef.get();
@@ -8948,11 +8975,11 @@ export const getHomeRows = onRequest(
             .map((doc) => ({
               id: doc.get('tmdbId') as unknown,
               addedAt: doc.get('addedAt') as
-                admin.firestore.Timestamp | undefined,
+                Timestamp | undefined,
             }))
             .filter((entry): entry is {
               id: number;
-              addedAt: admin.firestore.Timestamp | undefined;
+              addedAt: Timestamp | undefined;
             } => typeof entry.id === 'number')
             .sort((left, right) =>
               (right.addedAt?.toMillis() ?? 0) -
@@ -9124,11 +9151,11 @@ function longestDayStreak(days: string[]): number {
 
 /**
  * Transforme les documents de galerie en faits exploitables par les règles.
- * @param {admin.firestore.QueryDocumentSnapshot[]} docs Documents de galerie.
+ * @param {QueryDocumentSnapshot[]} docs Documents de galerie.
  * @return {GalleryFact[]} Faits normalisés.
  */
 function toGalleryFacts(
-    docs: admin.firestore.QueryDocumentSnapshot[],
+    docs: QueryDocumentSnapshot[],
 ): GalleryFact[] {
   return docs.map((doc) => {
     const releaseDate = doc.get('releaseDate');
@@ -9151,7 +9178,7 @@ function toGalleryFacts(
         doc.get('collectionId') : null,
       collectionTotal: typeof doc.get('collectionTotal') === 'number' ?
         doc.get('collectionTotal') : null,
-      addedAt: addedAt instanceof admin.firestore.Timestamp ?
+      addedAt: addedAt instanceof Timestamp ?
         addedAt.toDate() : null,
     };
   });
@@ -9465,17 +9492,17 @@ export const evaluateBadges = onRequest(
           );
         const states = evaluate(facts);
 
-        const alreadyUnlocked = new Map<string, admin.firestore.Timestamp>();
+        const alreadyUnlocked = new Map<string, Timestamp>();
         const triggers = new Map<string, BadgeTrigger | null>();
         for (const doc of badgesSnap.docs) {
           const at = doc.get('unlockedAt');
-          if (at instanceof admin.firestore.Timestamp) {
+          if (at instanceof Timestamp) {
             alreadyUnlocked.set(doc.id, at);
             triggers.set(doc.id, parseBadgeTrigger(doc.get('unlockedBy')));
           }
         }
 
-        const now = a.firestore.Timestamp.now();
+        const now = Timestamp.now();
         const batch = db.batch();
         let writes = 0;
 
@@ -9665,7 +9692,7 @@ export const claimHandle = onRequest(
             };
           }
 
-          const now = a.firestore.Timestamp.now();
+          const now = Timestamp.now();
 
           if (profileSnap.exists && previousHandleNormalized) {
             tx.delete(db.collection('usernames').doc(previousHandleNormalized));
@@ -9676,7 +9703,7 @@ export const claimHandle = onRequest(
             tx.update(profileRef, {
               handle: rawHandle.trim(),
               handleNormalized,
-              handleChangeCount: a.firestore.FieldValue.increment(1),
+              handleChangeCount: FieldValue.increment(1),
               updatedAt: now,
             });
           } else {
@@ -9785,19 +9812,18 @@ interface FollowChangeOutcome {
  * Applique ou retire le lien de suivi entre deux comptes, compteurs compris.
  * Idempotente : suivre deux fois, ou se désabonner sans être abonné, réussit
  * sans rien réécrire.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} followerUid Celui qui suit.
  * @param {string} targetUid Celui qui est suivi.
  * @param {boolean} follow Vrai pour suivre, faux pour se désabonner.
  * @return {Promise<FollowChangeOutcome>} Résultat à renvoyer au client.
  */
 async function applyFollowChange(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     followerUid: string,
     targetUid: string,
     follow: boolean,
 ): Promise<FollowChangeOutcome> {
-  const a = getAdmin();
   const followingRef = db.collection('users').doc(followerUid)
       .collection('following').doc(targetUid);
   const followerRef = db.collection('users').doc(targetUid)
@@ -9823,7 +9849,7 @@ async function applyFollowChange(
       return {status: 200};
     }
 
-    const now = a.firestore.Timestamp.now();
+    const now = Timestamp.now();
     const delta = follow ? 1 : -1;
 
     if (follow) {
@@ -9834,11 +9860,11 @@ async function applyFollowChange(
       tx.delete(followerRef);
     }
     tx.update(ownProfileRef, {
-      followingCount: a.firestore.FieldValue.increment(delta),
+      followingCount: FieldValue.increment(delta),
     });
     if (targetProfileSnap.exists) {
       tx.update(targetProfileRef, {
-        followerCount: a.firestore.FieldValue.increment(delta),
+        followerCount: FieldValue.increment(delta),
       });
     }
 
@@ -10046,7 +10072,7 @@ export const sendSuggestion = onRequest(
               genreIds: item.genreIds ?? [],
               releaseDate: item.releaseDate ?? null,
             },
-            createdAt: a.firestore.Timestamp.now(),
+            createdAt: Timestamp.now(),
           });
 
           return {status: 200 as const};
@@ -10131,7 +10157,7 @@ export const respondToSuggestion = onRequest(
             return {status: 200 as const, alreadySeen: true};
           }
 
-          const now = a.firestore.Timestamp.now();
+          const now = Timestamp.now();
           const recommender = {
             uid: suggestionSnap.get('fromUid') ?? null,
             displayName: suggestionSnap.get('fromDisplayName') ?? null,
@@ -10141,7 +10167,7 @@ export const respondToSuggestion = onRequest(
 
           if (watchlistSnap.exists) {
             tx.update(watchlistRef, {
-              recommendedBy: a.firestore.FieldValue.arrayUnion(recommender),
+              recommendedBy: FieldValue.arrayUnion(recommender),
             });
           } else {
             tx.set(watchlistRef, {
@@ -10233,7 +10259,7 @@ export const getSuggestionTargets = onRequest(
             avatarURL: profileSnap.get('avatarURL') ?? null,
             alreadySeen: gallerySnap.exists,
             alreadySuggested: suggestionSnap.exists,
-            suggestedAt: suggestedAt instanceof admin.firestore.Timestamp ?
+            suggestedAt: suggestedAt instanceof Timestamp ?
               suggestedAt.toDate().toISOString() : null,
           };
         }));
@@ -10348,9 +10374,9 @@ export const getPublicProfile = onRequest(
             }))
             .filter((row) => !!row.posterPath)
             .sort((a, b) => {
-              const ta = a.addedAt instanceof admin.firestore.Timestamp ?
+              const ta = a.addedAt instanceof Timestamp ?
                 a.addedAt.toMillis() : 0;
-              const tb = b.addedAt instanceof admin.firestore.Timestamp ?
+              const tb = b.addedAt instanceof Timestamp ?
                 b.addedAt.toMillis() : 0;
               return tb - ta;
             })
@@ -10547,7 +10573,7 @@ function parseCineMatchReplace(raw: unknown): CineMatchReplace | null {
  * Un remplacement ne crée pas de seconde séance : les remplaçants
  * rejoignent celle des cinq, pour que le lancement de l'un d'eux s'y
  * accroche comme celui des autres, et les films vus y sont notés.
- * @param {admin.firestore.CollectionReference} history La collection.
+ * @param {CollectionReference} history La collection.
  * @param {CineMatchReplace | null} replace Le remplacement, s'il y en a un.
  * @param {number[]} ids Les films proposés.
  * @param {Object[]} films Leur bloc d'historique.
@@ -10555,21 +10581,21 @@ function parseCineMatchReplace(raw: unknown): CineMatchReplace | null {
  * @return {Promise<string>} L'identifiant de la séance.
  */
 async function writeFiveHistory(
-    history: admin.firestore.CollectionReference,
+    history: CollectionReference,
     replace: CineMatchReplace | null,
     ids: number[],
     films: Record<string, unknown>[],
     answers: Record<string, unknown>,
 ): Promise<string> {
-  const now = admin.firestore.Timestamp.now();
+  const now = Timestamp.now();
   if (replace?.sessionId) {
     const ref = history.doc(replace.sessionId);
     const snap = await ref.get();
     if (snap.exists && snap.get('kind') === 'five') {
       await ref.set({
-        tmdbIds: admin.firestore.FieldValue.arrayUnion(...ids),
-        seenIds: admin.firestore.FieldValue.arrayUnion(...replace.seenIds),
-        films: admin.firestore.FieldValue.arrayUnion(
+        tmdbIds: FieldValue.arrayUnion(...ids),
+        seenIds: FieldValue.arrayUnion(...replace.seenIds),
+        films: FieldValue.arrayUnion(
             ...films.map((film) => ({...film, replacement: true}))),
         replacedAt: now,
       }, {merge: true});
@@ -10648,7 +10674,7 @@ function parseCineMatchComparisons(raw: unknown): engine.Comparison[] {
  * @return {number | null} Millisecondes.
  */
 function millisOf(value: unknown): number | null {
-  return value instanceof admin.firestore.Timestamp ? value.toMillis() : null;
+  return value instanceof Timestamp ? value.toMillis() : null;
 }
 
 /** Un film de la galerie, positionné, et ce qu'il faut pour l'afficher. */
@@ -10675,14 +10701,14 @@ interface CineMatchGallery {
  * encore leur position, comme le fait `getTasteProfile`. Un film sans
  * position n'est pas perdu : il reste exclu des propositions, et il
  * entrera dans les comparaisons à l'appel suivant.
- * @param {admin.firestore.Firestore} db Firestore.
- * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {Firestore} db Firestore.
+ * @param {DocumentReference} userRef Document utilisateur.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<CineMatchGallery>} La galerie lue.
  */
 async function loadCineMatchGallery(
-    db: admin.firestore.Firestore,
-    userRef: admin.firestore.DocumentReference,
+    db: Firestore,
+    userRef: DocumentReference,
     ctx: TMDBContext,
 ): Promise<CineMatchGallery> {
   const gallerySnap = await filmsIn(userRef.collection('gallery')).get();
@@ -10746,14 +10772,14 @@ const SERIES_GALLERY_META_BATCH = 15;
  * l'on a vu presque tout ce qui est sorti. Une série sans fiche encore n'est
  * pas perdue : elle reste écartée des propositions, et entrera dans les
  * comparaisons à l'appel suivant.
- * @param {admin.firestore.Firestore} db Firestore.
- * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {Firestore} db Firestore.
+ * @param {DocumentReference} userRef Document utilisateur.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<CineMatchGallery>} La galerie des séries.
  */
 async function loadSeriesGallery(
-    db: admin.firestore.Firestore,
-    userRef: admin.firestore.DocumentReference,
+    db: Firestore,
+    userRef: DocumentReference,
     ctx: TMDBContext,
 ): Promise<CineMatchGallery> {
   const snap = await userRef.collection('gallery')
@@ -10806,14 +10832,14 @@ async function loadSeriesGallery(
 
 /**
  * Les séries lâchées en route : identifiants et positions.
- * @param {admin.firestore.Firestore} db Firestore.
- * @param {admin.firestore.DocumentReference} userRef Document utilisateur.
+ * @param {Firestore} db Firestore.
+ * @param {DocumentReference} userRef Document utilisateur.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<Object>} Ce que le moteur écarte et ce dont il s'éloigne.
  */
 async function loadSeriesAbandons(
-    db: admin.firestore.Firestore,
-    userRef: admin.firestore.DocumentReference,
+    db: Firestore,
+    userRef: DocumentReference,
     ctx: TMDBContext,
 ): Promise<{ids: number[]; axes: engine.EngineAxes[]}> {
   const snap = await userRef.collection('taste').doc('seriesAbandons').get();
@@ -10883,7 +10909,7 @@ export const getCineMatchComparison = onRequest(
             loadCineMatchGallery(db, userRef, ctx),
           userRef.collection(cineMatchStoreFor(format).exposure)
               .where('posterLastShownAt', '>',
-                  admin.firestore.Timestamp.fromMillis(0))
+                  Timestamp.fromMillis(0))
               .get(),
         ]);
 
@@ -11046,12 +11072,12 @@ async function fetchCineMatchCatalogue(
 
 /**
  * Relit un document de watchlist sous la forme d'une ligne de vivier.
- * @param {admin.firestore.QueryDocumentSnapshot} doc Document.
+ * @param {QueryDocumentSnapshot} doc Document.
  * @return {DiscoverRow | null} Ligne, ou null pour une série ou un film
  *   sans identifiant.
  */
 function watchlistRowFrom(
-    doc: admin.firestore.QueryDocumentSnapshot,
+    doc: QueryDocumentSnapshot,
 ): DiscoverRow | null {
   if (doc.get('mediaType') === 'tv') return null;
   const id = doc.get('tmdbId');
@@ -11102,21 +11128,21 @@ interface CineMatchEvening {
 /**
  * Lit tout ce que la soirée sait déjà : galerie, watchlist, graphe de
  * préférence et journal d'exposition des quatorze derniers jours.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur.
  * @param {CineMatchSituationPayload} situation La soirée.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<CineMatchSetup>} La soirée, prête pour le vivier.
  */
 async function loadCineMatchSetup(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
     situation: CineMatchSituationPayload,
     ctx: TMDBContext,
 ): Promise<CineMatchSetup> {
   const now = Date.now();
   const userRef = db.collection('users').doc(uid);
-  const cutoff = admin.firestore.Timestamp.fromMillis(
+  const cutoff = Timestamp.fromMillis(
       now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
   );
   const [gallery, watchlistSnap, prefsSnap, exposureSnap] = await Promise.all([
@@ -11460,14 +11486,14 @@ const SERIES_PRIOR_MAX = 30;
  * Tout ce que la soirée sait déjà, côté séries : galerie des séries,
  * séries dans la file, duels, exposition, abandons, et les films aimés tant
  * qu'il le faut.
- * @param {admin.firestore.Firestore} db Firestore.
+ * @param {Firestore} db Firestore.
  * @param {string} uid Utilisateur.
  * @param {CineMatchSituationPayload} situation La soirée.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<CineMatchSetup>} La soirée, prête pour le vivier.
  */
 async function loadSeriesSetup(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     uid: string,
     situation: CineMatchSituationPayload,
     ctx: TMDBContext,
@@ -11475,7 +11501,7 @@ async function loadSeriesSetup(
   const now = Date.now();
   const userRef = db.collection('users').doc(uid);
   const store = cineMatchStoreFor('series');
-  const cutoff = admin.firestore.Timestamp.fromMillis(
+  const cutoff = Timestamp.fromMillis(
       now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
   );
   const [gallery, watchlistSnap, prefsSnap, exposureSnap, abandons] =
@@ -11646,7 +11672,7 @@ function engineSeriesFrom(meta: TvMeta, listed: boolean): engine.EngineFilm {
  * Compose le vivier des séries d'une soirée et l'enrichit. Le même
  * principe que celui des films : catalogue, graines, watchlist ; un
  * classement grossier choisit les séries qui méritent une fiche.
- * @param {admin.firestore.Firestore} db Firestore, pour le cache des fiches.
+ * @param {Firestore} db Firestore, pour le cache des fiches.
  * @param {CineMatchSetup} setup La soirée.
  * @param {CineMatchEvening} evening Les réponses.
  * @param {boolean} forceRelaxed Aller chercher hors durée et plateformes.
@@ -11654,7 +11680,7 @@ function engineSeriesFrom(meta: TvMeta, listed: boolean): engine.EngineFilm {
  * @return {Promise<Object>} Séries enrichies, et leurs fiches.
  */
 async function buildSeriesCandidates(
-    db: admin.firestore.Firestore,
+    db: Firestore,
     setup: CineMatchSetup,
     evening: CineMatchEvening,
     forceRelaxed: boolean,
@@ -12028,7 +12054,7 @@ export const getCineMatchDaily = onRequest(
           await Promise.all([
             dailyRef.set({date: today, tmdbId: meta.id, film}),
             userRef.collection(store.history).add({
-              createdAt: admin.firestore.Timestamp.now(),
+              createdAt: Timestamp.now(),
               kind: 'daily',
               tmdbIds: [meta.id],
               films: seriesHistoryFilms([pick], enriched),
@@ -12056,7 +12082,7 @@ export const getCineMatchDaily = onRequest(
         }
 
         const film = cineMatchFiveFilmJSON(candidate);
-        const now = admin.firestore.Timestamp.now();
+        const now = Timestamp.now();
         await Promise.all([
           dailyRef.set({date: today, tmdbId: candidate.id, film}),
           userRef.collection('recommendationHistory').add({
@@ -12119,14 +12145,14 @@ export const recordCineMatchExposure = onRequest(
         const exposureRef = db.collection('users').doc(uid)
             .collection(cineMatchStoreFor(cineMatchFormatOf(body.format))
                 .exposure);
-        const now = admin.firestore.Timestamp.now();
+        const now = Timestamp.now();
         const batch = db.batch();
         for (const tmdbId of ids) {
           const data = kind === 'poster' ?
             {tmdbId, posterLastShownAt: now} :
             {
               tmdbId,
-              shownCount: admin.firestore.FieldValue.increment(1),
+              shownCount: FieldValue.increment(1),
               lastShownAt: now,
             };
           batch.set(exposureRef.doc(String(tmdbId)), data, {merge: true});
