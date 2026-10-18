@@ -13403,6 +13403,10 @@ function dayOfYearFrom(day: string): number {
  * Il est tiré des cinq d'une soirée sans questions, et mémorisé : rouvrir
  * l'app ne doit pas le changer, sans quoi « du jour » ne voudrait rien
  * dire. Le jour est celui de Paris, comme partout ailleurs dans l'app.
+ *
+ * Une seule exception : `seenId`, le film du jour que la personne vient de
+ * ranger dans sa galerie (« Je l'ai déjà vu »). Il ne peut plus être sa
+ * proposition : on en tire une autre, qui devient celle du jour.
  */
 export const getCineMatchDaily = onRequest(
     {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
@@ -13421,13 +13425,25 @@ export const getCineMatchDaily = onRequest(
         const store = cineMatchStoreFor(format);
         const today = parisDay(new Date());
         const eveningId = eveningIdOf(body.eveningId);
+        const seenRaw = Number(body.seenId);
+        const seenId = Number.isInteger(seenRaw) && seenRaw > 0 ?
+          seenRaw : null;
+        // Le film vu est écarté même si la galerie ne le montre pas encore à
+        // la lecture : l'écriture de l'app peut avoir un temps de retard.
+        const excludeSeen = (setup: CineMatchSetup): CineMatchSetup =>
+          seenId === null ? setup : {
+            ...setup,
+            extraExcludedIds: [...(setup.extraExcludedIds ?? []), seenId],
+          };
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
         const dailyRef = userRef.collection('cinematch').doc(store.daily);
         const stored = await dailyRef.get();
         const storedFilm = stored.get('film');
-        if (stored.get('date') === today &&
+        const storedSeen = seenId !== null &&
+          Number(stored.get('tmdbId')) === seenId;
+        if (stored.get('date') === today && !storedSeen &&
             typeof storedFilm === 'object' && storedFilm !== null) {
           await journalEvening(userRef, format, eveningId, {
             type: 'daily', situation, served: [Number(stored.get('tmdbId'))],
@@ -13448,7 +13464,8 @@ export const getCineMatchDaily = onRequest(
         const dayIndex = ((dayOfYearFrom(today) % 5) + 5) % 5;
 
         if (format === 'series') {
-          const setup = await loadSeriesSetup(db, uid, situation, ctx);
+          const setup =
+            excludeSeen(await loadSeriesSetup(db, uid, situation, ctx));
           const result = await runSeriesPicks(db, setup, request, ctx);
           const top = result.picks
               .filter((pick) => result.enriched.has(pick.fiche.id));
@@ -13462,6 +13479,7 @@ export const getCineMatchDaily = onRequest(
           await Promise.all([
             journalEvening(userRef, format, eveningId, {
               type: 'daily', situation, served: [meta.id], cached: false,
+              afterSeen: seenId,
             }),
             dailyRef.set({date: today, tmdbId: meta.id, film}),
             userRef.collection(store.history).add({
@@ -13486,7 +13504,8 @@ export const getCineMatchDaily = onRequest(
             return null;
           }) : null;
         if (rt && engine.seededRandom(`${uid}:${today}:daily-engine`)() < 0.5) {
-          const daily = await carteDaily(db, rt, uid, situation, today, ctx)
+          const daily = await carteDaily(db, rt, uid, situation, today,
+              seenId, ctx)
               .catch((error) => {
                 logger.error('carteDaily failed', {error});
                 return null;
@@ -13497,7 +13516,8 @@ export const getCineMatchDaily = onRequest(
             await Promise.all([
               journalEvening(userRef, format, eveningId, {
                 type: 'daily', situation, served: [id], cached: false,
-                engine: 'carte', propensity: daily.propensity,
+                afterSeen: seenId, engine: 'carte',
+                propensity: daily.propensity,
               }),
               dailyRef.set({date: today, tmdbId: id, film, engine: 'carte'}),
               userRef.collection('recommendationHistory').add({
@@ -13517,7 +13537,8 @@ export const getCineMatchDaily = onRequest(
           }
         }
 
-        const setup = await loadCineMatchSetup(db, uid, situation, ctx);
+        const setup =
+          excludeSeen(await loadCineMatchSetup(db, uid, situation, ctx));
         const result = await runFilmPicks(db, setup, request, ctx);
         const top = result.picks
             .filter((pick) => result.enriched.has(pick.fiche.id));
@@ -13535,7 +13556,7 @@ export const getCineMatchDaily = onRequest(
         await Promise.all([
           journalEvening(userRef, format, eveningId, {
             type: 'daily', situation, served: [candidate.id], cached: false,
-            engine: 'fiche',
+            afterSeen: seenId, engine: 'fiche',
           }),
           dailyRef.set({date: today, tmdbId: candidate.id, film,
             engine: 'fiche'}),
@@ -15977,12 +15998,15 @@ async function carteNear(
  * @param {string} uid Le compte.
  * @param {CineMatchSituationPayload} situation La soirée.
  * @param {string} day Le jour, à Paris.
+ * @param {?number} seenId Le film du jour que la personne vient de ranger
+ *   dans sa galerie, écarté même si la galerie ne le montre pas encore.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
  * @return {Promise<?Object>} Le film et sa probabilité d'affichage.
  */
 async function carteDaily(
     db: Firestore, rt: CarteRuntime, uid: string,
-    situation: CineMatchSituationPayload, day: string, ctx: TMDBContext,
+    situation: CineMatchSituationPayload, day: string, seenId: number | null,
+    ctx: TMDBContext,
 ): Promise<{candidate: EnrichedCandidate; propensity: number | null} | null> {
   const userRef = db.collection('users').doc(uid);
   const now = Date.now();
@@ -16006,7 +16030,8 @@ async function carteDaily(
   const point = carteEveningPoint(rt, gallery, [], () => null);
   const filtered = carteCandidateRows(rt, {
     situation,
-    excluded: gallery.seen,
+    excluded: seenId === null ? gallery.seen :
+      new Set([...gallery.seen, seenId]),
     exposure,
     now,
     anchor: null,
