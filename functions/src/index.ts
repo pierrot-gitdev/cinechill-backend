@@ -2230,15 +2230,16 @@ export const enrichCandidates = onRequest(
 // ===========================================================================
 
 /**
- * Cooldown de base d'un film écarté, doublé à chaque nouveau skip.
+ * Durée pendant laquelle un film écarté (« pas vu ») ne revient pas dans le
+ * deck : quatre-vingt-dix jours, puis il est oublié.
  *
- * Quatre-vingt-dix jours, et non plus quatorze : un film qu'on n'a pas vu en
- * octobre, on ne l'a pas vu davantage début novembre, et le revoir au bout
- * de deux semaines lassait.
+ * Elle doublait à chaque nouveau skip, jusqu'à un an, avec un bouton
+ * « Remettre les films passés » dans les réglages pour rattraper ce qui
+ * avait été enterré trop loin. Une durée fixe rend le bouton inutile (choix
+ * de Pierre, 19 oct. 2026).
  */
-const SWIPE_SKIP_BASE_COOLDOWN_DAYS = 90;
-/** Plafond du cooldown : au-delà, le film ne revient plus en pratique. */
-const SWIPE_SKIP_MAX_COOLDOWN_DAYS = 365;
+const SWIPE_SKIP_COOLDOWN_DAYS = 90;
+const SWIPE_SKIP_COOLDOWN_MS = SWIPE_SKIP_COOLDOWN_DAYS * 24 * 3600 * 1000;
 /**
  * Cooldown d'un opus déduit d'un « pas vu » sur la tête de sa saga. C'est
  * une déduction, pas une déclaration, et elle doit s'oublier vite.
@@ -3807,8 +3808,14 @@ async function fetchSwipeExclusions(
   for (const doc of tvGallerySnap.docs) add(tvExcluded, doc);
   for (const doc of tvWatchlistSnap.docs) add(tvExcluded, doc);
   // Les écarts antérieurs aux séries n'ont pas de `mediaType` : ce sont tous
-  // des films.
+  // des films. Ceux écrits avant la durée fixe portent parfois un
+  // `resurfaceAt` à six mois ou un an : c'est la date du skip qui décide,
+  // pour qu'ils soient oubliés comme les autres.
+  const forgottenBefore = now.toMillis() - SWIPE_SKIP_COOLDOWN_MS;
   for (const doc of skipsSnap.docs) {
+    const skippedAt = doc.get('lastSkippedAt');
+    if (skippedAt instanceof Timestamp &&
+      skippedAt.toMillis() < forgottenBefore) continue;
     add(doc.get('mediaType') === 'tv' ? tvExcluded : excluded, doc);
   }
 
@@ -4418,21 +4425,6 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
 }
 
 /**
- * Cooldown avant qu'un film écarté puisse revenir : 90 jours, doublés à chaque
- * nouveau skip, plafonnés à 365. Un film écarté une fois revient dans trois
- * mois ; au troisième skip il sort de fait du feed.
- * @param {number} skipCount Nombre total de skips après celui-ci.
- * @return {number} Cooldown en millisecondes.
- */
-function skipCooldownMillis(skipCount: number): number {
-  const days = Math.min(
-      SWIPE_SKIP_MAX_COOLDOWN_DAYS,
-      SWIPE_SKIP_BASE_COOLDOWN_DAYS * Math.pow(2, Math.max(0, skipCount - 1)),
-  );
-  return days * 24 * 3600 * 1000;
-}
-
-/**
  * Enregistre un lot de décisions de swipe. Le client swipe plus vite qu'un
  * aller-retour réseau : il accumule localement et flushe par paquets, l'UI
  * n'attend jamais cette écriture.
@@ -4465,25 +4457,6 @@ export const recordSwipes = onRequest(
         const db = a.firestore();
         const userRef = db.collection('users').doc(uid);
         const now = Timestamp.now();
-
-        // Le cooldown dépend du nombre de skips déjà encaissés : une lecture
-        // groupée en amont évite une transaction par film. Une case laissée
-        // vide n'écarte rien : elle n'a pas de cooldown.
-        const skippedIds = decisions
-            .filter((d) => d.decision === 'skipped' && !d.soft)
-            .map((d) => d.item.id);
-        const previousSkipCounts = new Map<string, number>();
-        if (skippedIds.length > 0) {
-          const refs = Array.from(new Set(skippedIds))
-              .map((id) => userRef.collection('swipeSkips').doc(id));
-          const snaps = await db.getAll(...refs);
-          for (const snap of snaps) {
-            const count = snap.get('skipCount');
-            previousSkipCounts.set(
-                snap.id, typeof count === 'number' ? count : 0,
-            );
-          }
-        }
 
         // L'écriture « seen » remplace le document : sans cette lecture, un
         // film re-balayé perdrait le coup de cœur et le pays d'origine qu'il
@@ -4610,16 +4583,16 @@ export const recordSwipes = onRequest(
           if (soft) continue;
 
           if (decision === 'skipped') {
-            const skipCount = (previousSkipCounts.get(item.id) ?? 0) + 1;
+            // Une case laissée vide n'arrive pas ici : elle n'écarte rien.
             batch.set(skipRef, {
               tmdbId: item.tmdbId,
               // Sans lui, un « pas vue » sur la série 1399 écarterait le film
               // 1399 : les deux espaces d'identifiants se recoupent.
               mediaType: item.mediaType,
-              skipCount,
+              skipCount: FieldValue.increment(1),
               lastSkippedAt: now,
               resurfaceAt: Timestamp.fromMillis(
-                  now.toMillis() + skipCooldownMillis(skipCount),
+                  now.toMillis() + SWIPE_SKIP_COOLDOWN_MS,
               ),
             }, {merge: true});
             if (isFilm) {
@@ -5052,71 +5025,11 @@ export const getDeckSheet = onRequest(
 );
 
 // ===========================================================================
-// Compte — resetSwipeSkips / deleteAccount
+// Compte — deleteAccount
 // ===========================================================================
 
 /** Documents supprimés par lot, sous la limite de 500 d'un batch Firestore. */
 const DELETE_BATCH_SIZE = 400;
-
-/**
- * Supprime tous les documents d'une collection, par lots.
- * @param {Firestore} db Firestore.
- * @param {CollectionReference} ref Collection à vider.
- * @return {Promise<number>} Nombre de documents supprimés.
- */
-async function deleteCollection(
-    db: Firestore,
-    ref: CollectionReference,
-): Promise<number> {
-  let deleted = 0;
-  for (;;) {
-    const snap = await ref.limit(DELETE_BATCH_SIZE).get();
-    if (snap.empty) return deleted;
-
-    const batch = db.batch();
-    for (const doc of snap.docs) batch.delete(doc.ref);
-    await batch.commit();
-    deleted += snap.size;
-
-    if (snap.size < DELETE_BATCH_SIZE) return deleted;
-  }
-}
-
-/**
- * Remet en jeu tous les films écartés au swipe.
- *
- * Le cooldown peut enterrer un film jusqu'à 180 jours et rien, côté client, ne
- * permettait de revenir dessus — un aller sans retour qu'on ne peut pas
- * laisser sans issue.
- */
-export const resetSwipeSkips = onRequest(
-    {invoker: 'public', timeoutSeconds: 60},
-    async (req: Request, res: Response) => {
-      try {
-        if (req.method !== 'POST') {
-          res.status(405).json({error: 'method_not_allowed'});
-          return;
-        }
-        const uid = await verifyAuth(req, res);
-        if (!uid) return;
-
-        const a = getAdmin();
-        const db = a.firestore();
-        const deleted = await deleteCollection(
-            db, db.collection('users').doc(uid).collection('swipeSkips'),
-        );
-        // Le vivier en cache a été construit sans les films qu'on vient de
-        // rendre : il se refait à la prochaine demande.
-        await db.collection('users').doc(uid)
-            .collection('preferences').doc('deckPool').delete();
-
-        res.status(200).json({ok: true, deleted});
-      } catch (error) {
-        logger.error('resetSwipeSkips failed', {error});
-        res.status(500).json({error: 'internal_error'});
-      }
-    },
-);
 
 /**
  * Referme le lien de suivi des deux côtés avant la suppression d'un compte.
