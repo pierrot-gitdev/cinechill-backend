@@ -2320,29 +2320,6 @@ function parseSigma(raw: unknown): AxisVector {
   return out;
 }
 
-/**
- * Le graphe de préférence (C2), relu : un score type Elo par film de la
- * Galerie, construit duel après duel.
- * @param {DocumentSnapshot} snap Document `taste/filmPrefs`.
- * @return {Map<number, number>} Score par tmdbId.
- */
-function parseFilmPrefs(
-    snap: DocumentSnapshot,
-): Map<number, number> {
-  const prefs = new Map<number, number>();
-  if (!snap.exists) return prefs;
-  const data = snap.data() ?? {};
-  for (const [key, value] of Object.entries(data)) {
-    const tmdbId = Number(key);
-    if (!Number.isFinite(tmdbId)) continue;
-    const rating = (value as {r?: unknown} | null)?.r;
-    if (typeof rating === 'number' && Number.isFinite(rating)) {
-      prefs.set(tmdbId, rating);
-    }
-  }
-  return prefs;
-}
-
 /** Les sorties d'un film dans un pays, telles que `release_dates` les rend. */
 interface ReleaseDatesByCountry {
   iso_3166_1?: string;
@@ -2986,46 +2963,6 @@ export const recordSessionOutcome = onRequest(
 );
 
 /* ===================================================================== *
- *  Le graphe de préférence (C2) : les duels entre films vus
- * ===================================================================== */
-
-/** Le score de départ d'un film jamais duellé. */
-const ELO_START = 1000;
-/** Ce que vaut un « resté avec moi » : un duel gagné d'office, l'ordre de
- * grandeur d'une victoire nette contre le champ. */
-const ELO_STAYED_BONUS = 40;
-
-/**
- * Ajoute d'office des points à un film du graphe — le chemin du verdict.
- * @param {DocumentReference} userRef Le document utilisateur.
- * @param {number} tmdbId Le film.
- * @param {number} delta Les points à ajouter.
- * @param {string} prefsDoc Le graphe : `filmPrefs` ou `seriesPrefs`.
- */
-async function bumpFilmPref(
-    userRef: DocumentReference,
-    tmdbId: number,
-    delta: number,
-    prefsDoc = 'filmPrefs',
-): Promise<void> {
-  const prefsRef = userRef.collection('taste').doc(prefsDoc);
-  await prefsRef.firestore.runTransaction(async (txn) => {
-    const snap = await txn.get(prefsRef);
-    const entry = (snap.get(String(tmdbId)) ?? {}) as Record<string, unknown>;
-    const rating = typeof entry.r === 'number' ? entry.r : ELO_START;
-    const wins = typeof entry.w === 'number' ? entry.w : 0;
-    txn.set(prefsRef, {
-      [String(tmdbId)]: {
-        r: rating + delta,
-        w: wins + 1,
-        l: typeof entry.l === 'number' ? entry.l : 0,
-        at: Timestamp.now(),
-      },
-    }, {merge: true});
-  });
-}
-
-/* ===================================================================== *
  *  La passe de rattrapage : l'existant rejoint la V3
  * ===================================================================== */
 
@@ -3093,7 +3030,6 @@ export const backfillGallery = onRequest(
                 lovedAt: launched?.at instanceof Timestamp ?
                   launched.at : Timestamp.now(),
               }, {merge: true});
-              await bumpFilmPref(userRef, tmdbId, ELO_STAYED_BONUS);
               hearts += 1;
             }
           }
@@ -9736,7 +9672,7 @@ const CINEMATCH_ENGAGEMENTS: readonly engine.Engagement[] =
 
 /**
  * Films ou séries : deux profils qui ne se mêlent pas. Chacun a son journal
- * d'exposition, son graphe de duels, son historique et sa proposition du
+ * d'exposition, son historique, son journal des soirées et sa proposition du
  * jour. Les identifiants TMDB des films et des séries se recoupent : un
  * stockage commun prendrait l'un pour l'autre.
  */
@@ -9745,7 +9681,6 @@ type CineMatchFormat = 'film' | 'series';
 /** Où vit chaque profil, document ou collection. */
 interface CineMatchStore {
   exposure: string;
-  prefs: string;
   history: string;
   /** Le journal des soirées, écran par écran (voir `journalEvening`). */
   evenings: string;
@@ -9770,13 +9705,11 @@ function cineMatchFormatOf(raw: unknown): CineMatchFormat {
 function cineMatchStoreFor(format: CineMatchFormat): CineMatchStore {
   return format === 'series' ? {
     exposure: 'cinematchSeriesExposure',
-    prefs: 'seriesPrefs',
     history: 'seriesHistory',
     evenings: 'seriesEvenings',
     daily: 'dailySeries',
   } : {
     exposure: 'cinematchExposure',
-    prefs: 'filmPrefs',
     history: 'recommendationHistory',
     evenings: 'cinematchEvenings',
     daily: 'daily',
@@ -10341,7 +10274,6 @@ interface CineMatchSetup {
   gallery: CineMatchGallery;
   watchlistRows: DiscoverRow[];
   watchlistIds: Set<number>;
-  prefs: Map<number, number>;
   exposure: Map<number, engine.ExposureRecord>;
   now: number;
   /** Séries : les positions des séries abandonnées. */
@@ -10372,10 +10304,9 @@ async function loadCineMatchSetup(
   const cutoff = Timestamp.fromMillis(
       now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
   );
-  const [gallery, watchlistSnap, prefsSnap, exposureSnap] = await Promise.all([
+  const [gallery, watchlistSnap, exposureSnap] = await Promise.all([
     loadCineMatchGallery(db, userRef, ctx),
     filmsIn(userRef.collection('watchlist')).get(),
-    userRef.collection('taste').doc('filmPrefs').get(),
     userRef.collection('cinematchExposure')
         .where('lastShownAt', '>=', cutoff).get(),
   ]);
@@ -10401,7 +10332,6 @@ async function loadCineMatchSetup(
     gallery,
     watchlistRows,
     watchlistIds: new Set(watchlistRows.map((row) => row.id)),
-    prefs: parseFilmPrefs(prefsSnap),
     exposure,
     now,
   };
@@ -10480,11 +10410,10 @@ async function loadSeriesSetup(
   const cutoff = Timestamp.fromMillis(
       now - engine.EXPOSURE_MEMORY_DAYS * 24 * 3600 * 1000,
   );
-  const [gallery, watchlistSnap, prefsSnap, exposureSnap, abandons] =
+  const [gallery, watchlistSnap, exposureSnap, abandons] =
     await Promise.all([
       loadSeriesGallery(db, userRef, ctx),
       userRef.collection('watchlist').where('mediaType', '==', 'tv').get(),
-      userRef.collection('taste').doc(store.prefs).get(),
       userRef.collection(store.exposure)
           .where('lastShownAt', '>=', cutoff).get(),
       loadSeriesAbandons(db, userRef, ctx),
@@ -10540,7 +10469,6 @@ async function loadSeriesSetup(
     gallery,
     watchlistRows: [],
     watchlistIds,
-    prefs: parseFilmPrefs(prefsSnap),
     exposure,
     now,
     avoided: abandons.axes,
