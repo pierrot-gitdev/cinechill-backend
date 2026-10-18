@@ -1997,10 +1997,8 @@ function seriesDoorStateFrom(
 
 /**
  * L'état des deux Portes de CinéMatch, mesuré sur la galerie et la watchlist.
- * Le nom date du trait à huit axes que l'appel renvoyait aussi ; l'app ne
- * lit plus que les Portes.
  */
-export const getTasteProfile = onRequest(
+export const getDoors = onRequest(
     {invoker: 'public', timeoutSeconds: 30},
     async (req: Request, res: Response) => {
       try {
@@ -2026,7 +2024,7 @@ export const getTasteProfile = onRequest(
           series_door: seriesDoorStateFrom(tvGallerySnap, tvWatchlistSnap),
         });
       } catch (error) {
-        logger.error('getTasteProfile failed', {error});
+        logger.error('getDoors failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
     },
