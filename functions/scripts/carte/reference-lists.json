@@ -1,0 +1,74 @@
+{
+  "note": "Listes écrites le 18 octobre 2026, avant tout calcul de la carte. Pour chaque film de départ, des films qu'on accepterait volontiers comme « un film proche de ». Elles servent à vérifier qu'une version du moteur ne casse rien, jamais à classer deux moteurs (règle de l'audit du 13 octobre). Les films d'une même saga que le film de départ sont exclus du calcul, pas des listes.",
+  "anchors": [
+    {"title": "Heat", "year": 1995, "good": [
+      ["Collateral", 2004], ["The Town", 2010], ["Thief", 1981], ["Sicario", 2015], ["Hell or High Water", 2016],
+      ["Miami Vice", 2006], ["Ronin", 1998], ["The Departed", 2006], ["Point Break", 1991], ["Den of Thieves", 2018],
+      ["The Usual Suspects", 1995], ["Reservoir Dogs", 1992], ["Public Enemies", 2009], ["Inside Man", 2006],
+      ["L.A. Confidential", 1997], ["Drive", 2011], ["Training Day", 2001]]},
+    {"title": "Interstellar", "year": 2014, "good": [
+      ["Arrival", 2016], ["Gravity", 2013], ["The Martian", 2015], ["Contact", 1997], ["Inception", 2010],
+      ["2001: A Space Odyssey", 1968], ["Ad Astra", 2019], ["Sunshine", 2007], ["Moon", 2009], ["Dune", 2021],
+      ["Blade Runner 2049", 2017], ["Annihilation", 2018], ["Solaris", 1972], ["Close Encounters of the Third Kind", 1977],
+      ["Tenet", 2020], ["First Man", 2018]]},
+    {"title": "Amélie", "year": 2001, "good": [
+      ["Delicatessen", 1991], ["The City of Lost Children", 1995], ["Midnight in Paris", 2011], ["The Grand Budapest Hotel", 2014],
+      ["Big Fish", 2003], ["Chocolat", 2000], ["Micmacs", 2009], ["The Science of Sleep", 2006], ["Moonrise Kingdom", 2012],
+      ["Paris, je t'aime", 2006], ["Eternal Sunshine of the Spotless Mind", 2004], ["Mood Indigo", 2013], ["The Chorus", 2004],
+      ["Cinema Paradiso", 1988], ["Little Miss Sunshine", 2006]]},
+    {"title": "Spirited Away", "year": 2001, "good": [
+      ["Howl's Moving Castle", 2004], ["Princess Mononoke", 1997], ["My Neighbor Totoro", 1988], ["Kiki's Delivery Service", 1989],
+      ["Ponyo", 2008], ["Castle in the Sky", 1986], ["The Boy and the Heron", 2023], ["Nausicaä of the Valley of the Wind", 1984],
+      ["Wolf Children", 2012], ["Your Name.", 2016], ["The Wind Rises", 2013], ["Coraline", 2009], ["Song of the Sea", 2014],
+      ["Suzume", 2022], ["Whisper of the Heart", 1995]]},
+    {"title": "What's in a Name?", "year": 2012, "good": [
+      ["The Dinner Game", 1998], ["Carnage", 2011], ["C'est la vie!", 2017], ["Little White Lies", 2010], ["The Intouchables", 2011],
+      ["Sink or Swim", 2018], ["Perfect Strangers", 2016], ["The Best Is Yet to Come", 2019], ["Daddy or Mommy", 2015],
+      ["Serial (Bad) Weddings", 2014], ["The Taste of Others", 2000], ["Barbecue", 2014], ["Nothing to Declare", 2010]]},
+    {"title": "La La Land", "year": 2016, "good": [
+      ["Whiplash", 2014], ["Singin' in the Rain", 1952], ["The Umbrellas of Cherbourg", 1964], ["Once", 2007], ["Begin Again", 2013],
+      ["Moulin Rouge!", 2001], ["A Star Is Born", 2018], ["Sing Street", 2016], ["Before Sunrise", 1995], ["Crazy, Stupid, Love.", 2011],
+      ["Chicago", 2002], ["Babylon", 2022], ["500 Days of Summer", 2009], ["Past Lives", 2023], ["The Greatest Showman", 2017]]},
+    {"title": "Parasite", "year": 2019, "good": [
+      ["Memories of Murder", 2003], ["Mother", 2009], ["The Handmaiden", 2016], ["Burning", 2018], ["Oldboy", 2003],
+      ["Snowpiercer", 2013], ["Shoplifters", 2018], ["Us", 2019], ["Get Out", 2017], ["Knives Out", 2019], ["I Saw the Devil", 2010],
+      ["Decision to Leave", 2022], ["The Wailing", 2016], ["Triangle of Sadness", 2022]]},
+    {"title": "Mad Max: Fury Road", "year": 2015, "good": [
+      ["Dredd", 2012], ["The Raid", 2011], ["John Wick", 2014], ["Edge of Tomorrow", 2014], ["Children of Men", 2006],
+      ["Logan", 2017], ["District 9", 2009], ["Snowpiercer", 2013], ["Apocalypto", 2006], ["300", 2006], ["Gladiator", 2000],
+      ["Dune", 2021], ["Terminator 2: Judgment Day", 1991], ["The Road", 2009]]},
+    {"title": "Whiplash", "year": 2014, "good": [
+      ["Black Swan", 2010], ["La La Land", 2016], ["Birdman or (The Unexpected Virtue of Ignorance)", 2014], ["The Social Network", 2010],
+      ["Nightcrawler", 2014], ["Amadeus", 1984], ["Uncut Gems", 2019], ["TÁR", 2022], ["Dead Poets Society", 1989],
+      ["Good Will Hunting", 1997], ["Sound of Metal", 2020], ["Shine", 1996], ["Foxcatcher", 2014], ["The Wrestler", 2008]]},
+    {"title": "Prisoners", "year": 2013, "good": [
+      ["Zodiac", 2007], ["Gone Girl", 2014], ["Mystic River", 2003], ["Se7en", 1995], ["Sicario", 2015], ["Gone Baby Gone", 2007],
+      ["The Silence of the Lambs", 1991], ["Memories of Murder", 2003], ["Shutter Island", 2010], ["Enemy", 2013], ["Wind River", 2017],
+      ["Incendies", 2010], ["The Girl with the Dragon Tattoo", 2011], ["Nightcrawler", 2014]]},
+    {"title": "Get Out", "year": 2017, "good": [
+      ["Us", 2019], ["Nope", 2022], ["Hereditary", 2018], ["The Invisible Man", 2020], ["It Follows", 2015], ["Midsommar", 2019],
+      ["Rosemary's Baby", 1968], ["The Stepford Wives", 1975], ["Parasite", 2019], ["Barbarian", 2022], ["Smile", 2022],
+      ["The Babadook", 2014], ["Split", 2017], ["Ready or Not", 2019], ["The Witch", 2015]]},
+    {"title": "The Grand Budapest Hotel", "year": 2014, "good": [
+      ["Moonrise Kingdom", 2012], ["The Royal Tenenbaums", 2001], ["Fantastic Mr. Fox", 2009], ["The French Dispatch", 2021],
+      ["Isle of Dogs", 2018], ["Amélie", 2001], ["Asteroid City", 2023], ["The Darjeeling Limited", 2007], ["Rushmore", 1998],
+      ["The Life Aquatic with Steve Zissou", 2004], ["Big Fish", 2003], ["Hugo", 2011], ["Paddington 2", 2017], ["Knives Out", 2019],
+      ["Midnight in Paris", 2011]]},
+    {"title": "The Dark Knight", "year": 2008, "good": [
+      ["Joker", 2019], ["The Batman", 2022], ["Inception", 2010], ["Heat", 1995], ["Logan", 2017], ["The Prestige", 2006],
+      ["Sicario", 2015], ["V for Vendetta", 2006], ["Watchmen", 2009], ["Se7en", 1995], ["Skyfall", 2012], ["Casino Royale", 2006],
+      ["Gladiator", 2000], ["The Departed", 2006], ["Collateral", 2004]]},
+    {"title": "Before Sunrise", "year": 1995, "good": [
+      ["Lost in Translation", 2003], ["Eternal Sunshine of the Spotless Mind", 2004], ["Past Lives", 2023], ["Call Me by Your Name", 2017],
+      ["500 Days of Summer", 2009], ["Once", 2007], ["Her", 2013], ["Blue Valentine", 2010], ["The Worst Person in the World", 2021],
+      ["In the Mood for Love", 2000], ["When Harry Met Sally...", 1989], ["Like Crazy", 2011], ["Weekend", 2011]]},
+    {"title": "Ratatouille", "year": 2007, "good": [
+      ["Up", 2009], ["WALL·E", 2008], ["Coco", 2017], ["Inside Out", 2015], ["Finding Nemo", 2003], ["The Incredibles", 2004],
+      ["Toy Story", 1995], ["Paddington", 2014], ["Chef", 2014], ["Monsters, Inc.", 2001], ["Kiki's Delivery Service", 1989],
+      ["Zootopia", 2016], ["Soul", 2020], ["How to Train Your Dragon", 2010], ["The Mitchells vs. the Machines", 2021]]},
+    {"title": "Arrival", "year": 2016, "good": [
+      ["Contact", 1997], ["Interstellar", 2014], ["Annihilation", 2018], ["Close Encounters of the Third Kind", 1977], ["Sicario", 2015],
+      ["Incendies", 2010], ["Prisoners", 2013], ["Ex Machina", 2015], ["Her", 2013], ["Blade Runner 2049", 2017], ["Dune", 2021],
+      ["Gravity", 2013], ["Moon", 2009], ["Solaris", 1972], ["Enemy", 2013]]}
+  ]
+}

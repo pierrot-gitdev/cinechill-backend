@@ -1,5 +1,6 @@
 import {setGlobalOptions} from 'firebase-functions/v2/options';
 import {onRequest, Request} from 'firebase-functions/v2/https';
+import {onSchedule} from 'firebase-functions/v2/scheduler';
 import {defineSecret, defineString} from 'firebase-functions/params';
 import * as logger from 'firebase-functions/logger';
 import {Response} from 'express';
@@ -25,6 +26,9 @@ import * as engine from './cinematch/engine';
 import * as fiche from './cinematch/fiche';
 import * as series from './series';
 import * as deck from './deck/engine';
+import {CARTE_DETAIL_APPEND, DiscoverPage} from './carte/catalog';
+import {CarteSource} from './carte/pipeline';
+import * as carteStore from './carte/store';
 
 /**
  * Les trois services de l'Admin SDK dont le backend se sert, sous la forme
@@ -15549,5 +15553,84 @@ export const getCineMatchPicks = onRequest(
         logger.error('getCineMatchPicks failed', {error});
         res.status(500).json({error: 'internal_error'});
       }
+    },
+);
+
+/* ===================================================================== *
+ *  La carte des films, recalculée chaque semaine
+ *
+ *  Le calcul lui-même vit dans `carte/` ; ici, seulement le client TMDB de
+ *  la tâche et son horaire. Le lundi à 4 h : la nuit la plus creuse de la
+ *  semaine, loin des soirées. Quand les utilisateurs seront nombreux, elle
+ *  passera chaque nuit (décision du 18 octobre 2026).
+ * ===================================================================== */
+
+/** Les fiches et les listes n'ont pas de texte : la langue n'y change rien. */
+const CARTE_LANGUAGE = 'en-US';
+
+/**
+ * Le client TMDB de la tâche. Il ne passe pas par le cache des points
+ * d'entrée : vingt mille réponses lues une fois chacune n'ont rien à y
+ * faire, et elles en chasseraient tout le reste. Une réponse 429 ou 5xx est
+ * retentée deux fois, après une et trois secondes ; une fiche absente (404)
+ * rend null.
+ * @param {string} token Le jeton TMDB.
+ * @return {CarteSource} Le client.
+ */
+function carteSource(token: string): CarteSource {
+  const get = async (
+      path: string, query: Record<string, string>,
+  ): Promise<Record<string, unknown> | null> => {
+    const params = new URLSearchParams({language: CARTE_LANGUAGE, ...query});
+    const url = `${TMDB_BASE}${path}?${params.toString()}`;
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(url, {
+        headers: {Authorization: `Bearer ${token}`, Accept: 'application/json'},
+        signal: AbortSignal.timeout(TMDB_TIMEOUT_MS),
+      });
+      if (response.status === 404) return null;
+      if (response.ok) {
+        return await response.json() as Record<string, unknown>;
+      }
+      const retry = response.status === 429 || response.status >= 500;
+      if (!retry || attempt >= 2) {
+        throw new TMDBRequestError(response.status, await response.text());
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1000 + 2000 * attempt));
+    }
+  };
+  return {
+    discover: async (query) => {
+      const page = await get('/discover/movie', query);
+      if (!page) throw new TMDBRequestError(404, '/discover/movie');
+      return page as unknown as DiscoverPage;
+    },
+    providers: async () => {
+      const list = await get('/watch/providers/movie', {watch_region: 'FR'});
+      return Array.isArray(list?.results) ?
+        list.results as {provider_id: number; provider_name: string}[] : [];
+    },
+    movie: (id) =>
+      get(`/movie/${id}`, {append_to_response: CARTE_DETAIL_APPEND}),
+  };
+}
+
+export const rebuildCarte = onSchedule(
+    {
+      schedule: 'every monday 04:00',
+      timeZone: 'Europe/Paris',
+      secrets: [tmdbApiKey],
+      // La première carte lit les 17 500 fiches : une dizaine de minutes. Les
+      // suivantes n'en relisent qu'une centaine.
+      timeoutSeconds: 1800,
+      memory: '2GiB',
+      retryCount: 0,
+    },
+    async () => {
+      const result = await carteStore.runCarteBuild(
+          getAdmin().firestore(), carteSource(tmdbApiKey.value()),
+          {budgetMs: 20 * 60 * 1000, concurrency: 12});
+      logger.info('Carte recalculée', result);
     },
 );
