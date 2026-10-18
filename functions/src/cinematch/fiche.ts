@@ -908,8 +908,12 @@ export function nearFilms(
     loved: Set<number>,
     count = 6,
 ): number[] {
+  // Un film de la même saga que le premier n'ouvre aucune direction :
+  // choisir Kill Bill 2 après Kill Bill 1 ne dit rien de plus.
+  const saga = anchor.collection;
   const scored = others
-      .filter((other) => other.id !== anchor.id)
+      .filter((other) => other.id !== anchor.id &&
+        (saga === null || other.collection !== saga))
       .map((other) => ({
         fiche: other,
         similarity: comparer.similarity(anchor, other),
