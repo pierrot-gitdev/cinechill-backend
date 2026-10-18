@@ -12412,24 +12412,6 @@ async function notifyNewFollower(
  *  préférence) et écrire ce que la soirée laisse derrière elle.
  * ===================================================================== */
 
-/** Films enrichis avant le moteur, au plus : un appel de fiche chacun. */
-const CINEMATCH_ENRICH_MAX = 60;
-/**
- * En deçà de ce nombre de films conformes dans le catalogue, on va chercher
- * aussi hors des plateformes et de la durée demandées. Sans ça, le moteur
- * n'aurait rien sous la main pour élargir, et l'élargissement ne serait
- * qu'une promesse.
- */
-const CINEMATCH_STRICT_FLOOR = 40;
-/** Les graines personnelles : têtes du graphe puis coups de cœur récents. */
-const CINEMATCH_SEED_COUNT = 8;
-const CINEMATCH_SEED_TAKE = 12;
-/**
- * Les lignes personnelles (graines, watchlist) admises à l'enrichissement.
- * Elles n'ont traversé aucun filtre de plateforme ni de durée : sans
- * plafond, elles prendraient la place de films qui, eux, conviennent.
- */
-const CINEMATCH_PERSONAL_MAX = 20;
 /** La watchlist n'a qu'une place dans les cinq : inutile d'en enrichir plus. */
 const CINEMATCH_WATCHLIST_MAX = 8;
 /** Le plancher de votes du vivier : assez pour que la fiche soit fiable. */
@@ -12443,9 +12425,6 @@ const CINEMATCH_COMPANIES: readonly engine.Company[] =
   ['alone', 'duo', 'family'];
 const CINEMATCH_DURATIONS: readonly engine.Duration[] =
   ['short', 'medium', 'long', 'any'];
-const CINEMATCH_WANTS: readonly engine.Want[] =
-  ['light', 'soft', 'suspense', 'think', 'feelgood', 'everyone'];
-const CINEMATCH_ENERGIES: readonly engine.Energy[] = ['low', 'high'];
 const CINEMATCH_ENGAGEMENTS: readonly engine.Engagement[] =
   ['mini', 'season', 'long', 'any'];
 
@@ -12664,31 +12643,6 @@ interface CineMatchReplace {
 }
 
 /**
- * Relit le bloc `replace` d'une demande de cinq films.
- *
- * On peut avoir vu plusieurs des cinq : l'app les marque d'abord, sans
- * rien demander, puis demande une seule fois leurs remplaçants. Les films
- * gardés restent à leur place côté app ; le serveur ne renvoie que les
- * remplaçants, un par film vu.
- * @param {unknown} raw Bloc `replace` du corps de requête.
- * @return {CineMatchReplace | null} Le remplacement, ou `null`.
- */
-function parseCineMatchReplace(raw: unknown): CineMatchReplace | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const record = raw as Record<string, unknown>;
-  const seenIds = parseTmdbIdList(record.seenIds, 5);
-  if (seenIds.length === 0) return null;
-  const sessionId = typeof record.sessionId === 'string' &&
-    /^[A-Za-z0-9]{1,64}$/.test(record.sessionId) ? record.sessionId : null;
-  return {
-    sessionId,
-    keepIds: parseTmdbIdList(record.keepIds, 5)
-        .filter((id) => !seenIds.includes(id)),
-    seenIds,
-  };
-}
-
-/**
  * Écrit la séance des cinq, ou la complète pour un remplacement.
  *
  * Un remplacement ne crée pas de seconde séance : les remplaçants
@@ -12762,37 +12716,6 @@ function parseCineMatchSituation(raw: unknown): CineMatchSituationPayload {
     watchRegion: region,
     engagement: oneOf(record.engagement, CINEMATCH_ENGAGEMENTS) ?? 'any',
   };
-}
-
-/**
- * Relit les comparaisons jouées. Une comparaison malformée est ignorée
- * plutôt que refusée : elle ne fait qu'apprendre moins.
- * @param {unknown} raw Liste brute.
- * @return {engine.Comparison[]} Comparaisons valides, dans l'ordre.
- */
-function parseCineMatchComparisons(raw: unknown): engine.Comparison[] {
-  if (!Array.isArray(raw)) return [];
-  const out: engine.Comparison[] = [];
-  for (const item of raw.slice(0, 50)) {
-    if (typeof item !== 'object' || item === null) continue;
-    const record = item as Record<string, unknown>;
-    if (record.kind === 'pick') {
-      const keptId = Number(record.keptId);
-      const excludedId = Number(record.excludedId);
-      if (!Number.isInteger(keptId) || !Number.isInteger(excludedId) ||
-          keptId === excludedId) {
-        continue;
-      }
-      const latency = Number(record.latencyMs);
-      out.push({
-        kind: 'pick', keptId, excludedId,
-        latencyMs: Number.isFinite(latency) ? latency : Infinity,
-      });
-    } else if (record.kind === 'none') {
-      out.push({kind: 'none', shownIds: parseTmdbIdList(record.shownIds, 20)});
-    }
-  }
-  return out;
 }
 
 /**
@@ -13123,16 +13046,6 @@ interface CineMatchSetup {
   priorAnchors?: {axes: engine.EngineAxes; genreIds: number[]}[];
 }
 
-/** Ce que la soirée demande, questions comprises. */
-interface CineMatchEvening {
-  want: engine.Want | null;
-  energy: engine.Energy | null;
-  /** Séries : le temps total accepté, à la place de l'énergie. */
-  engagement?: engine.Engagement | null;
-  comparisons: engine.Comparison[];
-  hesitations: number;
-}
-
 /**
  * Lit tout ce que la soirée sait déjà : galerie, watchlist, graphe de
  * préférence et journal d'exposition des quatorze derniers jours.
@@ -13198,230 +13111,6 @@ function yearOf(date: string | null | undefined): number | null {
   return Number.isInteger(year) && year > 1800 ? year : null;
 }
 
-/** Le vivier enrichi, prêt pour le moteur. */
-interface CineMatchCandidates {
-  films: engine.EngineFilm[];
-  enriched: Map<number, EnrichedCandidate>;
-  relaxed: boolean;
-}
-
-/**
- * Compose le vivier d'une soirée et l'enrichit.
- *
- * Trois sources : le catalogue filtré par TMDB, les graines personnelles
- * (voisinage des films qu'on relance et des coups de cœur récents) et la
- * watchlist. Un classement grossier, sur les axes de liste, choisit les
- * soixante films qui méritent une fiche complète ; seuls ceux-là passent
- * par le moteur, qui tranche sur la durée réelle et les vraies plateformes.
- * @param {CineMatchSetup} setup La soirée.
- * @param {CineMatchEvening} evening Les réponses.
- * @param {boolean} forceRelaxed Aller chercher hors durée et plateformes
- *   même si le catalogue conforme semble suffire.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<CineMatchCandidates>} Films enrichis.
- */
-async function buildCineMatchCandidates(
-    setup: CineMatchSetup,
-    evening: CineMatchEvening,
-    forceRelaxed: boolean,
-    ctx: TMDBContext,
-): Promise<CineMatchCandidates> {
-  const {situation, gallery} = setup;
-
-  // Les têtes du graphe d'abord : un film qui a gagné ses duels dit mieux
-  // ce qu'on relance qu'un coup de cœur ancien. Les coups de cœur récents
-  // complètent.
-  const seedIds: number[] = [];
-  const positionedIds = new Set(gallery.positioned.map((e) => e.film.id));
-  for (const [id, rating] of
-    [...setup.prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
-    if (rating <= ELO_START || seedIds.length >= CINEMATCH_SEED_COUNT) break;
-    if (positionedIds.has(id)) seedIds.push(id);
-  }
-  const loved = gallery.positioned
-      .filter((entry) => entry.lovedAtMillis !== null)
-      .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0));
-  for (const entry of loved) {
-    if (seedIds.length >= CINEMATCH_SEED_COUNT) break;
-    if (!seedIds.includes(entry.film.id)) seedIds.push(entry.film.id);
-  }
-
-  const constrained =
-    situation.duration !== 'any' || situation.platformIds.length > 0;
-  const [catalogue, seedResponses] = await Promise.all([
-    fetchCineMatchCatalogue(situation, false, ctx),
-    Promise.allSettled(seedIds.map((id) => tmdbGET(
-        `/movie/${id}/recommendations`, {page: '1'}, ctx))),
-  ]);
-
-  const keep = (row: DiscoverRow): boolean =>
-    typeof row.id === 'number' && !gallery.seenIds.has(row.id) &&
-    !(situation.company === 'family' &&
-      (row.genre_ids ?? []).includes(GENRE_HORROR));
-
-  const strictRows = catalogue.filter(keep);
-  const strictIds = new Set(strictRows.map((row) => row.id));
-  let relaxedRows: DiscoverRow[] = [];
-  const relaxed = constrained &&
-    (forceRelaxed || strictRows.length < CINEMATCH_STRICT_FLOOR);
-  if (relaxed) {
-    relaxedRows = (await fetchCineMatchCatalogue(situation, true, ctx))
-        .filter((row) => keep(row) && !strictIds.has(row.id));
-  }
-
-  // Les lignes personnelles, contingentées : la watchlist d'abord (elle
-  // n'aura qu'une place, quelques films suffisent), les graines ensuite.
-  const personal = new Map<number, DiscoverRow>();
-  for (const row of setup.watchlistRows) {
-    if (personal.size >= CINEMATCH_WATCHLIST_MAX) break;
-    if (keep(row)) personal.set(row.id, row);
-  }
-  for (const settled of seedResponses) {
-    if (settled.status !== 'fulfilled') continue;
-    const results = Array.isArray(settled.value.results) ?
-      settled.value.results as DiscoverRow[] : [];
-    for (const row of results.slice(0, CINEMATCH_SEED_TAKE)) {
-      if (personal.size >= CINEMATCH_PERSONAL_MAX) break;
-      if (keep(row) && !strictIds.has(row.id)) personal.set(row.id, row);
-    }
-  }
-
-  const byId = new Map<number, DiscoverRow>();
-  for (const row of [...strictRows, ...personal.values(), ...relaxedRows]) {
-    if (!byId.has(row.id)) byId.set(row.id, row);
-  }
-  // Ce soir, on regarde chez soi : ni un film encore en salle, ni une sortie
-  // à venir, ni une fiche de projet. Les tris par date et par popularité du
-  // catalogue en ramènent pourtant chaque semaine.
-  const rows = await servableRows(
-      getAdmin().firestore(), [...byId.values()], ctx);
-  if (rows.length === 0) {
-    return {films: [], enriched: new Map(), relaxed};
-  }
-
-  // Le classement grossier : le moteur lui-même, sur les axes de liste, sans
-  // durée ni plateformes (inconnues à ce stade). Les films du catalogue
-  // conforme partent devant, comme ils partiront devant dans le moteur.
-  const stats = poolStatsFor(rows);
-  const coarse = new Map<number, AxisVector>();
-  const coarseFilms: engine.EngineFilm[] = [];
-  for (const row of rows) {
-    if (engine.isResting(setup.exposure.get(row.id), setup.now)) continue;
-    const axes = coarseAxesFor(row, stats);
-    coarse.set(row.id, axes);
-    coarseFilms.push({
-      id: row.id,
-      axes,
-      genreIds: row.genre_ids ?? [],
-      year: yearOf(row.release_date),
-      voteCount: row.vote_count ?? null,
-      runtime: null,
-      providerIds: [],
-      keywordNames: [],
-      listed: setup.watchlistIds.has(row.id),
-      certification: null,
-    });
-  }
-  const lovedFilms = gallery.positioned
-      .filter((entry) => entry.film.loved)
-      .map((entry) => entry.film);
-  const ranked = engine.scoreFilms(coarseFilms, {
-    situation: {...situation, duration: 'any', platformIds: []},
-    want: evening.want,
-    energy: evening.energy,
-    hesitations: evening.hesitations,
-    loved: lovedFilms,
-    weights: engine.buildWeights(
-        lovedFilms.map((film) => film.axes),
-        coarseFilms.map((film) => film.axes),
-        evening.comparisons,
-        new Map(gallery.positioned.map((e) => [e.film.id, e.film.axes])),
-    ),
-    exposure: setup.exposure,
-    now: setup.now,
-    conforming: strictIds,
-  });
-
-  const shortlist = ranked
-      .slice(0, CINEMATCH_ENRICH_MAX)
-      .map((scored) => byId.get(scored.film.id))
-      .filter((row): row is DiscoverRow => row !== undefined);
-  const enrichedList = await Promise.all(
-      shortlist.map((row) => enrichCandidate(row, ctx)));
-
-  const enriched = new Map<number, EnrichedCandidate>();
-  const films: engine.EngineFilm[] = [];
-  for (const candidate of enrichedList) {
-    if (!candidate) continue;
-    enriched.set(candidate.id, candidate);
-    const base = coarse.get(candidate.id) ?? parseAxes(null);
-    films.push({
-      id: candidate.id,
-      axes: refineAxes(base, candidate),
-      genreIds: candidate.genre_ids ?? [],
-      year: yearOf(candidate.release_date),
-      voteCount: candidate.vote_count ?? null,
-      runtime: candidate.runtimeMinutes,
-      providerIds: candidate.providerIds,
-      keywordNames: candidate.keywordNames ?? [],
-      listed: setup.watchlistIds.has(candidate.id),
-      certification: candidate.certification ?? null,
-    });
-  }
-  return {films, enriched, relaxed};
-}
-
-/**
- * Fait tourner le moteur sur le vivier, et retourne chercher hors durée et
- * plateformes si le premier passage n'a pas donné assez de films.
- *
- * Le second passage n'a lieu que si le premier n'était pas déjà relâché :
- * c'est le cas rare où TMDB annonçait assez de films conformes, mais où les
- * fiches ont démenti la durée ou les plateformes.
- * @param {CineMatchSetup} setup La soirée.
- * @param {CineMatchEvening} evening Les réponses.
- * @param {function(boolean): Promise} build Compose le vivier, relâché ou
- *   non : celui des films ou celui des séries.
- * @param {function(engine.RecommendInput): T} run Le calcul à faire.
- * @param {function(T): boolean} enough Vrai si le résultat suffit.
- * @return {Promise<Object>} Le résultat et les fiches enrichies.
- */
-async function runCineMatchEngine<T, E>(
-    setup: CineMatchSetup,
-    evening: CineMatchEvening,
-    build: (forceRelaxed: boolean) => Promise<{
-      films: engine.EngineFilm[]; enriched: Map<number, E>; relaxed: boolean;
-    }>,
-    run: (input: engine.RecommendInput) => T,
-    enough: (result: T) => boolean,
-): Promise<{result: T; enriched: Map<number, E>}> {
-  const inputFor = (films: engine.EngineFilm[]): engine.RecommendInput => ({
-    films,
-    gallery: setup.gallery.positioned.map((entry) => entry.film),
-    situation: setup.situation,
-    want: evening.want,
-    energy: evening.energy,
-    comparisons: evening.comparisons,
-    hesitations: evening.hesitations,
-    exposure: setup.exposure,
-    now: setup.now,
-    engagement: evening.engagement ?? null,
-    avoided: setup.avoided ?? [],
-    priorAnchors: setup.priorAnchors ?? [],
-    extraExcludedIds: setup.extraExcludedIds ?? [],
-  });
-
-  const first = await build(false);
-  const firstResult = run(inputFor(first.films));
-  const constrained = setup.situation.duration !== 'any' ||
-    setup.situation.platformIds.length > 0;
-  if (enough(firstResult) || first.relaxed || !constrained) {
-    return {result: firstResult, enriched: first.enriched};
-  }
-  const second = await build(true);
-  return {result: run(inputFor(second.films)), enriched: second.enriched};
-}
-
 /**
  * La forme JSON d'un film proposé.
  * @param {EnrichedCandidate} c Fiche enrichie.
@@ -13441,25 +13130,6 @@ function cineMatchFiveFilmJSON(c: EnrichedCandidate) {
   };
 }
 
-/**
- * Le bloc `films` d'un document d'historique, compatible avec
- * `recordSessionOutcome` et la relecture du trait.
- * @param {engine.ScoredFilm[]} picks Films proposés, dans l'ordre.
- * @param {Map<number, EnrichedCandidate>} enriched Fiches.
- * @return {Object[]} Films, rang à partir de 1.
- */
-function cineMatchHistoryFilms(
-    picks: engine.ScoredFilm[], enriched: Map<number, EnrichedCandidate>,
-) {
-  return picks.map((pick, index) => ({
-    id: pick.film.id,
-    title: enriched.get(pick.film.id)?.title ?? null,
-    rank: index + 1,
-    axes: pick.film.axes,
-    score: pick.score,
-  }));
-}
-
 /* ===================================================================== *
  *  CinéMatch des séries
  *
@@ -13473,14 +13143,6 @@ function cineMatchHistoryFilms(
 const SERIES_CINEMATCH_VOTE_FLOOR = 100;
 /** La tranche peu connue des séries. */
 const SERIES_QUIET_VOTE_CEILING = 1500;
-/** Séries qui méritent une fiche complète, par passage. */
-const SERIES_ENRICH_MAX = 40;
-/** En deçà de tant de séries conformes, on relâche durée et plateformes. */
-const SERIES_STRICT_FLOOR = 25;
-/** Graines de voisinage tirées des séries relancées ou aimées. */
-const SERIES_CINEMATCH_SEEDS = 5;
-/** Séries de la watchlist entrées dans le vivier, au plus. */
-const SERIES_WATCHLIST_MAX = 8;
 /**
  * Les films aimés servent d'ancres au goût des séries, de moins en moins à
  * mesure qu'on aime des séries : leur part s'éteint à quinze séries aimées,
@@ -13677,138 +13339,6 @@ function engineSeriesFrom(meta: TvMeta, listed: boolean): engine.EngineFilm {
 }
 
 /**
- * Compose le vivier des séries d'une soirée et l'enrichit. Le même
- * principe que celui des films : catalogue, graines, watchlist ; un
- * classement grossier choisit les séries qui méritent une fiche.
- * @param {Firestore} db Firestore, pour le cache des fiches.
- * @param {CineMatchSetup} setup La soirée.
- * @param {CineMatchEvening} evening Les réponses.
- * @param {boolean} forceRelaxed Aller chercher hors durée et plateformes.
- * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
- * @return {Promise<Object>} Séries enrichies, et leurs fiches.
- */
-async function buildSeriesCandidates(
-    db: Firestore,
-    setup: CineMatchSetup,
-    evening: CineMatchEvening,
-    forceRelaxed: boolean,
-    ctx: TMDBContext,
-): Promise<{
-  films: engine.EngineFilm[]; enriched: Map<number, TvMeta>; relaxed: boolean;
-}> {
-  const {situation, gallery} = setup;
-  const abandoned = new Set(setup.extraExcludedIds ?? []);
-
-  const seedIds: number[] = [];
-  const positionedIds = new Set(gallery.positioned.map((e) => e.film.id));
-  for (const [id, rating] of
-    [...setup.prefs.entries()].sort((lhs, rhs) => rhs[1] - lhs[1])) {
-    if (rating <= ELO_START || seedIds.length >= SERIES_CINEMATCH_SEEDS) break;
-    if (positionedIds.has(id)) seedIds.push(id);
-  }
-  const loved = gallery.positioned
-      .filter((entry) => entry.film.loved)
-      .sort((a, b) => (b.lovedAtMillis ?? 0) - (a.lovedAtMillis ?? 0));
-  for (const entry of loved) {
-    if (seedIds.length >= SERIES_CINEMATCH_SEEDS) break;
-    if (!seedIds.includes(entry.film.id)) seedIds.push(entry.film.id);
-  }
-
-  const constrained =
-    situation.duration !== 'any' || situation.platformIds.length > 0;
-  const [catalogue, seedResponses] = await Promise.all([
-    fetchSeriesCatalogue(situation, false, ctx),
-    Promise.allSettled(seedIds.map((id) => tmdbGET(
-        `/tv/${id}/recommendations`, {page: '1'}, ctx))),
-  ]);
-  const keep = (row: DiscoverRow): boolean =>
-    !gallery.seenIds.has(row.id) && !abandoned.has(row.id) &&
-    !(row.genre_ids ?? []).some((id) => TV_EXCLUDED_GENRES.includes(id));
-
-  const strictRows = catalogue.filter(keep);
-  const strictIds = new Set(strictRows.map((row) => row.id));
-  let relaxedRows: DiscoverRow[] = [];
-  const relaxed = constrained &&
-    (forceRelaxed || strictRows.length < SERIES_STRICT_FLOOR);
-  if (relaxed) {
-    relaxedRows = (await fetchSeriesCatalogue(situation, true, ctx))
-        .filter((row) => keep(row) && !strictIds.has(row.id));
-  }
-  const personal: DiscoverRow[] = [];
-  for (const settled of seedResponses) {
-    for (const raw of rowsFrom(settled, 'results').slice(0, 12)) {
-      const row = seriesRowFrom(raw as unknown as Record<string, unknown>);
-      if (row && keep(row) && !strictIds.has(row.id)) personal.push(row);
-    }
-  }
-
-  const byId = new Map<number, DiscoverRow>();
-  for (const row of [...strictRows, ...personal, ...relaxedRows]) {
-    if (!byId.has(row.id)) byId.set(row.id, row);
-  }
-  const rows = [...byId.values()];
-
-  // Le classement grossier, comme pour les films, sur ce que `/discover`
-  // dit d'une série : genres, notoriété, date.
-  const stats = poolStatsFor(rows);
-  const coarseFilms: engine.EngineFilm[] = rows
-      .filter((row) => !engine.isResting(setup.exposure.get(row.id), setup.now))
-      .map((row) => ({
-        id: row.id,
-        axes: coarseAxesFor(row, stats),
-        genreIds: row.genre_ids ?? [],
-        year: yearOf(row.release_date),
-        voteCount: row.vote_count ?? null,
-        runtime: null,
-        providerIds: [],
-        keywordNames: [],
-        listed: setup.watchlistIds.has(row.id),
-        certification: null,
-      }));
-  const lovedAxes = [
-    ...gallery.positioned.filter((e) => e.film.loved).map((e) => e.film),
-    ...(setup.priorAnchors ?? []),
-  ];
-  const ranked = engine.scoreFilms(coarseFilms, {
-    situation: {...situation, duration: 'any', platformIds: []},
-    want: evening.want,
-    energy: null,
-    hesitations: evening.hesitations,
-    loved: lovedAxes,
-    weights: engine.buildWeights(
-        lovedAxes.map((film) => film.axes),
-        coarseFilms.map((film) => film.axes),
-        evening.comparisons,
-        new Map(gallery.positioned.map((e) => [e.film.id, e.film.axes])),
-    ),
-    exposure: setup.exposure,
-    now: setup.now,
-    conforming: strictIds,
-  });
-
-  // La watchlist entre d'office : elle n'a pas de ligne `/discover`, mais
-  // c'est là que le moteur trouve ce qu'on s'était promis de commencer.
-  const listed = [...setup.watchlistIds]
-      .filter((id) => !gallery.seenIds.has(id) && !abandoned.has(id))
-      .slice(0, SERIES_WATCHLIST_MAX);
-  const shortlist = [...new Set([
-    ...listed,
-    ...ranked.slice(0, SERIES_ENRICH_MAX).map((scored) => scored.film.id),
-  ])];
-  const metas = await loadTvMeta(db, shortlist, ctx, shortlist.length);
-
-  const enriched = new Map<number, TvMeta>();
-  const films: engine.EngineFilm[] = [];
-  for (const id of shortlist) {
-    const meta = metas.get(id);
-    if (!meta || !isKeptSeries(meta)) continue;
-    enriched.set(id, meta);
-    films.push(engineSeriesFrom(meta, setup.watchlistIds.has(id)));
-  }
-  return {films, enriched, relaxed};
-}
-
-/**
  * La forme JSON d'une série proposée : celle d'un film, plus ce qu'il faut
  * pour dire dans quoi on s'engage.
  * @param {TvMeta} meta Fiche de la série.
@@ -13831,165 +13361,6 @@ function cineMatchSeriesJSON(meta: TvMeta) {
     status: meta.status,
   };
 }
-
-/**
- * Le bloc `films` d'un document d'historique des séries.
- * @param {engine.ScoredFilm[]} picks Séries proposées, dans l'ordre.
- * @param {Map<number, TvMeta>} metas Fiches.
- * @return {Object[]} Séries, rang à partir de 1.
- */
-function seriesHistoryFilms(
-    picks: engine.ScoredFilm[], metas: Map<number, TvMeta>,
-) {
-  return picks.map((pick, index) => ({
-    id: pick.film.id,
-    title: metas.get(pick.film.id)?.name ?? null,
-    rank: index + 1,
-    axes: pick.film.axes,
-    score: pick.score,
-  }));
-}
-
-/**
- * Les cinq films d'une soirée guidée.
- *
- * Tout le moteur tourne ici : l'app envoie la situation, les deux réponses
- * et les comparaisons, et reçoit cinq films prêts à être montrés. La
- * séance est écrite dans l'historique pour que le lancement, puis le
- * verdict, puissent s'y accrocher.
- */
-export const getCineMatchFive = onRequest(
-    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 60},
-    async (req: Request, res: Response) => {
-      try {
-        if (req.method !== 'POST') {
-          res.status(405).json({error: 'method_not_allowed'});
-          return;
-        }
-        const uid = await verifyAuth(req, res);
-        if (!uid) return;
-
-        const body = (req.body ?? {}) as Record<string, unknown>;
-        const format = cineMatchFormatOf(body.format);
-        const want = oneOf(body.want, CINEMATCH_WANTS);
-        // Une série ne se choisit pas pour une soirée : la seconde question
-        // demande dans quoi on s'engage, pas l'énergie qu'on a.
-        const energy = format === 'film' ?
-          oneOf(body.energy, CINEMATCH_ENERGIES) : null;
-        const engagement = format === 'series' ?
-          oneOf(body.engagement, CINEMATCH_ENGAGEMENTS) : null;
-        if (!want || (format === 'film' ? !energy : !engagement)) {
-          res.status(400).json({error: 'invalid_answers'});
-          return;
-        }
-        const hesitationsRaw = Number(body.hesitations);
-        const evening: CineMatchEvening = {
-          want,
-          energy,
-          engagement,
-          comparisons: parseCineMatchComparisons(body.comparisons),
-          hesitations: Number.isFinite(hesitationsRaw) ?
-            Math.max(0, Math.min(20, Math.floor(hesitationsRaw))) : 0,
-        };
-        const situation = parseCineMatchSituation(body.situation);
-        const replace = parseCineMatchReplace(body.replace);
-        // Ni les films gardés ni les films vus ne reviennent.
-        const withReplace = (setup: CineMatchSetup): CineMatchSetup =>
-          replace ? {
-            ...setup,
-            extraExcludedIds: [
-              ...(setup.extraExcludedIds ?? []),
-              ...replace.keepIds,
-              ...replace.seenIds,
-            ],
-          } : setup;
-        // Un remplacement ne renvoie que ce qui manque, dans l'ordre.
-        const wanted = <T>(picks: T[]): T[] =>
-          replace ? picks.slice(0, replace.seenIds.length) : picks;
-
-        const db = getAdmin().firestore();
-        const ctx = tmdb(req, res);
-
-        if (format === 'series') {
-          const setup = withReplace(
-              await loadSeriesSetup(db, uid, situation, ctx));
-          const {result, enriched} = await runCineMatchEngine(
-              setup, evening,
-              (relaxed) =>
-                buildSeriesCandidates(db, setup, evening, relaxed, ctx),
-              engine.recommendFive, (r) => r.films.length >= 3,
-          );
-          const picks = wanted(
-              result.films.filter((pick) => enriched.has(pick.film.id)));
-          if (picks.length === 0) {
-            // Un remplacement sans remplaçant n'est pas une erreur : l'app
-            // garde sa proposition et le dit.
-            if (replace) {
-              res.status(200).json({films: [], widened: result.widened});
-            } else {
-              res.status(409).json({error: 'no_candidates'});
-            }
-            return;
-          }
-          const sessionId = await writeFiveHistory(
-              db.collection('users').doc(uid)
-                  .collection(cineMatchStoreFor('series').history),
-              replace,
-              picks.map((pick) => pick.film.id),
-              seriesHistoryFilms(picks, enriched),
-              {situation, want, engagement},
-          );
-          res.status(200).json({
-            films: picks.map((pick) =>
-              cineMatchSeriesJSON(enriched.get(pick.film.id) as TvMeta)),
-            widened: result.widened,
-            sessionId,
-          });
-          return;
-        }
-
-        const setup = withReplace(
-            await loadCineMatchSetup(db, uid, situation, ctx));
-        const {result, enriched} = await runCineMatchEngine(
-            setup, evening,
-            (relaxed) => buildCineMatchCandidates(setup, evening, relaxed, ctx),
-            engine.recommendFive, (r) => r.films.length >= 3,
-        );
-
-        const picks = wanted(
-            result.films.filter((pick) => enriched.has(pick.film.id)));
-        if (picks.length === 0) {
-          if (replace) {
-            res.status(200).json({films: [], widened: result.widened});
-          } else {
-            res.status(409).json({error: 'no_candidates'});
-          }
-          return;
-        }
-
-        const sessionId = await writeFiveHistory(
-            db.collection('users').doc(uid)
-                .collection('recommendationHistory'),
-            replace,
-            picks.map((pick) => pick.film.id),
-            cineMatchHistoryFilms(picks, enriched),
-            {situation, want, energy},
-        );
-
-        res.status(200).json({
-          films: picks.map((pick) =>
-            cineMatchFiveFilmJSON(enriched.get(pick.film.id) as
-              EnrichedCandidate)),
-          widened: result.widened,
-          sessionId,
-        });
-      } catch (error) {
-        if (sendTMDBError(error, res)) return;
-        logger.error('getCineMatchFive failed', {error});
-        res.status(500).json({error: 'internal_error'});
-      }
-    },
-);
 
 /**
  * Le rang d'un jour dans son année, 1 = 1er janvier.
