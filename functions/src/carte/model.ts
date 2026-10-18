@@ -15,6 +15,7 @@
 
 import {gunzipSync, gzipSync} from 'zlib';
 import {AlsRow, buildAlsData, gram, trainAls} from './als';
+import type {CarteAxis} from './axes';
 import {
   addOuter, addScaled, dot, inverseSpd, solveSpd, symmetricEigen,
 } from './linalg';
@@ -144,6 +145,8 @@ export interface Carte {
   gram: Float64Array;
   /** Identifiant TMDB → rang dans `films`. */
   index: Map<number, number>;
+  /** Les axes nommés appris cette semaine (`axes.ts`), par nom. */
+  axes?: Record<string, CarteAxis>;
 }
 
 /**
@@ -531,6 +534,7 @@ export interface EncodedCarte {
     count: number;
     params: CarteParams;
     chunks: number;
+    axes?: Record<string, CarteAxis>;
   };
   chunks: Buffer[];
 }
@@ -575,6 +579,7 @@ export function encodeCarte(carte: Carte): EncodedCarte {
     manifest: {
       version: carte.version, builtAt: carte.builtAt, k: carte.k,
       count: f.length, params: carte.params, chunks: chunks.length,
+      ...(carte.axes ? {axes: carte.axes} : {}),
     },
     chunks,
   };
@@ -624,5 +629,6 @@ export function decodeCarte(encoded: EncodedCarte): Carte {
     support: Int32Array.from(c.support as number[]),
     gram: gram(Float64Array.from(vectors), n, k),
     index: new Map(films.map((film, i) => [film.id, i])),
+    ...(encoded.manifest.axes ? {axes: encoded.manifest.axes} : {}),
   };
 }

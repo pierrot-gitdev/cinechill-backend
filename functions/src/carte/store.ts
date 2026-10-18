@@ -18,10 +18,14 @@ import {
   CARTE_VERSION, Carte, DEFAULT_CARTE_PARAMS, EncodedCarte, GalleryMark,
   buildCarte, decodeCarte, encodeCarte,
 } from './model';
+import {AxisAnswer, buildAxis} from './axes';
+import {rng} from './linalg';
 import {CarteSource, GatherReport, dayOf, gatherFilms} from './pipeline';
 
 const POINTER = 'carte/current';
 const BUILDS = 'carteBuilds';
+/** Les réponses à « Lequel est le plus sombre ? », sans compte. */
+export const AXIS_ANSWERS = 'axisAnswers';
 /** Le temps entre deux coups d'œil au pointeur, dans une instance. */
 const RECHECK_MS = 10 * 60 * 1000;
 
@@ -162,11 +166,32 @@ export async function saveCarte(
   return buildId;
 }
 
+/**
+ * Les réponses d'un axe nommé.
+ * @param {Firestore} db Firestore.
+ * @param {string} axis Le nom de l'axe (`dark`).
+ * @return {Promise<AxisAnswer[]>} Les réponses.
+ */
+export async function readAxisAnswers(
+    db: Firestore, axis: string,
+): Promise<AxisAnswer[]> {
+  const snap = await db.collection(AXIS_ANSWERS).where('axis', '==', axis)
+      .get();
+  return snap.docs.map((doc) => ({
+    a: Number(doc.get('a')),
+    b: Number(doc.get('b')),
+    darker: typeof doc.get('darker') === 'number' ? doc.get('darker') : null,
+  })).filter((answer) => Number.isInteger(answer.a) &&
+    Number.isInteger(answer.b));
+}
+
 export interface CarteBuildResult {
   buildId: string;
   films: number;
   galleries: number;
   report: GatherReport;
+  /** L'axe « léger ou sombre », sans sa direction. */
+  dark: Record<string, unknown>;
   /** Le temps de chaque partie, en millisecondes. */
   timings: {gather: number; galleries: number; factorize: number; save: number};
 }
@@ -203,10 +228,20 @@ export async function runCarteBuild(
     throw new Error(`carte: ${films.length} films contre ` +
       `${previous.carte.films.length} la semaine précédente`);
   }
-  const galleries = await readGalleries(db);
+  const [galleries, darkAnswers] = await Promise.all([
+    readGalleries(db),
+    readAxisAnswers(db, 'dark'),
+  ]);
   const read = Date.now();
   const carte = buildCarte(films, galleries, DEFAULT_CARTE_PARAMS,
       previous?.carte ?? null);
+  // L'axe « léger ou sombre » se réapprend chaque semaine sur la carte
+  // neuve, et ne sert que s'il passe ses trois contrôles (`axes.ts`).
+  const dark = buildAxis(carte, darkAnswers,
+      previous ? {carte: previous.carte, axis: previous.carte.axes?.dark} :
+        null,
+      rng(carte.builtAt));
+  carte.axes = {dark};
   const factorized = Date.now();
   const buildId = await saveCarte(db, carte, previous?.buildId ?? null);
   memory = null;
@@ -215,6 +250,7 @@ export async function runCarteBuild(
     films: films.length,
     galleries: galleries.length,
     report,
+    dark: {...dark, direction: dark.direction ? 'apprise' : null},
     timings: {
       gather: gathered - started,
       galleries: read - gathered,

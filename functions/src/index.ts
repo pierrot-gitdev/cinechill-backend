@@ -29,6 +29,7 @@ import * as deck from './deck/engine';
 import {
   CARTE_DETAIL_APPEND, DiscoverPage, ficheOfCarteFilm,
 } from './carte/catalog';
+import * as carteAxes from './carte/axes';
 import * as carteEvening from './carte/evening';
 import * as carteModel from './carte/model';
 import {CarteSource} from './carte/pipeline';
@@ -15235,6 +15236,8 @@ const CARTE_FOLD_FETCH = 6;
  * quand il a fallu élargir la durée ou les plateformes.
  */
 const CARTE_CONFORMING_BONUS = 1;
+/** κ : de combien d'écarts types « Plus sombre » déplace la note. */
+const CARTE_AXIS_SHIFT = 1;
 
 /** La carte prête pour les soirées : ses fiches, leur réception. */
 interface CarteRuntime {
@@ -15469,11 +15472,53 @@ function carteCandidateRows(
   if (input.anchor && input.tweak) {
     const anchor = input.anchor;
     const tweak = input.tweak;
-    const tweaked = rows.filter((row) =>
+    const axis = axisTweakFor(rt, anchor.id, tweak);
+    const tweaked = rows.filter((row) => axis ?
+      axis.sign * (axis.along[row] - axis.anchor) > 0 :
       fiche.keepsTweak(rt.fiches[row], anchor, tweak));
     if (tweaked.length >= input.count + 3) rows = tweaked;
   }
   return {rows, conforming: filtered.conforming, widened: filtered.widened};
+}
+
+/** « Plus léger » ou « Plus sombre » le long de l'axe appris. */
+interface AxisTweak {
+  /** La position de chaque film de la carte le long de l'axe. */
+  along: Float64Array;
+  /** Celle du film choisi. */
+  anchor: number;
+  /** +1 pour « Plus sombre », −1 pour « Plus léger ». */
+  sign: number;
+  /** L'écart type des films le long de l'axe. */
+  spread: number;
+}
+
+const axisAlong = new WeakMap<carteModel.Carte, Float64Array>();
+
+/**
+ * La retouche « Plus léger » ou « Plus sombre » par l'axe de la carte,
+ * quand il a passé ses trois contrôles. Sinon null : la retouche garde la
+ * règle de la fiche (`fiche.keepsTweak`).
+ * @param {CarteRuntime} rt La carte.
+ * @param {number} anchorId Le film choisi.
+ * @param {?fiche.TweakKey} tweak La retouche.
+ * @return {?AxisTweak} La retouche par l'axe, ou null.
+ */
+function axisTweakFor(
+    rt: CarteRuntime, anchorId: number, tweak: fiche.TweakKey | null,
+): AxisTweak | null {
+  if (tweak !== 'lighter' && tweak !== 'darker') return null;
+  const axis = rt.carte.axes?.dark;
+  const row = rt.carte.index.get(anchorId);
+  if (!axis?.validated || !axis.direction || !axis.spread ||
+      row === undefined) return null;
+  let along = axisAlong.get(rt.carte);
+  if (!along) {
+    along = carteAxes.projections(rt.carte, axis.direction);
+    axisAlong.set(rt.carte, along);
+  }
+  return {along, anchor: along[row], sign: tweak === 'darker' ? 1 : -1,
+    spread: axis.spread};
 }
 
 /**
@@ -15483,19 +15528,30 @@ function carteCandidateRows(
  * @param {CarteRuntime} rt La carte.
  * @param {CarteFiltered} filtered Les films retenus.
  * @param {fiche.Fiche[]} chosen Le film de départ et le second, s'il y en a.
+ * @param {?fiche.TweakKey} tweak La retouche, qui déplace la note quand
+ *   l'axe « léger ou sombre » est appris.
  * @return {carteEvening.Candidates} Les candidats.
  */
 function carteCandidates(
     rt: CarteRuntime, filtered: CarteFiltered, chosen: fiche.Fiche[],
+    tweak: fiche.TweakKey | null = null,
 ): carteEvening.Candidates {
   const {carte} = rt;
+  const axis = chosen.length > 0 ? axisTweakFor(rt, chosen[0].id, tweak) :
+    null;
+  const conforming = (row: number) => filtered.widened &&
+    filtered.conforming.has(carte.films[row].id) ? CARTE_CONFORMING_BONUS : 0;
+  // « Plus sombre » déplace aussi la note : un écart type des films le long
+  // de l'axe, comme le point du soir déplacé de κ σ_d.
+  const along = (row: number) => axis ?
+    CARTE_AXIS_SHIFT * axis.sign * (axis.along[row] - axis.anchor) /
+      axis.spread : 0;
   return carteEvening.prepareCandidates(carte, filtered.rows,
       (row) => rt.reception[row],
       chosen.length > 0 ? (row) => chosen.reduce((sum, sheet) =>
         sum + rt.comparer.similarity(sheet, rt.fiches[row]), 0) /
         chosen.length : null,
-      filtered.widened ? (row) => filtered.conforming.has(
-          carte.films[row].id) ? CARTE_CONFORMING_BONUS : 0 : null,
+      filtered.widened || axis ? (row) => conforming(row) + along(row) : null,
       CARTE_EVENING);
 }
 
@@ -15625,7 +15681,7 @@ async function runCartePicks(
     seenMakers: carteSeenMakers(rt, gallery),
     count: request.count,
   });
-  const candidates = carteCandidates(rt, filtered, chosen);
+  const candidates = carteCandidates(rt, filtered, chosen, request.tweak);
   const random = engine.seededRandom(
       `${uid}:${eveningId ?? setup.now}:${refusedNow.join('.')}:` +
       `${(setup.extraExcludedIds ?? []).length}`);
@@ -15884,7 +15940,8 @@ async function carteNear(
         });
         if (kept.rows.length === filtered.rows.length) return false;
         const slate = carteEvening.expectedSlate(carte,
-            carteCandidates(rt, kept, [anchor]), point, 5, CARTE_EVENING);
+            carteCandidates(rt, kept, [anchor], tweak), point, 5,
+            CARTE_EVENING);
         return slate.filter((row) => !base.includes(row)).length >=
           CARTE_SCREEN_MIN_CHANGE;
       });
@@ -15972,3 +16029,160 @@ async function carteDaily(
     propensity: slate.propensity.get(row) ?? null,
   };
 }
+
+/* ===================================================================== *
+ *  « Lequel est le plus sombre ? »
+ *
+ *  Deux films de la galerie, une fois par jour au plus, aux moments calmes
+ *  seulement : l'app la pose après l'avis du lendemain, jamais pendant une
+ *  soirée. Les réponses apprennent l'axe « léger ou sombre » de la carte
+ *  (`carte/axes.ts`) ; la question s'arrête d'elle-même quand l'axe a passé
+ *  ses trois contrôles. Elles sont rangées sans compte : une paire de films
+ *  et le film désigné, rien d'autre.
+ * ===================================================================== */
+
+/** Les films de la galerie parmi lesquels se tire la paire. */
+const AXIS_QUESTION_POOL = 40;
+/** Les paires essayées avant d'en garder une. */
+const AXIS_QUESTION_TRIES = 40;
+/** Au-delà, deux films se ressemblent trop pour qu'on les compare. */
+const AXIS_QUESTION_MAX_PROXIMITY = 0.9;
+
+/**
+ * La question du jour, s'il y en a une : `{question: null}` quand l'axe est
+ * appris, qu'elle a déjà été posée aujourd'hui, ou que la galerie n'a pas
+ * deux films de la carte avec une affiche.
+ *
+ * Tant que l'axe n'a pas de direction, la paire est tirée au hasard parmi
+ * les films les mieux connus de la galerie (coups de cœur, puis nombre de
+ * votes). Dès qu'il en a une, on garde la paire dont l'ordre est le plus
+ * incertain : c'est elle qui lui apprend le plus.
+ */
+export const getAxisQuestion = onRequest(
+    {invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        const today = parisDay(new Date());
+        const rt = await loadCarteRuntime(db).catch(() => null);
+        const axis = rt?.carte.axes?.dark;
+        if (!rt || axis?.validated) {
+          res.status(200).json({question: null});
+          return;
+        }
+        const limitRef = userRef.collection('limits').doc('axisQuestion');
+        const [limit, gallery] = await Promise.all([
+          limitRef.get(), loadCarteGallery(userRef),
+        ]);
+        if (limit.get('day') === today) {
+          res.status(200).json({question: null});
+          return;
+        }
+        const {carte} = rt;
+        const pool = gallery.films
+            .filter((film) => film.posterPath && carte.index.has(film.id))
+            .sort((a, b) => Number(b.loved) - Number(a.loved) ||
+              carte.films[carte.index.get(b.id) as number].voteCount -
+              carte.films[carte.index.get(a.id) as number].voteCount)
+            .slice(0, AXIS_QUESTION_POOL);
+        if (pool.length < 2) {
+          res.status(200).json({question: null});
+          return;
+        }
+        const along = axis?.direction ?
+          carteAxes.projections(carte, axis.direction) : null;
+        const random = engine.seededRandom(`${uid}:${today}:axis`);
+        let best: [StarterFilm, StarterFilm] | null = null;
+        let bestValue = Infinity;
+        for (let t = 0; t < AXIS_QUESTION_TRIES; t++) {
+          const i = Math.floor(random() * pool.length);
+          const j = Math.floor(random() * pool.length);
+          if (i === j) continue;
+          const ra = carte.index.get(pool[i].id) as number;
+          const rb = carte.index.get(pool[j].id) as number;
+          const saga = carte.films[ra].collection;
+          if (saga !== null && saga === carte.films[rb].collection) continue;
+          if (carteModel.proximity(carte, ra, rb) >
+              AXIS_QUESTION_MAX_PROXIMITY) continue;
+          const value = along ? Math.abs(along[ra] - along[rb]) : t;
+          if (value < bestValue) {
+            best = [pool[i], pool[j]];
+            bestValue = value;
+          }
+        }
+        if (!best) {
+          res.status(200).json({question: null});
+          return;
+        }
+        await limitRef.set({
+          day: today, a: best[0].id, b: best[1].id, askedAt: Timestamp.now(),
+        });
+        res.status(200).json({question: {
+          axis: 'dark',
+          films: best.map((film) => starterFilmJSON(film)),
+        }});
+      } catch (error) {
+        logger.error('getAxisQuestion failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
+
+/**
+ * La réponse à la question du jour : `darkerId`, le film désigné, ou null
+ * pour « Pareil ». Seule la paire posée aujourd'hui est acceptée, et une
+ * seule fois : on ne peut pas remplir l'axe de réponses inventées.
+ */
+export const recordAxisAnswer = onRequest(
+    {invoker: 'public', timeoutSeconds: 30},
+    async (req: Request, res: Response) => {
+      try {
+        if (req.method !== 'POST') {
+          res.status(405).json({error: 'method_not_allowed'});
+          return;
+        }
+        const uid = await verifyAuth(req, res);
+        if (!uid) return;
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const a = Number(body.a);
+        const b = Number(body.b);
+        const darkerRaw = body.darkerId;
+        const darker = darkerRaw === null ? null : Number(darkerRaw);
+        if (body.axis !== 'dark' || !Number.isInteger(a) ||
+            !Number.isInteger(b) ||
+            (darker !== null && darker !== a && darker !== b)) {
+          res.status(400).json({error: 'invalid_answer'});
+          return;
+        }
+        const db = getAdmin().firestore();
+        const limitRef = db.collection('users').doc(uid)
+            .collection('limits').doc('axisQuestion');
+        const limit = await limitRef.get();
+        const asked = [limit.get('a'), limit.get('b')];
+        if (limit.get('day') !== parisDay(new Date()) ||
+            limit.get('answeredAt') !== undefined ||
+            !asked.includes(a) || !asked.includes(b) || a === b) {
+          res.status(409).json({error: 'no_question'});
+          return;
+        }
+        const now = Timestamp.now();
+        await Promise.all([
+          db.collection(carteStore.AXIS_ANSWERS).add({
+            axis: 'dark', a, b, darker, at: now,
+          }),
+          limitRef.set({answeredAt: now}, {merge: true}),
+        ]);
+        res.status(200).json({ok: true});
+      } catch (error) {
+        logger.error('recordAxisAnswer failed', {error});
+        res.status(500).json({error: 'internal_error'});
+      }
+    },
+);
