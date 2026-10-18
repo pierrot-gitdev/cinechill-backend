@@ -2281,7 +2281,8 @@ type SwipeSource =
   | 'coverage'
   | 'franchise'
   | 'people'
-  | 'pillars';
+  | 'pillars'
+  | 'france';
 
 interface SwipeCandidate extends DiscoverRow {
   source: SwipeSource;
@@ -2568,6 +2569,15 @@ const DECK_COVERAGE_PROBES_PER_GENRE = 3;
 const DECK_COVERAGE_GENRES_PER_POOL = 2;
 /** Galerie à partir de laquelle on cherche aussi sagas et têtes d'affiche. */
 const DECK_FRANCHISE_MIN_GALLERY = 8;
+/**
+ * Pages de films en français parcourues par le vivier d'une application en
+ * français, une tirée au sort par vivier. Sans cette requête, La Grande
+ * Vadrouille ou Les Bronzés n'entraient presque jamais dans le vivier : les
+ * familles ne cherchent le français que par la comédie et le film d'auteur,
+ * et leurs votes TMDB les classent loin derrière. Ils y concourent ensuite
+ * comme les autres, et reculent d'eux-mêmes chez qui les refuse.
+ */
+const DECK_FRENCH_PAGES = 3;
 
 /** Une ligne du vivier, telle que Firestore la garde. */
 interface DeckPoolRow extends DiscoverRow {
@@ -2592,6 +2602,8 @@ interface DeckPoolInput {
   counters: SwipeCounters;
   declared: DeclaredProfile;
   watchlistSize: number;
+  /** Application en français : le public français compte. */
+  french: boolean;
 }
 
 /**
@@ -2785,11 +2797,30 @@ async function servableRows<T extends DiscoverRow>(
 }
 
 /**
+ * Les votes d'un film tels que le moteur du deck les lit : ceux de TMDB,
+ * relevés pour un film en français dans une application en français (voir
+ * `deck.frenchVotes`).
+ * @param {?string} originalLanguage Langue d'origine TMDB.
+ * @param {?number} voteCount Votes TMDB.
+ * @param {boolean} french Application en français.
+ * @return {?number} Votes à lire.
+ */
+function deckVotes(
+    originalLanguage: string | null | undefined,
+    voteCount: number | null | undefined,
+    french: boolean,
+): number | null {
+  if (!french) return voteCount ?? null;
+  return deck.frenchVotes(originalLanguage ?? null, voteCount ?? null);
+}
+
+/**
  * Une ligne du vivier, dans le vocabulaire du moteur.
  * @param {DeckPoolRow} row Ligne.
+ * @param {boolean} french Application en français.
  * @return {deck.DeckCandidate} Candidat.
  */
-function candidateOf(row: DeckPoolRow): deck.DeckCandidate {
+function candidateOf(row: DeckPoolRow, french = false): deck.DeckCandidate {
   return {
     id: row.id,
     source: row.source,
@@ -2797,7 +2828,7 @@ function candidateOf(row: DeckPoolRow): deck.DeckCandidate {
     genreIds: row.genre_ids ?? [],
     originalLanguage: row.original_language,
     year: yearOf(row.release_date),
-    voteCount: row.vote_count ?? null,
+    voteCount: deckVotes(row.original_language, row.vote_count, french),
     voteAverage: row.vote_average ?? null,
     taggedFamilies: row.tagged,
   };
@@ -2972,13 +3003,24 @@ async function buildDeckPool(
     fetchFranchiseAndPeopleCandidates(seeds.slice(0, 2), ctx) :
     Promise.resolve({franchise: [], people: []});
 
+  // Les films en français, pour une application en français, tous genres
+  // confondus. Le plancher suit celui de la personne, ramené à l'échelle des
+  // votes relevés (`deck.FRENCH_VOTE_FACTOR`).
+  const frenchCall = input.french ? tmdbGET('/discover/movie', {
+    ...base,
+    'with_original_language': 'fr',
+    'vote_count.gte': String(Math.round(floor / deck.FRENCH_VOTE_FACTOR)),
+    'page': String(1 + Math.floor(Math.random() * DECK_FRENCH_PAGES)),
+  }, ctx) : Promise.resolve(null);
+
   const [familySettled, neighborSettled, promesse, coverageSettled,
-    franchise] = await Promise.all([
+    franchise, frenchPage] = await Promise.all([
     Promise.allSettled(familyCalls),
     Promise.allSettled(neighborCalls),
     promesseCall.catch(() => null),
     Promise.allSettled(coverageCalls),
     franchiseCall.catch(() => ({franchise: [], people: []})),
+    frenchCall.catch(() => null),
   ]);
 
   const today = todayISO();
@@ -3023,6 +3065,10 @@ async function buildDeckPool(
   }
   for (const settled of coverageSettled) {
     for (const raw of rowsFrom(settled, 'results')) admit(raw, 'coverage', []);
+  }
+  if (frenchPage) {
+    const rows = Array.isArray(frenchPage.results) ? frenchPage.results : [];
+    for (const raw of rows) admit(raw, 'france', []);
   }
   for (const settled of familySettled) {
     if (settled.status !== 'fulfilled') continue;
@@ -3111,10 +3157,15 @@ async function loadDeckPool(
  * vu ». Les décisions de la feuille de saga n'entrent pas dans le rendement
  * glissant : elles ne disent rien de la qualité du deck.
  * @param {SwipeDecisionPayload} d Décision.
+ * @param {boolean} french Application en français.
  * @return {?deck.Observation} Observation.
  */
-function observationOf(d: SwipeDecisionPayload): deck.Observation | null {
+function observationOf(
+    d: SwipeDecisionPayload, french = false,
+): deck.Observation | null {
   if (d.item.mediaType !== 'movie') return null;
+  const voteCount = deckVotes(
+      d.item.originalLanguage, d.item.voteCount, french);
   const logged = (d.log?.families ?? [])
       .filter((key) => deck.FAMILIES.some((f) => f.key === key));
   const families = logged.length > 0 ? logged : deck.familiesOf({
@@ -3126,12 +3177,12 @@ function observationOf(d: SwipeDecisionPayload): deck.Observation | null {
   });
   const fromDeck = d.via === 'deck' || d.via === 'reserve';
   if (d.decision === 'watchlist') {
-    return {families, voteCount: d.item.voteCount ?? null, seen: 1,
+    return {families, voteCount, seen: 1,
       weight: 0.5, familiesOnly: true, fromDeck, countsForClosing: false};
   }
   return {
     families,
-    voteCount: d.item.voteCount ?? null,
+    voteCount,
     seen: d.decision === 'seen' ? 1 : 0,
     weight: d.soft ? 0.5 : 1,
     fromDeck,
@@ -3146,15 +3197,17 @@ function observationOf(d: SwipeDecisionPayload): deck.Observation | null {
  * dernières secondes, que la V1 ignorait.
  * @param {DocumentSnapshot} profileSnap `swipeProfile`.
  * @param {SwipeDecisionPayload[]} pending Décisions en route.
+ * @param {boolean} french Application en français.
  * @return {deck.DeckModel} Modèle.
  */
 function modelWithPending(
     profileSnap: DocumentSnapshot,
     pending: SwipeDecisionPayload[],
+    french: boolean,
 ): deck.DeckModel {
   const model = deck.parseModel(profileSnap.get('model'));
   for (const decision of pending) {
-    const obs = observationOf(decision);
+    const obs = observationOf(decision, french);
     if (obs) deck.learn(model, obs);
   }
   return model;
@@ -3241,8 +3294,9 @@ async function buildFilmLot(
     ctx: TMDBContext,
 ): Promise<Record<string, unknown>> {
   const {exclusions, declared} = args;
+  const french = ctx.language === 'fr-FR';
   const pendingFilms = args.pending.filter((d) => d.item.mediaType === 'movie');
-  const model = modelWithPending(args.profileSnap, pendingFilms);
+  const model = modelWithPending(args.profileSnap, pendingFilms, french);
   const pendingSeenIds = pendingFilms
       .filter((d) => d.decision === 'seen')
       .map((d) => d.item.tmdbId);
@@ -3263,6 +3317,7 @@ async function buildFilmLot(
     counters: parseSwipeCounters(args.profileSnap),
     declared,
     watchlistSize: exclusions.watchlistSize,
+    french,
   };
   const rows = await loadDeckPool(db, uid, input, blocked, args.fresh, ctx);
   const byId = new Map(rows.map((row) => [row.id, row]));
@@ -3281,7 +3336,8 @@ async function buildFilmLot(
     random: Math.random,
   };
   const scored = deck.scoreCandidates(
-      rows.filter((row) => !blocked.has(row.id)).map(candidateOf),
+      rows.filter((row) => !blocked.has(row.id))
+          .map((row) => candidateOf(row, french)),
       lotContext,
   );
   const lot = deck.composeLot(scored, lotContext);
@@ -3304,8 +3360,12 @@ async function buildFilmLot(
       await applySagaRule(db, lot.cards.map(asSwipe), blocked, ctx), ctx);
   const reserveBlocked = new Set(blocked);
   for (const c of cards) reserveBlocked.add(c.id);
+  // Les sagas du lot : sans elles, la réserve pouvait garder la suite d'une
+  // saga dont le lot sert déjà le premier opus.
+  const lotSagas = new Set(cards.map((c) => c.collectionId)
+      .filter((id): id is number => typeof id === 'number'));
   const reserve = (await servableRows(db, await applySagaRule(
-      db, lot.reserve.map(asSwipe), reserveBlocked, ctx,
+      db, lot.reserve.map(asSwipe), reserveBlocked, ctx, lotSagas,
   ), ctx)).filter((c) => !cards.some((card) => card.id === c.id));
 
   const meta = {lotId: newLotId(), phase, mode: args.mode};
@@ -3529,6 +3589,8 @@ function sagaHead(
  * @param {SwipeCandidate[]} deck Lot composé, dans l'ordre d'affichage.
  * @param {Set<number>} blocked Films déjà classés, en attente ou déjà servis.
  * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @param {Set<number>} servedSagas Sagas déjà servies ailleurs (le lot,
+ *   quand la règle passe sur la réserve).
  * @return {Promise<SwipeCandidate[]>} Lot corrigé.
  */
 async function applySagaRule(
@@ -3536,6 +3598,7 @@ async function applySagaRule(
     deck: SwipeCandidate[],
     blocked: Set<number>,
     ctx: TMDBContext,
+    servedSagas: Set<number> = new Set(),
 ): Promise<SwipeCandidate[]> {
   if (deck.length === 0) return deck;
 
@@ -3552,7 +3615,7 @@ async function applySagaRule(
 
   const today = new Date().toISOString().slice(0, 10);
   const out: SwipeCandidate[] = [];
-  const served = new Set<number>();
+  const served = new Set<number>(servedSagas);
   const shown = new Set<number>();
 
   for (const card of deck) {
@@ -4355,9 +4418,9 @@ function parseSwipeDecisions(value: unknown): SwipeDecisionPayload[] {
 }
 
 /**
- * Cooldown avant qu'un film écarté puisse revenir : 14 jours, doublés à chaque
- * nouveau skip, plafonnés à 180. Un film écarté une fois revient dans deux
- * semaines ; au quatrième ou cinquième skip il sort de fait du feed.
+ * Cooldown avant qu'un film écarté puisse revenir : 90 jours, doublés à chaque
+ * nouveau skip, plafonnés à 365. Un film écarté une fois revient dans trois
+ * mois ; au troisième skip il sort de fait du feed.
  * @param {number} skipCount Nombre total de skips après celui-ci.
  * @return {number} Cooldown en millisecondes.
  */
@@ -4387,6 +4450,9 @@ export const recordSwipes = onRequest(
 
         const body = req.body as Record<string, unknown> | undefined;
         const decisions = parseSwipeDecisions(body?.decisions);
+        // Le modèle apprend sur les votes que le lot a lus pour servir la
+        // carte : relevés par le public français dans une app en français.
+        const french = requestedLanguage(req, res) === 'fr-FR';
         // La mosaïque de départ passée sans rien toucher n'envoie aucune
         // décision, mais elle ne doit pas se rouvrir.
         const startGridDone = body?.startGridDone === true;
@@ -4668,7 +4734,7 @@ export const recordSwipes = onRequest(
         // d'écritures, dans une transaction : c'est une lecture-écriture, et
         // la feuille de saga peut écrire en même temps que le deck.
         const observations = decisions
-            .map(observationOf)
+            .map((d) => observationOf(d, french))
             .filter((obs): obs is deck.Observation => obs !== null);
         if (observations.length > 0 || startGridDone) {
           const profileRef =
@@ -4731,7 +4797,12 @@ async function familyProbes(
       .map((raw) => poolRowFrom(
           raw as unknown as Record<string, unknown>, 'family', [family.key]))
       .filter((row): row is DeckPoolRow => row !== null && !!row.poster_path);
-  return rows.sort((a, b) => (b.vote_count ?? 0) - (a.vote_count ?? 0));
+  // Le plus vu d'abord, au sens du public de l'application : en français,
+  // Les Visiteurs passe devant un film que ses votes TMDB mettaient avant.
+  const french = ctx.language === 'fr-FR';
+  const votes = (row: DeckPoolRow) =>
+    deckVotes(row.original_language, row.vote_count, french) ?? 0;
+  return rows.sort((a, b) => votes(b) - votes(a));
 }
 
 /**
@@ -4949,7 +5020,10 @@ export const getDeckSheet = onRequest(
             .filter((row): row is DeckPoolRow => row !== null && servable(row));
         const vein = (await servableRows(db, neighbors, ctx))
             .map((row) => {
-              const candidate = {...candidateOf(row), neighborCount: 1};
+              const candidate = {
+                ...candidateOf(row, ctx.language === 'fr-FR'),
+                neighborCount: 1,
+              };
               const families = deck.familiesOf(candidate);
               return {row, families, pSeen: deck.pSeenOf(
                   model, candidate, families, declared.birthDecade)};

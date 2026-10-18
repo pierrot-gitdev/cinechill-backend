@@ -199,6 +199,45 @@ const promesseLot = D.composeLot(
 check('la Promesse en retard réserve une carte « à voir »',
     promesseLot.cards.some((c) => c.kind === 'promesse'));
 
+// Une sonde de genre attend quand le rendement est bas, sauf en finitions :
+// à 70 films, un genre jamais sondé doit passer.
+const lowYield = D.emptyModel();
+lowYield.recent = [1, 0, 0, 1, 0, 0, 0, 1, 0, 0];
+const withCoverage = [...catalog, {
+  ...coreeFilm, id: 9998, source: 'coverage', voteCount: 6000,
+  genreIds: [10751], taggedFamilies: [],
+}];
+const coverageOf = (overrides) => {
+  const c = context(lowYield, overrides);
+  return D.composeLot(D.scoreCandidates(withCoverage, c), c)
+      .cards.some((card) => card.kind === 'coverage');
+};
+check('sous un film sur deux, la sonde de genre attend en récolte',
+    !coverageOf({phase: 'recolte', gallerySize: 40}));
+check('en finitions, la sonde de genre passe même sous un film sur deux',
+    coverageOf({phase: 'finitions', gallerySize: 75}));
+
+/* ------------------------------------------------------------------ *
+ *  Le public français
+ * ------------------------------------------------------------------ */
+
+console.log('\nPublic français');
+check('un film en français voit ses votes relevés',
+    D.frenchVotes('fr', 2300) === 2300 * D.FRENCH_VOTE_FACTOR);
+check('un film dans une autre langue ne bouge pas',
+    D.frenchVotes('en', 2300) === 2300 && D.frenchVotes(null, 2300) === 2300);
+check('des votes inconnus restent inconnus',
+    D.frenchVotes('fr', null) === null);
+const visiteurs = {genreIds: [35], originalLanguage: 'fr', year: 1993,
+  voteCount: 2300, voteAverage: 7, neighborCount: 0};
+const visiteursBefore = D.pSeenOf(fresh, visiteurs, ['comedie_fr'], null);
+const visiteursAfter = D.pSeenOf(fresh, {...visiteurs,
+  voteCount: D.frenchVotes('fr', 2300)}, ['comedie_fr'], null);
+console.log(`        Les Visiteurs, a priori : ${visiteursBefore.toFixed(2)} → ${
+  visiteursAfter.toFixed(2)}`);
+check('un succès français remonte sans dépasser un classique mondial',
+    visiteursBefore < 0.3 && visiteursAfter > 0.35 && visiteursAfter < 0.6);
+
 /* ------------------------------------------------------------------ *
  *  4. Les mosaïques
  * ------------------------------------------------------------------ */

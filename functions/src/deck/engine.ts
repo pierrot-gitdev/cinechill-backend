@@ -605,7 +605,9 @@ export type DeckMode = 'normal' | 'recentrage';
 
 /**
  * La phase. Le repérage dure les vingt premières décisions ; les finitions
- * commencent à 70 films, quand les artéfacts en retard prennent le pas.
+ * commencent à 70 films, quand les artéfacts en retard prennent le pas et
+ * que les genres de CinéMatch encore jamais sondés passent, même quand le
+ * rendement est bas.
  * @param {DeckModel} model Modèle.
  * @param {number} gallerySize Films en galerie.
  * @return {DeckPhase} Phase.
@@ -745,6 +747,36 @@ export function pSeenOf(
   const theta = families.reduce((s, k) => s + a * beliefOf(model, k).m, 0);
   return sigmoid(theta + model.beta.m * notoriety(c.voteCount) +
     fixedTerms(c, birthDecade));
+}
+
+/**
+ * Combien de fois on relève les votes TMDB d'un film en français, pour une
+ * application en français.
+ *
+ * Les votes TMDB comptent un public mondial et anglophone : un grand succès
+ * français y reçoit bien moins de votes qu'un film américain vu par autant
+ * de Français, de l'ordre de vingt fois moins. On ne relève que de quatre
+ * fois, parce que la correction vaut pour tout film en français, petit ou
+ * grand, sans savoir lequel a eu un vrai public : un facteur de vingt ferait
+ * passer un film confidentiel pour un classique. Le modèle apprend le reste
+ * des « vu » et « pas vu » de chacun. À recaler sur le journal du deck
+ * (`swipeLog`).
+ */
+export const FRENCH_VOTE_FACTOR = 4;
+
+/**
+ * Les votes d'un film tels que le moteur les lit pour un public français :
+ * relevés de `FRENCH_VOTE_FACTOR` quand le film est en français (langue
+ * d'origine TMDB), inchangés sinon.
+ * @param {?string} originalLanguage Langue d'origine TMDB, ISO 639-1.
+ * @param {?number} voteCount Votes TMDB.
+ * @return {?number} Votes à lire.
+ */
+export function frenchVotes(
+    originalLanguage: string | null, voteCount: number | null,
+): number | null {
+  if (originalLanguage !== 'fr' || voteCount === null) return voteCount;
+  return Math.round(voteCount * FRENCH_VOTE_FACTOR);
 }
 
 /**
@@ -895,9 +927,15 @@ export function composeLot(scored: ScoredCandidate[], ctx: LotContext): Lot {
     }
     // La couverture des genres de CinéMatch, trois sondes par genre puis
     // plus rien ; et l'Éventail s'il manque encore des genres à 50 films.
+    // Sous un rendement d'un film sur deux, la sonde attend : elle coûterait
+    // une carte à qui en perd déjà beaucoup. Mais pas au-delà de 70 films :
+    // un genre jamais sondé à l'arrivée aux cent films est un genre dont
+    // CinéMatch ne sait rien, pas même qu'il est absent. Les finitions sont
+    // le moment de le demander, à une carte par lot.
     const eventailShort = ctx.gallerySize >= 50 &&
       ctx.galleryGenreCount < EVENTAIL_TARGET;
-    if (eventailShort || (ctx.rolling === null || ctx.rolling >= 0.5)) {
+    if (eventailShort || ctx.phase === 'finitions' ||
+      ctx.rolling === null || ctx.rolling >= 0.5) {
       const coverage = firstOf((c) => c.source === 'coverage');
       if (coverage) take(coverage, 'coverage');
     }
