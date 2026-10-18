@@ -158,7 +158,7 @@ check('le voisinage d\'un film vu relève sa probabilité',
 console.log('\nLot');
 function context(model, overrides = {}) {
   return {
-    model, phase: 'recolte', mode: 'normal', birthDecade: null,
+    model, phase: 'recolte', mode: 'normal',
     gallerySize: 40, lovedCount: 5, watchlistSize: 12, galleryGenreCount: 8,
     rolling: D.rollingYield(model.recent), random: rng(11), ...overrides,
   };

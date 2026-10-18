@@ -631,8 +631,6 @@ export interface LotContext {
   model: DeckModel;
   phase: DeckPhase;
   mode: DeckMode;
-  /** Décennie de naissance déclarée, `null` sinon. */
-  birthDecade: number | null;
   gallerySize: number;
   lovedCount: number;
   watchlistSize: number;
@@ -652,22 +650,6 @@ export interface ScoredCandidate extends DeckCandidate {
   value: number;
   /** Ce que la carte vient chercher. */
   kind: 'main' | 'promesse' | 'coverage' | 'explore' | 'reserve';
-}
-
-/**
- * Le facteur de génération : un film sorti avant la naissance se voit
- * moins. Asymétrique, parce que tout ce qui sort après reste accessible.
- * @param {?number} decade Décennie du film.
- * @param {?number} birthDecade Décennie de naissance.
- * @return {number} Multiplicateur entre 0,45 et 1.
- */
-export function generationFactor(
-    decade: number | null, birthDecade: number | null,
-): number {
-  if (decade === null || birthDecade === null) return 1;
-  if (decade >= birthDecade) return 1;
-  const decadesBefore = (birthDecade - decade) / 10;
-  return Math.max(0.45, 1 - 0.14 * decadesBefore);
 }
 
 /**
@@ -719,16 +701,14 @@ export function drawTemperature(phase: DeckPhase, mode: DeckMode): number {
 }
 
 /**
- * Ce qui s'ajoute au logit et ne s'apprend pas : voisinage, génération.
+ * Ce qui s'ajoute au logit et ne s'apprend pas : le voisinage. La décennie
+ * de naissance y comptait aussi ; les familles d'époque apprennent la même
+ * chose des réponses, sans rien demander (retirée le 19 oct. 2026).
  * @param {DeckCandidate} c Candidat.
- * @param {?number} birthDecade Décennie de naissance.
  * @return {number} Terme additif.
  */
-function fixedTerms(c: DeckCandidate, birthDecade: number | null): number {
-  const neighbors = 0.8 * Math.log2(1 + c.neighborCount);
-  const decade = c.year === null ? null : Math.floor(c.year / 10) * 10;
-  const generation = 1.5 * Math.log(generationFactor(decade, birthDecade));
-  return neighbors + generation;
+function fixedTerms(c: DeckCandidate): number {
+  return 0.8 * Math.log2(1 + c.neighborCount);
 }
 
 /**
@@ -736,17 +716,15 @@ function fixedTerms(c: DeckCandidate, birthDecade: number | null): number {
  * @param {DeckModel} model Modèle.
  * @param {DeckCandidate} c Candidat.
  * @param {string[]} families Ses familles.
- * @param {?number} birthDecade Décennie de naissance.
  * @return {number} Probabilité.
  */
 export function pSeenOf(
     model: DeckModel, c: DeckCandidate, families: string[],
-    birthDecade: number | null,
 ): number {
   const a = 1 / families.length;
   const theta = families.reduce((s, k) => s + a * beliefOf(model, k).m, 0);
   return sigmoid(theta + model.beta.m * notoriety(c.voteCount) +
-    fixedTerms(c, birthDecade));
+    fixedTerms(c));
 }
 
 /**
@@ -822,7 +800,7 @@ export function scoreCandidates(
   return candidates.map((c) => {
     const families = familiesOf(c);
     const a = 1 / families.length;
-    const fixed = fixedTerms(c, ctx.birthDecade);
+    const fixed = fixedTerms(c);
     const x = notoriety(c.voteCount);
     const thetaMean = families
         .reduce((s, k) => s + a * beliefOf(ctx.model, k).m, 0);

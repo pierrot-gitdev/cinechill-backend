@@ -2313,12 +2313,9 @@ interface SwipeCounters {
  */
 interface DeclaredProfile {
   bannedGenreIDs: Set<number>;
-  /** Décennie de naissance (1970, 1980, …), ou null si non renseignée. */
-  birthDecade: number | null;
 }
 const EMPTY_DECLARED_PROFILE: DeclaredProfile = {
   bannedGenreIDs: new Set<number>(),
-  birthDecade: null,
 };
 /**
  * Lit `users/{uid}/preferences/profile`, en tolérant son absence — la grande
@@ -2345,11 +2342,10 @@ async function fetchDeclaredProfile(
     }
   }
 
-  const rawDecade = snap.get('birthDecade');
-  const birthDecade = typeof rawDecade === 'number' && rawDecade >= 1930 &&
-    rawDecade <= 2020 ? Math.floor(rawDecade / 10) * 10 : null;
-
-  return {bannedGenreIDs, birthDecade};
+  // `birthDecade`, déclarée dans les anciens réglages, n'est plus lue : le
+  // deck apprend seul, par ses familles d'époque, si l'on connaît les vieux
+  // films (retiré le 19 oct. 2026).
+  return {bannedGenreIDs};
 }
 /**
  * Décennie d'un film à partir de sa date de sortie TMDB.
@@ -3328,7 +3324,6 @@ async function buildFilmLot(
     model,
     phase,
     mode: args.mode,
-    birthDecade: declared.birthDecade,
     gallerySize,
     lovedCount: facts.lovedCount,
     watchlistSize: exclusions.watchlistSize,
@@ -4184,8 +4179,6 @@ async function buildSeriesDeck(
   const scored = [...pool.values()].map((row) => {
     const notoriety = clamp01(
         (Math.log10(Math.max(1, row.vote_count ?? 0)) - 2) / 2.2);
-    const generation = deck.generationFactor(
-        decadeOf(row.release_date), declared.birthDecade);
     let cover = 0;
     let taste = 0;
     for (const id of row.genre_ids ?? []) {
@@ -4199,7 +4192,7 @@ async function buildSeriesDeck(
     const bonus = row.source === 'neighbors' ? 4 : 2;
     return {
       ...row,
-      score: 100 * (0.55 * notoriety * generation + 0.25 * cover +
+      score: 100 * (0.55 * notoriety + 0.25 * cover +
         0.20 * taste) + bonus + Math.random() * 4,
     };
   }).sort((a, b) => b.score - a.score);
@@ -4999,7 +4992,7 @@ export const getDeckSheet = onRequest(
               };
               const families = deck.familiesOf(candidate);
               return {row, families, pSeen: deck.pSeenOf(
-                  model, candidate, families, declared.birthDecade)};
+                  model, candidate, families)};
             })
             .filter((entry) => entry.pSeen >= SHEET_VEIN_P_SEEN)
             .sort((a, b) => b.pSeen - a.pSeen)
