@@ -12,23 +12,15 @@
  *  Module pur : aucune dépendance Firebase, aucun appel réseau.
  * ===================================================================== */
 
-/** Les huit axes, dans l'ordre de la spec de l'espace commun. */
-export const ENGINE_AXES =
-  ['ch', 'ry', 'fa', 'de', 'an', 'to', 'ec', 'in'] as const;
-export type EngineAxis = typeof ENGINE_AXES[number];
-export type EngineAxes = Record<EngineAxis, number>;
-
 /** Un film candidat, tel que le moteur le lit. */
 export interface EngineFilm {
   id: number;
-  axes: EngineAxes;
   genreIds: number[];
   year: number | null;
   voteCount: number | null;
   /** La durée du film, ou celle d'un épisode pour une série. */
   runtime: number | null;
   providerIds: number[];
-  keywordNames: string[];
   listed: boolean;
   certification: string | null;
   /** Séries seulement : saisons sorties. */
@@ -53,14 +45,11 @@ export type SeriesStatus = 'ended' | 'returning' | 'canceled';
  */
 export type Engagement = 'mini' | 'season' | 'long' | 'any';
 
-/** Un film de la galerie, vu, positionné. */
+/** Un film de la galerie, vu. */
 export interface EngineGalleryFilm {
   id: number;
-  axes: EngineAxes;
   genreIds: number[];
   loved: boolean;
-  /** Dernière apparition en affiche de comparaison, en millisecondes. */
-  posterLastShownAt: number | null;
 }
 
 export type Company = 'alone' | 'duo' | 'family';
