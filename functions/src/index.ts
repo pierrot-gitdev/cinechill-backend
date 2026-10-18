@@ -4439,35 +4439,22 @@ function discoverRowToJSON(row: DiscoverRow) {
  * ===================================================================== */
 
 /**
- * Les seuils des cinq artéfacts. Des constantes serveur, pas des valeurs
+ * Les seuils des quatre artéfacts. Des constantes serveur, pas des valeurs
  * client : elles s'ajustent sans release, et la porte raconte toujours l'état
  * que le serveur mesure réellement.
  *
- * La Mémoire à cent films : elle ouvre aussi les comparaisons de « Tes
- * préférences ». Chacune consomme cinq films (quatre affiches et le remplaçant
- * du film gardé), soit soixante sur les douze tours de la Porte ; à vingt, les
- * mêmes affiches revenaient trois fois, à cent aucune ne revient.
+ * Il y en avait cinq jusqu'au 18 octobre 2026 : « Tes préférences » faisait
+ * jouer douze comparaisons entre films vus. Retirée, parce qu'au moment où on
+ * la posait la galerie comptait déjà cent films et douze coups de cœur : douze
+ * duels n'y ajoutaient presque rien, et la personne n'en voyait rien.
  */
 const DOOR_MEMOIRE_TARGET = 100;
 const DOOR_EVENTAIL_TARGET = 6;
 const DOOR_COEUR_TARGET = 12;
-/**
- * Décennies et pays ne gardent plus la porte (CinéMatch v2) : ils restent
- * mesurés et renvoyés dans l'objet `horizons`, que les anciennes versions
- * de l'app lisent encore, mais n'entrent plus dans `unlocked`.
- */
-const DOOR_HORIZONS_DECADES_TARGET = 4;
-const DOOR_HORIZONS_COUNTRIES_TARGET = 3;
-/**
- * « Tes préférences » : les comparaisons jouées entre films vus. Douze
- * suffisent à dire quelles soirées on préfère ; c'est ce que les
- * comparaisons de CinéMatch réclament pour avoir de quoi trancher.
- */
-const DOOR_PREFERENCES_TARGET = 12;
 const DOOR_PROMESSE_TARGET = 10;
 
 /**
- * La Porte des séries : les cinq mêmes étapes, à l'échelle des séries.
+ * La Porte des séries : les quatre mêmes étapes, à l'échelle des séries.
  *
  * Moins que pour les films, et pour deux raisons. On regarde bien moins de
  * séries que de films : un cinéphile en connaît rarement plus de trente. Et
@@ -4477,7 +4464,6 @@ const DOOR_PROMESSE_TARGET = 10;
 const SERIES_DOOR_MEMOIRE_TARGET = 15;
 const SERIES_DOOR_EVENTAIL_TARGET = 4;
 const SERIES_DOOR_COEUR_TARGET = 4;
-const SERIES_DOOR_PREFERENCES_TARGET = 6;
 const SERIES_DOOR_PROMESSE_TARGET = 3;
 /**
  * Films positionnés par appel, au plus. La Galerie s'enrichit paresseusement :
@@ -4496,12 +4482,6 @@ interface DoorArtifact {
 interface DoorState {
   unlocked: boolean;
   artifacts: DoorArtifact[];
-  horizons: {
-    decades: number;
-    decadesTarget: number;
-    countries: number;
-    countriesTarget: number;
-  };
 }
 
 /** La position d'un film de bibliothèque, telle que le cache la garde. */
@@ -4696,23 +4676,16 @@ function pendingGalleryPositions(
 }
 
 /**
- * Mesure l'état des cinq artéfacts sur la bibliothèque telle qu'elle est.
+ * Mesure l'état des quatre artéfacts sur la bibliothèque telle qu'elle est.
  * @param {QuerySnapshot} gallerySnap La Galerie.
  * @param {QuerySnapshot} watchlistSnap La watchlist.
- * @param {Map<string, string[]>} freshOrigins Pays appris pendant cet appel,
- *   pas encore visibles dans le snapshot.
- * @param {number} duelsCount Comparaisons jouées (`taste/duels.count`).
  * @return {DoorState} La porte, artéfact par artéfact.
  */
 function doorStateFrom(
     gallerySnap: QuerySnapshot,
     watchlistSnap: QuerySnapshot,
-    freshOrigins: Map<string, string[]>,
-    duelsCount: number,
 ): DoorState {
   const genres = new Set<number>();
-  const decades = new Set<number>();
-  const countries = new Set<string>();
   let lovedCount = 0;
 
   for (const doc of gallerySnap.docs) {
@@ -4722,62 +4695,18 @@ function doorStateFrom(
         if (typeof id === 'number') genres.add(id);
       }
     }
-    const decade = decadeOf(doc.get('releaseDate'));
-    if (decade !== null) decades.add(decade);
-    const origins = freshOrigins.get(doc.id) ?? doc.get('originCountry');
-    if (Array.isArray(origins)) {
-      for (const code of origins) {
-        if (typeof code === 'string' && code.length > 0) countries.add(code);
-      }
-    }
     if (doc.get('lovedAt') instanceof Timestamp) lovedCount++;
   }
 
-  const memoire = {
-    key: 'memoire',
-    current: gallerySnap.size,
-    target: DOOR_MEMOIRE_TARGET,
-    done: gallerySnap.size >= DOOR_MEMOIRE_TARGET,
-  };
-  const eventail = {
-    key: 'eventail',
-    current: genres.size,
-    target: DOOR_EVENTAIL_TARGET,
-    done: genres.size >= DOOR_EVENTAIL_TARGET,
-  };
-  const coeur = {
-    key: 'coeur',
-    current: lovedCount,
-    target: DOOR_COEUR_TARGET,
-    done: lovedCount >= DOOR_COEUR_TARGET,
-  };
-  // La clé `horizons` est gardée pour ne pas casser les clients installés,
-  // mais l'artéfact est devenu « Tes préférences » : il compte les
-  // comparaisons jouées. Décennies et pays ne restent que dans le détail.
-  const horizons = {
-    key: 'horizons',
-    current: duelsCount,
-    target: DOOR_PREFERENCES_TARGET,
-    done: duelsCount >= DOOR_PREFERENCES_TARGET,
-  };
-  const promesse = {
-    key: 'promesse',
-    current: watchlistSnap.size,
-    target: DOOR_PROMESSE_TARGET,
-    done: watchlistSnap.size >= DOOR_PROMESSE_TARGET,
-  };
-
-  const artifacts = [memoire, eventail, coeur, horizons, promesse];
-  return {
-    unlocked: artifacts.every((artifact) => artifact.done),
-    artifacts,
-    horizons: {
-      decades: decades.size,
-      decadesTarget: DOOR_HORIZONS_DECADES_TARGET,
-      countries: countries.size,
-      countriesTarget: DOOR_HORIZONS_COUNTRIES_TARGET,
-    },
-  };
+  const artifact = (key: string, current: number, target: number) =>
+    ({key, current, target, done: current >= target});
+  const artifacts = [
+    artifact('memoire', gallerySnap.size, DOOR_MEMOIRE_TARGET),
+    artifact('eventail', genres.size, DOOR_EVENTAIL_TARGET),
+    artifact('coeur', lovedCount, DOOR_COEUR_TARGET),
+    artifact('promesse', watchlistSnap.size, DOOR_PROMESSE_TARGET),
+  ];
+  return {unlocked: artifacts.every((a) => a.done), artifacts};
 }
 
 /**
@@ -4788,14 +4717,12 @@ function doorStateFrom(
  * qu'il se pose. La Promesse compte les saisons dans la file.
  * @param {QuerySnapshot} tvGallerySnap Saisons vues.
  * @param {QuerySnapshot} tvWatchlistSnap Saisons à voir.
- * @param {number} duelsCount Comparaisons entre séries jouées.
- * @return {Object} La Porte, au même format que celle des films.
+ * @return {DoorState} La Porte, au même format que celle des films.
  */
 function seriesDoorStateFrom(
     tvGallerySnap: QuerySnapshot,
     tvWatchlistSnap: QuerySnapshot,
-    duelsCount: number,
-): Omit<DoorState, 'horizons'> {
+): DoorState {
   const seriesIds = new Set<number>();
   const genres = new Set<number>();
   let loved = 0;
@@ -4816,7 +4743,6 @@ function seriesDoorStateFrom(
     artifact('memoire', seriesIds.size, SERIES_DOOR_MEMOIRE_TARGET),
     artifact('eventail', genres.size, SERIES_DOOR_EVENTAIL_TARGET),
     artifact('coeur', loved, SERIES_DOOR_COEUR_TARGET),
-    artifact('horizons', duelsCount, SERIES_DOOR_PREFERENCES_TARGET),
     artifact('promesse', tvWatchlistSnap.size, SERIES_DOOR_PROMESSE_TARGET),
   ];
   return {unlocked: artifacts.every((a) => a.done), artifacts};
@@ -4845,7 +4771,7 @@ export const getTasteProfile = onRequest(
         const userRef = db.collection('users').doc(uid);
         const [
           gallerySnap, watchlistSnap, correctionsSnap, historySnap, prefsSnap,
-          duelsSnap, tvGallerySnap, tvWatchlistSnap, seriesDuelsSnap,
+          tvGallerySnap, tvWatchlistSnap,
         ] = await Promise.all([
           filmsIn(userRef.collection('gallery')).get(),
           filmsIn(userRef.collection('watchlist')).get(),
@@ -4853,10 +4779,8 @@ export const getTasteProfile = onRequest(
           userRef.collection('recommendationHistory')
               .orderBy('createdAt', 'desc').limit(20).get(),
           userRef.collection('taste').doc('filmPrefs').get(),
-          userRef.collection('taste').doc('duels').get(),
           userRef.collection('gallery').where('mediaType', '==', 'tv').get(),
           userRef.collection('watchlist').where('mediaType', '==', 'tv').get(),
-          userRef.collection('taste').doc('seriesDuels').get(),
         ]);
 
         const corrections: Partial<AxisVector> = {};
@@ -4868,18 +4792,13 @@ export const getTasteProfile = onRequest(
         }
 
         // Le rattrapage C1 : quelques films positionnés par ouverture, via le
-        // cache global. La porte y lit les pays au passage, le trait les
-        // positions — un seul chemin d'enrichissement pour les deux.
+        // cache global, pour le trait.
         const pending = pendingGalleryPositions(gallerySnap);
         let freshPositions = new Map<string, FilmPosition>();
         if (pending.length > 0) {
           freshPositions = await positionGalleryDocs(
               pending.slice(0, GALLERY_POSITION_BATCH), tmdb(req, res), db,
           );
-        }
-        const freshOrigins = new Map<string, string[]>();
-        for (const [id, position] of freshPositions) {
-          freshOrigins.set(id, position.originCountry);
         }
 
         const outcomes = readSessionOutcomes(historySnap);
@@ -4892,18 +4811,8 @@ export const getTasteProfile = onRequest(
             parseFilmPrefs(prefsSnap),
         );
 
-        const rawDuels = duelsSnap.get('count');
-        const duelsCount = typeof rawDuels === 'number' &&
-          Number.isFinite(rawDuels) ? Math.max(0, rawDuels) : 0;
-        const door = doorStateFrom(
-            gallerySnap, watchlistSnap, freshOrigins, duelsCount,
-        );
-        const rawSeriesDuels = seriesDuelsSnap.get('count');
-        const seriesDoor = seriesDoorStateFrom(
-            tvGallerySnap, tvWatchlistSnap,
-            typeof rawSeriesDuels === 'number' && rawSeriesDuels > 0 ?
-              rawSeriesDuels : 0,
-        );
+        const door = doorStateFrom(gallerySnap, watchlistSnap);
+        const seriesDoor = seriesDoorStateFrom(tvGallerySnap, tvWatchlistSnap);
 
         res.status(200).json({
           mu: trait.mu,
@@ -5107,9 +5016,6 @@ export const recordSessionOutcome = onRequest(
 
 /** Le score de départ d'un film jamais duellé. */
 const ELO_START = 1000;
-/** Le pas d'apprentissage d'un duel. Classique, et volontairement vif : le
- * graphe doit parler après une poignée de duels, pas après cent. */
-const ELO_K = 32;
 /** Ce que vaut un « resté avec moi » : un duel gagné d'office, l'ordre de
  * grandeur d'une victoire nette contre le champ. */
 const ELO_STAYED_BONUS = 40;
@@ -5143,89 +5049,6 @@ async function bumpFilmPref(
     }, {merge: true});
   });
 }
-
-/**
- * Un duel entre deux films **vus** : « tu as vu les deux, lequel tu
- * relancerais ce soir ? » La réponse s'écrit dans le graphe de préférence
- * persistant — un score léger type Elo par film de la Galerie — qui résout
- * « voir ≠ aimer » sans jamais demander une note.
- */
-export const recordFilmDuel = onRequest(
-    {invoker: 'public', timeoutSeconds: 20},
-    async (req: Request, res: Response) => {
-      try {
-        if (req.method !== 'POST') {
-          res.status(405).json({error: 'method_not_allowed'});
-          return;
-        }
-        const uid = await verifyAuth(req, res);
-        if (!uid) return;
-
-        const body = (req.body ?? {}) as Record<string, unknown>;
-        const winnerId = Number(body.winnerTmdbId);
-        const loserId = Number(body.loserTmdbId);
-        if (!Number.isFinite(winnerId) || !Number.isFinite(loserId) ||
-          winnerId === loserId) {
-          res.status(400).json({error: 'invalid_duel'});
-          return;
-        }
-
-        const tasteRef = getAdmin().firestore()
-            .collection('users').doc(uid)
-            .collection('taste');
-        // Deux graphes : un duel entre séries ne dit rien des films.
-        const store = cineMatchStoreFor(cineMatchFormatOf(body.format));
-        const prefsRef = tasteRef.doc(store.prefs);
-        // Le compteur de la Porte (« Tes préférences ») : tenu à part pour
-        // ne pas avoir à sommer les victoires du graphe à chaque ouverture.
-        const duelsRef = tasteRef.doc(store.duels);
-
-        await prefsRef.firestore.runTransaction(async (txn) => {
-          const snap = await txn.get(prefsRef);
-          const read = (id: number): Record<string, unknown> =>
-            (snap.get(String(id)) ?? {}) as Record<string, unknown>;
-          const winner = read(winnerId);
-          const loser = read(loserId);
-          const winnerRating =
-            typeof winner.r === 'number' ? winner.r : ELO_START;
-          const loserRating =
-            typeof loser.r === 'number' ? loser.r : ELO_START;
-
-          // Elo standard : la victoire attendue rapporte peu, la surprise
-          // beaucoup — c'est ce qui fait converger le graphe vite sans
-          // qu'une préférence évidente écrase tout.
-          const expected =
-            1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
-          const gain = ELO_K * (1 - expected);
-          const now = Timestamp.now();
-
-          txn.set(prefsRef, {
-            [String(winnerId)]: {
-              r: winnerRating + gain,
-              w: (typeof winner.w === 'number' ? winner.w : 0) + 1,
-              l: typeof winner.l === 'number' ? winner.l : 0,
-              at: now,
-            },
-            [String(loserId)]: {
-              r: loserRating - gain,
-              w: typeof loser.w === 'number' ? loser.w : 0,
-              l: (typeof loser.l === 'number' ? loser.l : 0) + 1,
-              at: now,
-            },
-          }, {merge: true});
-          txn.set(duelsRef, {
-            count: FieldValue.increment(1),
-            updatedAt: now,
-          }, {merge: true});
-        });
-
-        res.status(200).json({ok: true});
-      } catch (error) {
-        logger.error('recordFilmDuel failed', {error});
-        res.status(500).json({error: 'internal_error'});
-      }
-    },
-);
 
 /**
  * Les films de la Galerie, positionnés (C1), prêts pour les duels du client.
@@ -12619,7 +12442,6 @@ type CineMatchFormat = 'film' | 'series';
 interface CineMatchStore {
   exposure: string;
   prefs: string;
-  duels: string;
   history: string;
   daily: string;
 }
@@ -12643,13 +12465,11 @@ function cineMatchStoreFor(format: CineMatchFormat): CineMatchStore {
   return format === 'series' ? {
     exposure: 'cinematchSeriesExposure',
     prefs: 'seriesPrefs',
-    duels: 'seriesDuels',
     history: 'seriesHistory',
     daily: 'dailySeries',
   } : {
     exposure: 'cinematchExposure',
     prefs: 'filmPrefs',
-    duels: 'duels',
     history: 'recommendationHistory',
     daily: 'daily',
   };
@@ -13035,134 +12855,6 @@ async function loadSeriesAbandons(
     axes: [...metas.values()].map((meta) => meta.axes),
   };
 }
-
-/**
- * La forme JSON d'un film de galerie pour le client.
- * @param {CineMatchGalleryEntry} entry Film de galerie.
- * @return {Object} `GalleryFilm` du contrat.
- */
-function cineMatchGalleryFilmJSON(entry: CineMatchGalleryEntry) {
-  return {
-    id: entry.film.id,
-    title: entry.title,
-    poster_path: entry.posterPath,
-    release_date: entry.releaseDate,
-    genre_ids: entry.film.genreIds,
-  };
-}
-
-/**
- * Prépare une comparaison entre quatre films vus.
- *
- * Le nombre de comparaisons suit la galerie (une par tranche de cinq films
- * positionnés, quatre au plus). La Porte, elle, en demande douze d'affilée :
- * elle lève la limite et recycle les films les moins récemment montrés.
- */
-export const getCineMatchComparison = onRequest(
-    {secrets: [tmdbApiKey], invoker: 'public', timeoutSeconds: 30},
-    async (req: Request, res: Response) => {
-      try {
-        if (req.method !== 'POST') {
-          res.status(405).json({error: 'method_not_allowed'});
-          return;
-        }
-        const uid = await verifyAuth(req, res);
-        if (!uid) return;
-
-        const body = (req.body ?? {}) as Record<string, unknown>;
-        const round = Number(body.round);
-        if (!Number.isInteger(round) || round < 1 || round > 100) {
-          res.status(400).json({error: 'invalid_round'});
-          return;
-        }
-        const shownIds = parseTmdbIdList(body.shownIds, 500);
-        const history = parseCineMatchComparisons(body.history);
-        const forDoor = body.purpose === 'door';
-        const format = cineMatchFormatOf(body.format);
-        const memoireTarget = format === 'series' ?
-          SERIES_DOOR_MEMOIRE_TARGET : DOOR_MEMOIRE_TARGET;
-
-        const db = getAdmin().firestore();
-        const userRef = db.collection('users').doc(uid);
-        const ctx = tmdb(req, res);
-        const [gallery, posterSnap] = await Promise.all([
-          format === 'series' ?
-            loadSeriesGallery(db, userRef, ctx) :
-            loadCineMatchGallery(db, userRef, ctx),
-          userRef.collection(cineMatchStoreFor(format).exposure)
-              .where('posterLastShownAt', '>',
-                  Timestamp.fromMillis(0))
-              .get(),
-        ]);
-
-        const total = engine.comparisonTotal(gallery.positioned.length);
-        // La Porte ne compare qu'une galerie qui a déjà sa Mémoire : en
-        // dessous, le recyclage ferait revenir les mêmes affiches d'un tour
-        // à l'autre. L'app ferme l'accès, le serveur tient la même règle.
-        if (forDoor && gallery.size < memoireTarget) {
-          res.status(200).json({
-            total, round, films: [], replacements: {}, excludeFilms: [],
-          });
-          return;
-        }
-        if (!forDoor && round > total) {
-          res.status(200).json({
-            total, round, films: [], replacements: {}, excludeFilms: [],
-          });
-          return;
-        }
-
-        const posterTimes = new Map<number, number>();
-        for (const doc of posterSnap.docs) {
-          const at = millisOf(doc.get('posterLastShownAt'));
-          const id = Number(doc.get('tmdbId') ?? doc.id);
-          if (at !== null && Number.isInteger(id)) posterTimes.set(id, at);
-        }
-        const entries = new Map<number, CineMatchGalleryEntry>();
-        const films = gallery.positioned.map((entry) => {
-          entries.set(entry.film.id, entry);
-          return {
-            ...entry.film,
-            posterLastShownAt: posterTimes.get(entry.film.id) ?? null,
-          };
-        });
-
-        const plan = engine.planComparison({
-          gallery: films,
-          shownIds,
-          history,
-          round,
-          seedKey: `${uid}:${parisDay(new Date())}`,
-          recycle: forDoor,
-        });
-
-        const replacements: Record<string, unknown> = {};
-        for (const [id, film] of plan.replacements) {
-          const entry = entries.get(film.id);
-          if (entry) replacements[String(id)] = cineMatchGalleryFilmJSON(entry);
-        }
-        res.status(200).json({
-          total,
-          round,
-          films: plan.films
-              .map((film) => entries.get(film.id))
-              .filter((e): e is CineMatchGalleryEntry => e !== undefined)
-              .map(cineMatchGalleryFilmJSON),
-          replacements: plan.films.length > 0 ? replacements : {},
-          excludeFilms: plan.films.length > 0 ?
-            plan.excludeFilms
-                .map((film) => entries.get(film.id))
-                .filter((e): e is CineMatchGalleryEntry => e !== undefined)
-                .map(cineMatchGalleryFilmJSON) :
-            [],
-        });
-      } catch (error) {
-        if (sendTMDBError(error, res)) return;
-        logger.error('getCineMatchComparison failed', {error});
-        res.status(500).json({error: 'internal_error'});
-      }
-    },
-);
 
 /**
  * Les paramètres `/discover/movie` d'une soirée.
