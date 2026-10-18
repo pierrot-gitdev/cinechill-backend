@@ -18,6 +18,8 @@ const M = require('../../lib/carte/model.js');
 const L = require('../../lib/carte/linalg.js');
 const P = require('../../lib/carte/pipeline.js');
 const C = require('../../lib/carte/catalog.js');
+const E = require('../../lib/carte/evening.js');
+const S = require('../../lib/carte/session.js');
 
 let failures = 0;
 let checks = 0;
@@ -322,6 +324,171 @@ function fakeTmdb(count, {gone = new Set(), failing = new Set(), delayMs = 0} = 
   });
   check('le temps imparti arrête la lecture des fiches', timed.films.length < 200 && timed.report.deferred === 200 - timed.films.length,
       JSON.stringify(timed.report));
+}
+
+/* ------------------------------------------------------------------ *
+ *  Le moteur du soir
+ * ------------------------------------------------------------------ */
+
+{
+  const params = {...E.DEFAULT_EVENING_PARAMS};
+  const k = carte.k;
+  const famRows = (f) => films.map((x, i) => i).filter((i) => films[i].fam === f);
+  // Quelqu'un qui aime les polars et la science-fiction.
+  const gallery = [...famRows(0).slice(0, 15), ...famRows(1).slice(0, 15)]
+      .map((i) => ({id: films[i].id, loved: i % 3 === 0, disliked: false}));
+  const prior = E.eveningPrior(carte, gallery, params);
+  const trace = (p) => { const c = L.inverseSpd(Float64Array.from(p.precision), k); let t = 0; for (let d = 0; d < k; d++) t += c[d * k + d]; return t; };
+
+  // Il choisit un film de science-fiction parmi six (trois polars, trois SF).
+  const shownRows = [...famRows(0).slice(20, 23), ...famRows(1).slice(20, 23)];
+  const shown = shownRows.map((r) => E.vectorOf(carte, r));
+  const after = E.updateChoice(prior, shown, 3, params);
+  check('un choix rapproche le point du film pris',
+      L.dot(shown[3], after.mean, k) > L.dot(shown[3], prior.mean, k));
+  const sfShare = (p) => {
+    const scored = films.map((f, i) => ({f: f.fam, s: L.dot(carte.vectors, p.mean, k, i * k, 0)}))
+        .sort((a, b) => b.s - a.s).slice(0, 20);
+    return scored.filter((x) => x.f === 1).length / 20;
+  };
+  check('après le choix, la science-fiction passe devant', sfShare(after) > sfShare(prior),
+      `${sfShare(prior)} → ${sfShare(after)}`);
+  check('un choix resserre le nuage', trace(after) < trace(prior), `${trace(prior).toFixed(4)} → ${trace(after).toFixed(4)}`);
+  const none = E.updateChoice(prior, shown, null, params);
+  check('« aucun de ceux-là » éloigne le point de tous les films montrés',
+      shown.every((y) => L.dot(y, none.mean, k) < L.dot(y, prior.mean, k)));
+  const probs = E.choiceProbabilities(prior, shown, params);
+  check('les probabilités de réponse font 1', Math.abs(probs.reduce((a, b) => a + b, 0) - 1) < 1e-9 && probs.length === 7);
+
+  // Les tirages suivent le nuage.
+  const random = L.rng(99);
+  const draws = 4000;
+  const m = new Float64Array(k);
+  const samples = [];
+  for (let t = 0; t < draws; t++) { const e = E.drawPoint(after, random); samples.push(e); for (let d = 0; d < k; d++) m[d] += e[d] / draws; }
+  const cov = L.inverseSpd(Float64Array.from(after.precision), k);
+  let worstMean = 0;
+  for (let d = 0; d < k; d++) worstMean = Math.max(worstMean, Math.abs(m[d] - after.mean[d]) / Math.sqrt(cov[d * k + d]));
+  let v00 = 0;
+  for (const e of samples) v00 += (e[0] - m[0]) ** 2 / (draws - 1);
+  check('les tirages ont la moyenne du nuage', worstMean < 0.1, worstMean);
+  check('et sa largeur', Math.abs(v00 / cov[0] - 1) < 0.1, (v00 / cov[0]).toFixed(3));
+
+  // Un écran de la galerie : six films, aucun doublon, une saga une fois.
+  const galleryRows = gallery.map((g) => carte.index.get(g.id));
+  films[galleryRows[0]].collection = 77;
+  films[galleryRows[1]].collection = 77;
+  const screen = E.drawScreen(carte, galleryRows, prior, 6, params, L.rng(5));
+  check('un écran a six films différents de la galerie',
+      screen.length === 6 && new Set(screen).size === 6 && screen.every((r) => galleryRows.includes(r)));
+  check('un écran ne montre pas deux films de la même saga',
+      screen.filter((r) => films[r].collection === 77).length <= 1);
+
+  // Les cinq.
+  const candidateRows = films.map((f, i) => i).filter((i) => !galleryRows.includes(i));
+  films[candidateRows[0]].collection = 88;
+  films[candidateRows[4]].collection = 88;
+  const cands = E.prepareCandidates(carte, candidateRows, (r) => films[r].voteAverage + (r % 5) * 0.1, null, null, params);
+  const vecOf = (id) => { const r = carte.index.get(id); return r === undefined ? null : E.vectorOf(carte, r); };
+  const anchorEvening = E.eveningFromTouches(carte, prior,
+      [{kind: 'anchor', shown: shownRows.map((r) => films[r].id), chosen: films[shownRows[3]].id}], vecOf, params);
+  const slate = E.drawSlate(carte, cands, anchorEvening, 5, params, L.rng(11), 100);
+  check('cinq films, différents, hors galerie', slate.rows.length === 5 && new Set(slate.rows).size === 5 &&
+      slate.rows.every((r) => !galleryRows.includes(r)));
+  check('une probabilité d\'affichage par film, entre 0 et 1',
+      slate.rows.every((r) => slate.propensity.get(r) >= 0 && slate.propensity.get(r) <= 1));
+  const sfInFive = slate.rows.filter((r) => films[r].fam === 1).length;
+  check('après un choix de science-fiction, les cinq en sont surtout', sfInFive >= 3, sfInFive);
+  const twoSagas = E.expectedSlate(carte, cands, after, 5, params).filter((r) => films[r].collection === 88).length;
+  check('les cinq ne montrent qu\'un film d\'une saga', twoSagas <= 1);
+  // δ : sans pénalité de ressemblance, les cinq se ressemblent plus.
+  const meanCos = (rows) => { let s = 0, n = 0; for (let a = 0; a < rows.length; a++) for (let b = a + 1; b < rows.length; b++) { s += M.proximity(carte, rows[a], rows[b]); n++; } return s / n; };
+  const tight = E.expectedSlate(carte, cands, after, 5, {...params, delta: 0});
+  const varied = E.expectedSlate(carte, cands, after, 5, {...params, delta: 3});
+  check('δ rend les cinq plus variés', meanCos(varied) < meanCos(tight), `${meanCos(tight).toFixed(3)} → ${meanCos(varied).toFixed(3)}`);
+
+  // La règle des écrans.
+  check('des réponses qui ne changent rien : zéro film changé',
+      E.expectedChange([1, 2, 3, 4, 5], [[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], [0.5, 0.5]) === 0);
+  check('les films changés se pondèrent par la probabilité de la réponse',
+      Math.abs(E.expectedChange([1, 2, 3, 4, 5], [[1, 2, 3, 9, 8], [6, 7, 8, 9, 10]], [0.75, 0.25]) - 2.75) < 1e-12);
+
+  // La cible du soir : 60 % du chemin vers la position du film choisi.
+  const filmPoint = shown[3];
+  const declared = E.declareTargets(carte, prior, [filmPoint], params);
+  const ratio = E.spreadOf(carte, prior.mean) / E.spreadOf(carte, filmPoint);
+  const scaled = Float64Array.from(filmPoint, (v) => v * ratio);
+  // L'étalement se calcule sans parcourir les films : vérifions-le contre le calcul direct.
+  const direct = (() => { const v = films.map((f, i) => L.dot(carte.vectors, prior.mean, k, i * k, 0)); const m = v.reduce((a, b) => a + b, 0) / v.length; return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length); })();
+  check('l\'étalement des notes, calculé par la covariance', Math.abs(E.spreadOf(carte, prior.mean) - direct) < 1e-6 * Math.max(1, direct), `${E.spreadOf(carte, prior.mean)} / ${direct}`);
+  let gap = 0;
+  for (let d = 0; d < k; d++) gap = Math.max(gap, Math.abs(declared.mean[d] - (0.4 * prior.mean[d] + 0.6 * scaled[d])));
+  check('la cible du soir pèse 60 %', gap < 1e-12, gap);
+  check('et resserre le nuage', trace(declared) < trace(prior));
+  const vecFor = (id) => { const r = carte.index.get(id); return r === undefined ? null : E.vectorOf(carte, r); };
+  const fromTouches = E.eveningFromTouches(carte, prior,
+      [{kind: 'anchor', shown: shownRows.map((r) => films[r].id), chosen: films[shownRows[3]].id}], vecFor, params);
+  check('le film de départ, relu, fait passer la science-fiction devant', sfShare(fromTouches) > sfShare(prior) && sfShare(fromTouches) >= 0.8,
+      `${sfShare(prior)} → ${sfShare(fromTouches)}`);
+  const refusedAll = E.eveningFromTouches(carte, prior,
+      [{kind: 'refused', shown: [films[shownRows[3]].id], chosen: null}], vecFor, params);
+  check('« Pas celui-là » éloigne le point du film', L.dot(shown[3], refusedAll.mean, k) < L.dot(shown[3], prior.mean, k));
+  const unknown = E.eveningFromTouches(carte, prior, [{kind: 'anchor', shown: [999999], chosen: 999999}], vecFor, params);
+  check('un film sans position ne déplace rien', unknown.mean.every((v, d) => v === prior.mean[d]));
+
+  // Un film hors carte, placé par ses voisins de fiche.
+  const target = famRows(2)[3];
+  const folded = E.foldIn(carte, (r) => (r !== target && films[r].fam === 2 ? 1 / (1 + Math.abs(r - target)) : 0), 10);
+  const near = films.map((f, i) => ({i, s: L.dot(carte.vectors, folded, k, i * k, 0) /
+      (M.norm(carte, i) * Math.hypot(...folded))})).sort((a, b) => b.s - a.s).slice(0, 10);
+  check('un film hors carte se place parmi ses voisins de fiche', near.filter((x) => films[x.i].fam === 2).length >= 9);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Relire la soirée, entrelacer
+ * ------------------------------------------------------------------ */
+
+{
+  const events = [
+    {type: 'styles', served: ['thriller', 'drama']},
+    {type: 'starters', style: 'thriller', page: 0, served: [1, 2, 3, 4, 5, 6], afterShown: 0},
+    {type: 'starters', style: 'thriller', page: 1, served: [7, 8, 9, 10, 11, 12], afterShown: 6},
+    {type: 'near', anchorId: 9, served: [20, 21, 22]},
+    {type: 'picks', served: [{id: 100}, {id: 101}]},
+    {type: 'replace', served: [{id: 102}], refusedIds: [100], seenIds: []},
+  ];
+  const t = S.touchesFromJournal(events, {anchorId: 9, secondId: 21, refusedIds: [101]});
+  check('« Pas ceux-là » : aucun des six premiers', t[0].kind === 'none-of-screen' && t[0].chosen === null && t[0].shown.join() === '1,2,3,4,5,6');
+  check('le film de départ, pris parmi son écran', t[1].kind === 'anchor' && t[1].chosen === 9 && t[1].shown.join() === '7,8,9,10,11,12');
+  check('le second film, pris parmi les voisins et le film de départ', t[2].kind === 'second' && t[2].chosen === 21 && t[2].shown.join() === '20,21,22,9');
+  check('les films écartés, du journal et de la demande', t.slice(3).map((x) => x.shown[0]).join() === '100,101' && t.slice(3).every((x) => x.chosen === null));
+  const same = S.touchesFromJournal(events, {anchorId: 9, secondId: null, refusedIds: []});
+  check('« Pile comme » : le film de départ pris parmi ses voisins', same[2].kind === 'same' && same[2].chosen === 9);
+  const skipped = S.touchesFromJournal([{type: 'starters', served: [1, 2], afterShown: 0}, {type: 'near', anchorId: 2, served: []}],
+      {anchorId: 2, secondId: null, refusedIds: []});
+  check('un écran de voisins sauté ne compte pas', skipped.length === 1 && skipped[0].kind === 'anchor');
+  const any = S.touchesFromJournal(events, {anchorId: null, secondId: null, refusedIds: []});
+  check('« Peu importe » : seulement les refus', any.every((x) => x.kind !== 'anchor') && any.some((x) => x.kind === 'refused'));
+  const lone = S.touchesFromJournal([], {anchorId: 5, secondId: null, refusedIds: []});
+  check('un film de départ sans journal reste un choix', lone.length === 1 && lone[0].shown.join() === '5');
+
+  // Entrelacement.
+  const a = [1, 2, 3, 4, 5, 6, 7];
+  const b = [3, 8, 9, 1, 10, 11];
+  let balanced = true;
+  let firstA = 0;
+  for (let seed = 0; seed < 200; seed++) {
+    const d = S.teamDraft(a, b, ['fiche', 'carte'], 5, L.rng(seed));
+    const na = d.filter((x) => x.team === 'fiche').length;
+    if (d.length !== 5 || new Set(d.map((x) => x.id)).size !== 5 || Math.abs(na - (5 - na)) > 1) balanced = false;
+    if (d[0].team === 'fiche') firstA++;
+  }
+  check('l\'entrelacement rend cinq films, à parts égales à un près', balanced);
+  check('le premier choix revient à l\'un ou l\'autre au hasard', firstA > 70 && firstA < 130, firstA);
+  const saga = S.teamDraft([1, 2, 3], [4, 5, 6], ['x', 'y'], 4, L.rng(1), (id) => (id === 1 || id === 4 ? 9 : null));
+  check('l\'entrelacement ne prend qu\'un film d\'une saga', saga.filter((x) => x.id === 1 || x.id === 4).length === 1);
+  const short = S.teamDraft([1], [2, 3, 4, 5, 6], ['x', 'y'], 5, L.rng(2));
+  check('un moteur à court laisse l\'autre compléter', short.length === 5);
 }
 
 console.log(`${checks - failures}/${checks} vérifications`);

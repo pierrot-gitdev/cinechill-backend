@@ -26,8 +26,13 @@ import * as engine from './cinematch/engine';
 import * as fiche from './cinematch/fiche';
 import * as series from './series';
 import * as deck from './deck/engine';
-import {CARTE_DETAIL_APPEND, DiscoverPage} from './carte/catalog';
+import {
+  CARTE_DETAIL_APPEND, DiscoverPage, ficheOfCarteFilm,
+} from './carte/catalog';
+import * as carteEvening from './carte/evening';
+import * as carteModel from './carte/model';
 import {CarteSource} from './carte/pipeline';
+import * as carteSession from './carte/session';
 import * as carteStore from './carte/store';
 
 /**
@@ -4349,8 +4354,26 @@ async function enrichCandidate(
     const originCountry = detailOrigins.length > 0 ?
       detailOrigins : productionCountries;
 
+    // Un film venu de la carte n'arrive qu'avec son identifiant : ce qui
+    // s'affiche se lit alors sur la fiche, dans la langue de l'appel.
+    const detailGenres = Array.isArray(detail.genres) ?
+      (detail.genres as {id?: unknown}[])
+          .map((g) => g.id)
+          .filter((id): id is number => typeof id === 'number') : [];
+    const text = (key: string): string | null =>
+      typeof detail[key] === 'string' ? detail[key] as string : null;
+    const num = (key: string): number | null =>
+      typeof detail[key] === 'number' ? detail[key] as number : null;
     return {
       ...row,
+      title: row.title ?? text('title') ?? undefined,
+      overview: row.overview ?? text('overview'),
+      poster_path: row.poster_path ?? text('poster_path'),
+      release_date: row.release_date ?? text('release_date'),
+      vote_average: row.vote_average ?? num('vote_average'),
+      vote_count: row.vote_count ?? num('vote_count'),
+      popularity: row.popularity ?? num('popularity'),
+      genre_ids: row.genre_ids ?? detailGenres,
       origin_country: originCountry,
       runtimeMinutes:
         typeof detail.runtime === 'number' ? detail.runtime : null,
@@ -13407,7 +13430,7 @@ export const getCineMatchDaily = onRequest(
             typeof storedFilm === 'object' && storedFilm !== null) {
           await journalEvening(userRef, format, eveningId, {
             type: 'daily', situation, served: [Number(stored.get('tmdbId'))],
-            cached: true,
+            cached: true, engine: stored.get('engine') ?? 'fiche',
           });
           res.status(200).json({film: storedFilm, date: today});
           return;
@@ -13453,6 +13476,46 @@ export const getCineMatchDaily = onRequest(
           return;
         }
 
+        // Un jour sur deux, au hasard mais le même toute la journée, la
+        // proposition vient de la carte : les deux moteurs se mesurent aussi
+        // ici, sur ce qui est lancé puis aimé.
+        const rt = carteServes(situation) ?
+          await loadCarteRuntime(db).catch((error) => {
+            logger.error('loadCarteRuntime failed', {error});
+            return null;
+          }) : null;
+        if (rt && engine.seededRandom(`${uid}:${today}:daily-engine`)() < 0.5) {
+          const daily = await carteDaily(db, rt, uid, situation, today, ctx)
+              .catch((error) => {
+                logger.error('carteDaily failed', {error});
+                return null;
+              });
+          if (daily) {
+            const film = cineMatchFiveFilmJSON(daily.candidate);
+            const id = daily.candidate.id;
+            await Promise.all([
+              journalEvening(userRef, format, eveningId, {
+                type: 'daily', situation, served: [id], cached: false,
+                engine: 'carte', propensity: daily.propensity,
+              }),
+              dailyRef.set({date: today, tmdbId: id, film, engine: 'carte'}),
+              userRef.collection('recommendationHistory').add({
+                createdAt: Timestamp.now(),
+                kind: 'daily',
+                tmdbIds: [id],
+                films: [{
+                  id, title: daily.candidate.title ?? null, rank: 1,
+                  team: 'carte', source: 'carte',
+                  propensity: daily.propensity,
+                }],
+                answers: {situation, engine: 'carte'},
+              }),
+            ]);
+            res.status(200).json({film, date: today});
+            return;
+          }
+        }
+
         const setup = await loadCineMatchSetup(db, uid, situation, ctx);
         const result = await runFilmPicks(db, setup, request, ctx);
         const top = result.picks
@@ -13471,8 +13534,10 @@ export const getCineMatchDaily = onRequest(
         await Promise.all([
           journalEvening(userRef, format, eveningId, {
             type: 'daily', situation, served: [candidate.id], cached: false,
+            engine: 'fiche',
           }),
-          dailyRef.set({date: today, tmdbId: candidate.id, film}),
+          dailyRef.set({date: today, tmdbId: candidate.id, film,
+            engine: 'fiche'}),
           userRef.collection('recommendationHistory').add({
             createdAt: now,
             kind: 'daily',
@@ -13988,10 +14053,32 @@ export const getCineMatchStarters = onRequest(
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
         const ctx = tmdb(req, res);
-        const films = await loadStarterGallery(db, userRef, format, ctx);
+        // Les films passent par la carte quand il y en a une ; une erreur de
+        // sa part retombe sur la fiche, sans priver la soirée de ses écrans.
+        const rt = format === 'film' ?
+          await loadCarteRuntime(db).catch((error) => {
+            logger.error('loadCarteRuntime failed', {error});
+            return null;
+          }) : null;
+        const carteGallery = rt ? await loadCarteGallery(userRef) : null;
+        const films = carteGallery ? carteGallery.films :
+          await loadStarterGallery(db, userRef, format, ctx);
         const day = parisDay(new Date());
 
         if (nearId !== null) {
+          const fromCarte = rt && carteGallery ?
+            await carteNear(db, rt, uid, carteGallery, nearId, eveningId, ctx)
+                .catch((error) => {
+                  logger.error('carteNear failed', {error});
+                  return null;
+                }) : null;
+          if (fromCarte) {
+            await journalEvening(userRef, format, eveningId, {
+              ...fromCarte.journal, type: 'near',
+            });
+            res.status(200).json(fromCarte.response);
+            return;
+          }
           const near = await nearStarters(db, format, nearId, films, ctx);
           await journalEvening(userRef, format, eveningId, {
             type: 'near',
@@ -14031,6 +14118,53 @@ export const getCineMatchStarters = onRequest(
         const members = films.filter((film) =>
           fiche.inStyle(film.genreIds, style));
         const ids = members.map((film) => film.id);
+        const pages =
+          Math.max(1, Math.ceil(members.length / STARTERS_PER_PAGE));
+
+        if (rt && carteGallery) {
+          const answered = await (async () => {
+            const [posters, events] = await Promise.all([
+              userRef.collection(cineMatchStoreFor(format).exposure)
+                  .where('posterLastShownAt', '>',
+                      Timestamp.fromMillis(Date.now() - STARTER_REST_MS))
+                  .get(),
+              eveningEvents(userRef, eveningId),
+            ]);
+            const recent = new Set(posters.docs
+                .map((doc) => Number(doc.get('tmdbId') ?? doc.id))
+                .filter((id) => Number.isInteger(id)));
+            return carteStarters(rt, uid, carteGallery, members, shownIds,
+                recent, events, `${day}:${style}:${shownIds.size}`);
+          })().catch((error) => {
+            logger.error('carteStarters failed', {error});
+            return null;
+          });
+          if (answered) {
+            const current = answered.restarted ? 0 : page % pages;
+            const filler = await knownFilmsOfStyle(style, format,
+                new Set(ids), STARTERS_PER_PAGE - answered.films.length, ctx);
+            await journalEvening(userRef, format, eveningId, {
+              type: 'starters',
+              style,
+              page: current,
+              served: [...answered.films.map((film) => film.id),
+                ...filler.map((film) => film.id)],
+              afterShown: shownIds.size,
+              restarted: answered.restarted,
+              engine: 'carte',
+            });
+            res.status(200).json({
+              style,
+              page: current,
+              films: [...answered.films.map((film) => starterFilmJSON(film)),
+                ...filler],
+              hasMore: pages > 1,
+              restarted: answered.restarted,
+            });
+            return;
+          }
+        }
+
         const [posterSnap, sheets] = await Promise.all([
           userRef.collection(cineMatchStoreFor(format).exposure)
               .where('posterLastShownAt', '>',
@@ -14059,7 +14193,6 @@ export const getCineMatchStarters = onRequest(
               .map((f) => f.id)),
         });
 
-        const pages = Math.max(1, Math.ceil(order.length / STARTERS_PER_PAGE));
         // Sans liste, la page dit où l'on en est. Avec, on prend les six
         // premiers pas encore montrés, et l'on repart du début une fois le
         // style parcouru (`restarted`, pour que l'app remette sa liste à
@@ -14833,10 +14966,11 @@ export const getCineMatchPicks = onRequest(
         const eveningId = eveningIdOf(body.eveningId);
         const picksEvent = (
             sessionId: string, served: Record<string, unknown>[],
-            widened: unknown,
+            widened: unknown, engineName = 'fiche',
         ): Record<string, unknown> & {type: string} => ({
           type: replace ? 'replace' : 'picks',
           ...answers,
+          engine: engineName,
           sessionId,
           served,
           widened: widened ?? null,
@@ -14885,7 +15019,62 @@ export const getCineMatchPicks = onRequest(
 
         const setup = withReplace(
             await loadCineMatchSetup(db, uid, situation, ctx));
-        const result = await runFilmPicks(db, setup, request, ctx);
+        // Les deux moteurs tournent ensemble ; une erreur de la carte laisse
+        // la fiche servir seule.
+        const rt = carteServes(situation) ?
+          await loadCarteRuntime(db).catch((error) => {
+            logger.error('loadCarteRuntime failed', {error});
+            return null;
+          }) : null;
+        const [result, fromCarte] = await Promise.all([
+          runFilmPicks(db, setup, request, ctx),
+          rt ? runCartePicks(db, rt, uid, setup, request,
+              replace?.refusedIds ?? [], eveningId, ctx).catch((error) => {
+            logger.error('runCartePicks failed', {error});
+            return null;
+          }) : Promise.resolve(null),
+        ]);
+        if (rt && fromCarte && fromCarte.ordered.length > 0) {
+          const mixed = interleavePicks(result, fromCarte, rt, request.count,
+              engine.seededRandom(`${uid}:${eveningId ?? setup.now}:draft:` +
+                `${(setup.extraExcludedIds ?? []).length}`));
+          if (mixed.drafted.length === 0) {
+            if (replace) {
+              res.status(200).json({films: [], widened: mixed.widened});
+            } else {
+              res.status(409).json({error: 'no_candidates'});
+            }
+            return;
+          }
+          const sessionId = await writeFiveHistory(
+              userRef.collection('recommendationHistory'),
+              replace,
+              mixed.drafted.map((entry) => entry.id),
+              mixed.served,
+              {...answers, engine: 'interleaved'},
+          );
+          await journalEvening(userRef, 'film', eveningId,
+              picksEvent(sessionId, mixed.served, mixed.widened,
+                  'interleaved'));
+          const debug = process.env.FUNCTIONS_EMULATOR === 'true' &&
+            body.debug === true ? {
+              fiche: picksHistoryFilms(result.ranked.slice(0, 25),
+                  result.sources,
+                  (id) => result.enriched.get(id)?.title ?? null),
+              carte: fromCarte.ordered.map((id) => ({
+                id, title: fromCarte.enriched.get(id)?.title ?? null,
+                propensity: fromCarte.propensity.get(id) ?? null,
+              })),
+            } : undefined;
+          res.status(200).json({
+            films: mixed.drafted.map((entry) => cineMatchFiveFilmJSON(
+                mixed.enrichedOf(entry.id) as EnrichedCandidate)),
+            widened: mixed.widened,
+            sessionId,
+            ...(debug ? {debug} : {}),
+          });
+          return;
+        }
         const picks = result.picks
             .filter((pick) => result.enriched.has(pick.fiche.id));
         if (picks.length === 0) {
@@ -15005,3 +15194,781 @@ export const rebuildCarte = onSchedule(
       logger.info('Carte recalculée', result);
     },
 );
+
+/* ===================================================================== *
+ *  CinéMatch sur la carte : le moteur du soir
+ *
+ *  Quand une carte est en service, les films de CinéMatch en viennent :
+ *
+ *   - l'écran « Un film proche de… » tire ses six films de la galerie dans
+ *     le nuage du goût (`carte/evening.ts`) ;
+ *   - l'écran « Plutôt du côté de… » tire six voisins du film choisi, et se
+ *     saute quand sa réponse probable changerait moins de trois des cinq ;
+ *     les retouches de « Comme Heat, mais… » suivent la même règle ;
+ *   - les cinq se tirent sur tout le catalogue de la carte, et s'entrelacent
+ *     avec ceux du moteur de la fiche : chacun apporte ses films, comme deux
+ *     capitaines qui choisissent tour à tour (mesure B). Le film lancé, puis
+ *     aimé le lendemain, dira lequel gagne. Le moteur de la fiche reste en
+ *     place jusque-là ;
+ *   - la proposition du jour vient de l'un ou de l'autre, un jour sur deux
+ *     au hasard.
+ *
+ *  Le point du soir n'est gardé nulle part : chaque appel le recalcule
+ *  depuis le journal de la soirée (`carte/session.ts`). Les séries gardent
+ *  le moteur de la fiche : la carte ne connaît que les films.
+ * ===================================================================== */
+
+/** Les réglages du soir (voir `carte/evening.ts`). */
+const CARTE_EVENING = carteEvening.DEFAULT_EVENING_PARAMS;
+/** Les films de la galerie parmi lesquels se tirent les voisins choisis. */
+const CARTE_NEAR_POOL = 40;
+/** En deçà, un écran ne change pas assez les cinq pour être posé. */
+const CARTE_SCREEN_MIN_CHANGE = 3;
+/** Un film montré dans les cinq se repose quatorze jours. */
+const CARTE_REST_MS = 14 * 24 * 3600 * 1000;
+/** Les tirages qui mesurent la probabilité d'affichage d'un film. */
+const CARTE_PROPENSITY_DRAWS = 100;
+/** Fiches TMDB lues, au plus, pour placer des films absents de la carte. */
+const CARTE_FOLD_FETCH = 6;
+/**
+ * L'avance, en écarts types de la note, d'un film qui tient la soirée
+ * quand il a fallu élargir la durée ou les plateformes.
+ */
+const CARTE_CONFORMING_BONUS = 1;
+
+/** La carte prête pour les soirées : ses fiches, leur réception. */
+interface CarteRuntime {
+  carte: carteModel.Carte;
+  fiches: fiche.Fiche[];
+  reception: Float64Array;
+  comparer: fiche.FicheComparer;
+  engineFilms: engine.EngineFilm[];
+}
+
+let carteRuntime: CarteRuntime | null = null;
+
+/**
+ * La carte en service, et ce qu'on en tire une fois par instance.
+ * @param {Firestore} db Firestore.
+ * @return {Promise<?CarteRuntime>} La carte, ou null s'il n'y en a pas.
+ */
+async function loadCarteRuntime(db: Firestore): Promise<CarteRuntime | null> {
+  const carte = await carteStore.currentCarte(db);
+  if (!carte) return null;
+  if (carteRuntime?.carte === carte) return carteRuntime;
+  const fiches = carte.films.map(ficheOfCarteFilm);
+  carteRuntime = {
+    carte,
+    fiches,
+    reception: Float64Array.from(fiches, (sheet) => fiche.receptionOf(sheet)),
+    comparer: new fiche.FicheComparer(fiche.buildRarity(fiches)),
+    engineFilms: carte.films.map((film) => ({
+      id: film.id,
+      axes: NEUTRAL_AXES,
+      genreIds: film.genres,
+      year: film.year,
+      voteCount: film.voteCount,
+      runtime: film.runtime,
+      providerIds: film.providers,
+      keywordNames: [],
+      listed: false,
+      certification: null,
+    })),
+  };
+  return carteRuntime;
+}
+
+/**
+ * Vrai si la carte peut servir cette soirée : ses plateformes sont celles
+ * de la France.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @return {boolean} Vrai si la carte convient.
+ */
+function carteServes(situation: CineMatchSituationPayload): boolean {
+  return situation.platformIds.length === 0 ||
+    situation.watchRegion === DEFAULT_REGION;
+}
+
+/** La galerie de films, lue pour la carte. */
+interface CarteGallery {
+  marks: carteModel.GalleryMark[];
+  /** Tous les films vus, « Pas aimé » compris : jamais proposés. */
+  seen: Set<number>;
+  /** Les films hors « Pas aimé », pour les écrans de départ. */
+  films: StarterFilm[];
+}
+
+/**
+ * Lit la galerie de films une fois pour tout ce que la carte en fait.
+ * @param {DocumentReference} userRef Le compte.
+ * @return {Promise<CarteGallery>} La galerie.
+ */
+async function loadCarteGallery(
+    userRef: DocumentReference,
+): Promise<CarteGallery> {
+  const snap = await filmsIn(userRef.collection('gallery')).get();
+  const marks: carteModel.GalleryMark[] = [];
+  const seen = new Set<number>();
+  const films: StarterFilm[] = [];
+  for (const doc of snap.docs) {
+    const id = Number(doc.get('tmdbId'));
+    if (!Number.isInteger(id) || id <= 0) continue;
+    seen.add(id);
+    const disliked = doc.get('dislikedAt') instanceof Timestamp;
+    const lovedAtMillis = millisOf(doc.get('lovedAt'));
+    marks.push({id, loved: lovedAtMillis !== null, disliked});
+    if (disliked) continue;
+    const genreIds = doc.get('genreIds');
+    const title = doc.get('title');
+    const posterPath = doc.get('posterPath');
+    const releaseDate = doc.get('releaseDate');
+    films.push({
+      id,
+      title: typeof title === 'string' ? title : null,
+      posterPath: typeof posterPath === 'string' ? posterPath : null,
+      releaseDate: typeof releaseDate === 'string' ? releaseDate : null,
+      genreIds: Array.isArray(genreIds) ?
+        genreIds.filter((g): g is number => typeof g === 'number') : [],
+      loved: lovedAtMillis !== null,
+      lovedAtMillis,
+    });
+  }
+  return {marks, seen, films};
+}
+
+/**
+ * Les événements du journal d'une soirée de films, dans l'ordre.
+ * @param {DocumentReference} userRef Le compte.
+ * @param {?string} eveningId La soirée.
+ * @return {Promise<Array<Object>>} Les événements.
+ */
+async function eveningEvents(
+    userRef: DocumentReference, eveningId: string | null,
+): Promise<Record<string, unknown>[]> {
+  if (!eveningId) return [];
+  const snap = await userRef.collection(cineMatchStoreFor('film').evenings)
+      .doc(eveningId).get();
+  const events = snap.get('events');
+  return Array.isArray(events) ? events as Record<string, unknown>[] : [];
+}
+
+/**
+ * Les positions des films d'une soirée : celles de la carte, ou déduites
+ * de la fiche pour un film qu'elle ne contient pas (moins de 150 votes).
+ * @param {Firestore} db Firestore.
+ * @param {CarteRuntime} rt La carte.
+ * @param {number[]} ids Les films.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<function(number): ?Float64Array>} La position d'un film.
+ */
+async function carteVectors(
+    db: Firestore, rt: CarteRuntime, ids: number[], ctx: TMDBContext,
+): Promise<(id: number) => Float64Array | null> {
+  const {carte} = rt;
+  const absent = [...new Set(ids)].filter((id) => !carte.index.has(id));
+  const folded = new Map<number, Float64Array>();
+  if (absent.length > 0) {
+    const sheets = await loadMovieFiches(db, absent, ctx, CARTE_FOLD_FETCH);
+    for (const [id, sheet] of sheets) {
+      const y = carteEvening.foldIn(carte, (row) =>
+        rt.comparer.similarity(sheet, rt.fiches[row]));
+      if (y) folded.set(id, y);
+    }
+  }
+  return (id) => {
+    const row = carte.index.get(id);
+    return row !== undefined ?
+      carteEvening.vectorOf(carte, row) : folded.get(id) ?? null;
+  };
+}
+
+/**
+ * Les fiches des films choisis ce soir, de la carte ou du cache commun.
+ * @param {Firestore} db Firestore.
+ * @param {CarteRuntime} rt La carte.
+ * @param {number[]} ids Les films.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<fiche.Fiche[]>} Les fiches trouvées, dans l'ordre.
+ */
+async function chosenFiches(
+    db: Firestore, rt: CarteRuntime, ids: number[], ctx: TMDBContext,
+): Promise<fiche.Fiche[]> {
+  const absent = ids.filter((id) => !rt.carte.index.has(id));
+  const loaded = absent.length > 0 ?
+    await loadMovieFiches(db, absent, ctx, absent.length) :
+    new Map<number, fiche.Fiche>();
+  return ids
+      .map((id) => {
+        const row = rt.carte.index.get(id);
+        return row !== undefined ? rt.fiches[row] : loaded.get(id);
+      })
+      .filter((sheet): sheet is fiche.Fiche => sheet !== undefined);
+}
+
+/** Ce que les filtres du soir doivent savoir. */
+interface CarteFilterInput {
+  situation: CineMatchSituationPayload;
+  excluded: Set<number>;
+  exposure: Map<number, engine.ExposureRecord>;
+  now: number;
+  anchor: fiche.Fiche | null;
+  tweak: fiche.TweakKey | null;
+  /** Les auteurs des films vus : le remake d'un film vu ne sert à rien. */
+  seenMakers: Set<number>;
+  count: number;
+}
+
+/** Les films de la carte qui passent les filtres du soir. */
+interface CarteFiltered {
+  rows: number[];
+  conforming: Set<number>;
+  widened: engine.Widening | null;
+}
+
+/**
+ * Les filtres du soir sur toute la carte : ceux du moteur d'aujourd'hui
+ * (durée et plateformes avec leur élargissement, famille, déjà vu, repos),
+ * puis quatorze jours de repos pour un film déjà montré, un film encore en
+ * salle, le remake d'un film vu, la réception minimale et la retouche,
+ * chacune levée si elle ne laisse plus de quoi choisir.
+ * @param {CarteRuntime} rt La carte.
+ * @param {CarteFilterInput} input La soirée.
+ * @return {CarteFiltered} Les films retenus.
+ */
+function carteCandidateRows(
+    rt: CarteRuntime, input: CarteFilterInput,
+): CarteFiltered {
+  const {carte} = rt;
+  const filtered = engine.applyFilters(rt.engineFilms, {
+    situation: input.situation,
+    excludedIds: input.excluded,
+    exposure: input.exposure,
+    now: input.now,
+  });
+  const settledBefore = new Date(input.now - SERVE_SETTLED_DAYS * 86400000)
+      .toISOString().slice(0, 10);
+  let rows = filtered.eligible
+      .map((film) => carte.index.get(film.id) as number)
+      .filter((row) => {
+        const film = carte.films[row];
+        const shown = input.exposure.get(film.id)?.lastShownAt ?? null;
+        if (shown !== null && input.now - shown < CARTE_REST_MS) return false;
+        // Un film récent qui n'est sur aucune plateforme est sans doute
+        // encore en salle : la vérification de `servableRows` tranchera
+        // pour les autres, après l'enrichissement.
+        const released = (film.releaseDate ?? '') <= settledBefore ||
+          film.providers.length > 0;
+        if (!released) return false;
+        if (input.situation.company === 'family' &&
+            !engine.familyAllows(film.genres, null)) return false;
+        return !fiche.isRemakeOfSeen(rt.fiches[row], input.seenMakers);
+      });
+  const received = rows.filter((row) =>
+    rt.reception[row] >= PICK_MIN_RECEPTION);
+  if (received.length >= input.count * 2) rows = received;
+  if (input.anchor && input.tweak) {
+    const anchor = input.anchor;
+    const tweak = input.tweak;
+    const tweaked = rows.filter((row) =>
+      fiche.keepsTweak(rt.fiches[row], anchor, tweak));
+    if (tweaked.length >= input.count + 3) rows = tweaked;
+  }
+  return {rows, conforming: filtered.conforming, widened: filtered.widened};
+}
+
+/**
+ * Les candidats prêts à noter : la réception, et ce qui ne dépend pas du
+ * tirage (la ressemblance de fiche aux films choisis, l'avance d'un film
+ * qui tient la soirée quand on a élargi).
+ * @param {CarteRuntime} rt La carte.
+ * @param {CarteFiltered} filtered Les films retenus.
+ * @param {fiche.Fiche[]} chosen Le film de départ et le second, s'il y en a.
+ * @return {carteEvening.Candidates} Les candidats.
+ */
+function carteCandidates(
+    rt: CarteRuntime, filtered: CarteFiltered, chosen: fiche.Fiche[],
+): carteEvening.Candidates {
+  const {carte} = rt;
+  return carteEvening.prepareCandidates(carte, filtered.rows,
+      (row) => rt.reception[row],
+      chosen.length > 0 ? (row) => chosen.reduce((sum, sheet) =>
+        sum + rt.comparer.similarity(sheet, rt.fiches[row]), 0) /
+        chosen.length : null,
+      filtered.widened ? (row) => filtered.conforming.has(
+          carte.films[row].id) ? CARTE_CONFORMING_BONUS : 0 : null,
+      CARTE_EVENING);
+}
+
+/**
+ * Les auteurs des films vus (réalisation, scénario), pour reconnaître le
+ * remake d'un film vu.
+ * @param {CarteRuntime} rt La carte.
+ * @param {CarteGallery} gallery La galerie.
+ * @return {Set<number>} Les auteurs.
+ */
+function carteSeenMakers(rt: CarteRuntime, gallery: CarteGallery): Set<number> {
+  const out = new Set<number>();
+  for (const mark of gallery.marks) {
+    const row = rt.carte.index.get(mark.id);
+    if (row === undefined) continue;
+    for (const id of rt.fiches[row].makers) out.add(id);
+  }
+  return out;
+}
+
+/**
+ * Le point du soir depuis la galerie et les touchers.
+ * @param {CarteRuntime} rt La carte.
+ * @param {CarteGallery} gallery La galerie.
+ * @param {carteSession.Touch[]} touches Les touchers.
+ * @param {function(number): ?Float64Array} vectorFor Positions.
+ * @return {carteEvening.EveningPoint} Le point.
+ */
+function carteEveningPoint(
+    rt: CarteRuntime, gallery: CarteGallery, touches: carteSession.Touch[],
+    vectorFor: (id: number) => Float64Array | null,
+): carteEvening.EveningPoint {
+  const prior = carteEvening.eveningPrior(rt.carte, gallery.marks,
+      CARTE_EVENING);
+  return carteEvening.eveningFromTouches(rt.carte, prior, touches, vectorFor,
+      CARTE_EVENING);
+}
+
+/**
+ * Enrichit des films de la carte dans l'ordre, jusqu'à en avoir assez qui
+ * puissent se servir ce soir : sortis chez soi, avec une affiche, et
+ * regardables en famille si c'est la soirée.
+ * @param {Firestore} db Firestore.
+ * @param {number[]} ids Les films, du meilleur au moins bon.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {number} need Nombre voulu.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<Map<number, EnrichedCandidate>>} Les films retenus.
+ */
+async function servableCarteFilms(
+    db: Firestore, ids: number[], situation: CineMatchSituationPayload,
+    need: number, ctx: TMDBContext,
+): Promise<Map<number, EnrichedCandidate>> {
+  const out = new Map<number, EnrichedCandidate>();
+  let at = 0;
+  for (let round = 0; round < 3 && out.size < need && at < ids.length;
+    round++) {
+    const batch = ids.slice(at, at + need - out.size + 3);
+    at += batch.length;
+    const enriched = (await Promise.all(batch.map((id) =>
+      enrichCandidate({id}, ctx))))
+        .filter((c): c is EnrichedCandidate => c !== null);
+    const servable = await servableRows(db, enriched, ctx);
+    for (const candidate of servable) {
+      if (situation.company === 'family' && !engine.familyAllows(
+          candidate.genre_ids ?? [], candidate.certification ?? null)) {
+        continue;
+      }
+      out.set(candidate.id, candidate);
+    }
+  }
+  return out;
+}
+
+/** Les cinq de la carte pour une soirée, prêts à entrelacer. */
+interface CartePicks {
+  /** Les films servables, du meilleur au moins bon. */
+  ordered: number[];
+  enriched: Map<number, EnrichedCandidate>;
+  propensity: Map<number, number>;
+  widened: engine.Widening | null;
+}
+
+/**
+ * Les cinq de la carte : le point du soir, les filtres, un tirage.
+ * @param {Firestore} db Firestore.
+ * @param {CarteRuntime} rt La carte.
+ * @param {string} uid Le compte, pour les tirages.
+ * @param {CineMatchSetup} setup La soirée (exposition, exclusions).
+ * @param {PicksRequest} request Film choisi, retouche, nombre voulu.
+ * @param {number[]} refusedNow Les films écartés par cet appel.
+ * @param {?string} eveningId La soirée.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<CartePicks>} Les films.
+ */
+async function runCartePicks(
+    db: Firestore, rt: CarteRuntime, uid: string, setup: CineMatchSetup,
+    request: PicksRequest, refusedNow: number[], eveningId: string | null,
+    ctx: TMDBContext,
+): Promise<CartePicks> {
+  const userRef = db.collection('users').doc(uid);
+  const [gallery, events] = await Promise.all([
+    loadCarteGallery(userRef),
+    eveningEvents(userRef, eveningId),
+  ]);
+  const touches = carteSession.touchesFromJournal(events, {
+    anchorId: request.anchorId,
+    secondId: request.secondId,
+    refusedIds: refusedNow,
+  });
+  const chosenIds = [request.anchorId, request.secondId]
+      .filter((id): id is number => id !== null);
+  const [vectorFor, chosen] = await Promise.all([
+    carteVectors(db, rt, touches.flatMap((t) => t.shown), ctx),
+    chosenFiches(db, rt, chosenIds, ctx),
+  ]);
+  const point = carteEveningPoint(rt, gallery, touches, vectorFor);
+  const excluded = new Set([...gallery.seen, ...chosenIds,
+    ...(setup.extraExcludedIds ?? [])]);
+  const filtered = carteCandidateRows(rt, {
+    situation: setup.situation,
+    excluded,
+    exposure: setup.exposure,
+    now: setup.now,
+    anchor: request.anchorId !== null ? chosen[0] ?? null : null,
+    tweak: request.tweak,
+    seenMakers: carteSeenMakers(rt, gallery),
+    count: request.count,
+  });
+  const candidates = carteCandidates(rt, filtered, chosen);
+  const random = engine.seededRandom(
+      `${uid}:${eveningId ?? setup.now}:${refusedNow.join('.')}:` +
+      `${(setup.extraExcludedIds ?? []).length}`);
+  const slate = carteEvening.drawSlate(rt.carte, candidates, point,
+      request.count, CARTE_EVENING, random, CARTE_PROPENSITY_DRAWS);
+  const order = [...slate.rows,
+    ...slate.ranked.filter((row) => !slate.rows.includes(row))]
+      .map((row) => rt.carte.films[row].id);
+  const enriched = await servableCarteFilms(db, order, setup.situation,
+      request.count + 4, ctx);
+  const propensity = new Map<number, number>();
+  for (const [row, p] of slate.propensity) {
+    propensity.set(rt.carte.films[row].id, p);
+  }
+  return {
+    ordered: order.filter((id) => enriched.has(id)),
+    enriched,
+    propensity,
+    widened: filtered.widened,
+  };
+}
+
+/**
+ * Entrelace les cinq de la fiche et ceux de la carte.
+ * @param {PicksResult<EnrichedCandidate>} fromFiche Le moteur de la fiche.
+ * @param {CartePicks} fromCarte Le moteur de la carte.
+ * @param {CarteRuntime} rt La carte, pour les sagas.
+ * @param {number} count Nombre voulu.
+ * @param {function(): number} random Tirage uniforme.
+ * @return {Object} Les films, leur moteur, leur fiche enrichie.
+ */
+function interleavePicks(
+    fromFiche: PicksResult<EnrichedCandidate>, fromCarte: CartePicks,
+    rt: CarteRuntime, count: number, random: () => number,
+): {
+  drafted: carteSession.Drafted[];
+  enrichedOf: (id: number) => EnrichedCandidate | undefined;
+  served: Record<string, unknown>[];
+  widened: engine.Widening | null;
+} {
+  const ficheOrder = [...new Set([...fromFiche.picks, ...fromFiche.ranked]
+      .map((pick) => pick.fiche.id)
+      .filter((id) => fromFiche.enriched.has(id)))];
+  const enrichedOf = (id: number) =>
+    fromFiche.enriched.get(id) ?? fromCarte.enriched.get(id);
+  const sagaOf = (id: number): number | null => {
+    const row = rt.carte.index.get(id);
+    if (row !== undefined) return rt.carte.films[row].collection;
+    return enrichedOf(id)?.fiche?.collection ?? null;
+  };
+  const drafted = carteSession.teamDraft(ficheOrder, fromCarte.ordered,
+      ['fiche', 'carte'], count, random, sagaOf);
+  const scores = new Map(fromFiche.ranked.map((pick) =>
+    [pick.fiche.id, pick.score]));
+  const served = drafted.map((entry, index) => ({
+    id: entry.id,
+    title: enrichedOf(entry.id)?.title ?? null,
+    rank: index + 1,
+    team: entry.team,
+    source: entry.team === 'fiche' ?
+      fromFiche.sources.get(entry.id) ?? 'catalogue' : 'carte',
+    score: entry.team === 'fiche' ? scores.get(entry.id) ?? null : null,
+    propensity: entry.team === 'carte' ?
+      fromCarte.propensity.get(entry.id) ?? null : null,
+  }));
+  const teams = new Set(drafted.map((entry) => entry.team));
+  const widenings = [
+    teams.has('fiche') ? fromFiche.widened : null,
+    teams.has('carte') ? fromCarte.widened : null,
+  ].filter((w): w is engine.Widening => w !== null);
+  const widened = widenings.length === 0 ? null : {
+    duration: widenings.some((w) => w.duration),
+    platforms: widenings.some((w) => w.platforms),
+  };
+  return {drafted, enrichedOf, served, widened};
+}
+
+/**
+ * Les plateformes déclarées du compte : elles tiennent lieu de soirée pour
+ * la règle des écrans, posée avant que l'app n'envoie la sienne.
+ * @param {DocumentReference} userRef Le compte.
+ * @return {Promise<CineMatchSituationPayload>} Une soirée par défaut.
+ */
+async function defaultSituation(
+    userRef: DocumentReference,
+): Promise<CineMatchSituationPayload> {
+  const snap = await userRef.collection('preferences').doc('home').get();
+  const raw = snap.get('preferredPlatformIDs');
+  return parseCineMatchSituation({
+    platformIds: Array.isArray(raw) ? raw : [],
+    watchRegion: DEFAULT_REGION,
+  });
+}
+
+/**
+ * L'écran « Un film proche de… » sur la carte : six films de la galerie
+ * dans le style, tirés dans le nuage du soir, les films montrés ces
+ * quatorze derniers jours en dernier recours. Après « Pas ceux-là », le
+ * nuage s'éloigne des six refusés avant de tirer les suivants.
+ * @param {CarteRuntime} rt La carte.
+ * @param {string} uid Le compte.
+ * @param {CarteGallery} gallery La galerie.
+ * @param {StarterFilm[]} members Les films du style.
+ * @param {Set<number>} shownIds Les films déjà montrés pendant la visite.
+ * @param {Set<number>} recent Les films montrés ces quatorze jours.
+ * @param {Array<Object>} events Le journal de la soirée.
+ * @param {string} seed La graine du tirage.
+ * @return {Object} Les films retenus, et si la liste a repris du début.
+ */
+function carteStarters(
+    rt: CarteRuntime, uid: string, gallery: CarteGallery,
+    members: StarterFilm[], shownIds: Set<number>, recent: Set<number>,
+    events: Record<string, unknown>[], seed: string,
+): {films: StarterFilm[]; restarted: boolean} {
+  const {carte} = rt;
+  const unseen = members.filter((film) => !shownIds.has(film.id));
+  const restarted = shownIds.size > 0 && unseen.length === 0;
+  const pool = restarted || shownIds.size === 0 ? members : unseen;
+  // « Pas ceux-là » : la page en cours est un refus des six précédents.
+  const touches = carteSession.touchesFromJournal(
+      shownIds.size > 0 && !restarted ?
+        [...events, {type: 'starters', served: [], afterShown: shownIds.size}] :
+        events,
+      {anchorId: null, secondId: null, refusedIds: []});
+  const point = carteEveningPoint(rt, gallery, touches, (id) => {
+    const row = carte.index.get(id);
+    return row === undefined ? null : carteEvening.vectorOf(carte, row);
+  });
+  const random = engine.seededRandom(`${uid}:${seed}`);
+  const rowsOf = (films: StarterFilm[]) => films
+      .map((film) => carte.index.get(film.id))
+      .filter((row): row is number => row !== undefined);
+  const fresh = pool.filter((film) => !recent.has(film.id));
+  const picked = carteEvening.drawScreen(carte, rowsOf(fresh), point,
+      STARTERS_PER_PAGE, CARTE_EVENING, random);
+  if (picked.length < STARTERS_PER_PAGE) {
+    const rested = pool.filter((film) => recent.has(film.id));
+    picked.push(...carteEvening.drawScreen(carte, rowsOf(rested), point,
+        STARTERS_PER_PAGE - picked.length, CARTE_EVENING, random));
+  }
+  const byId = new Map(members.map((film) => [film.id, film]));
+  const films = picked.map((row) => byId.get(carte.films[row].id))
+      .filter((film): film is StarterFilm => film !== undefined);
+  // Les films absents de la carte complètent, coups de cœur d'abord.
+  if (films.length < STARTERS_PER_PAGE) {
+    const taken = new Set(films.map((film) => film.id));
+    const rest = pool
+        .filter((film) => !taken.has(film.id) && !carte.index.has(film.id))
+        .sort((a, b) => Number(b.loved) - Number(a.loved) || a.id - b.id);
+    films.push(...rest.slice(0, STARTERS_PER_PAGE - films.length));
+  }
+  return {films, restarted};
+}
+
+/**
+ * L'écran « Plutôt du côté de… » sur la carte : six voisins du film choisi
+ * dans la galerie, tirés dans le nuage resserré. L'écran ne paraît que si
+ * la réponse probable change au moins trois des cinq ; les retouches de
+ * « Comme Heat, mais… » aussi.
+ * @param {Firestore} db Firestore.
+ * @param {CarteRuntime} rt La carte.
+ * @param {string} uid Le compte.
+ * @param {CarteGallery} gallery La galerie.
+ * @param {number} nearId Le film choisi.
+ * @param {?string} eveningId La soirée.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<?Object>} `{near, films, tweaks}` et ce qu'il faut
+ *   journaliser, ou null si le film choisi n'a pas de position.
+ */
+async function carteNear(
+    db: Firestore, rt: CarteRuntime, uid: string, gallery: CarteGallery,
+    nearId: number, eveningId: string | null, ctx: TMDBContext,
+): Promise<{response: Record<string, unknown>;
+  journal: Record<string, unknown>} | null> {
+  const {carte} = rt;
+  const userRef = db.collection('users').doc(uid);
+  const [events, situation] = await Promise.all([
+    eveningEvents(userRef, eveningId),
+    defaultSituation(userRef),
+  ]);
+  // Le second film n'est pas encore choisi : l'écran le demande.
+  const touches = carteSession.touchesFromJournal(events,
+      {anchorId: nearId, secondId: null, refusedIds: []})
+      .filter((t) => t.kind !== 'same' && t.kind !== 'second');
+  const [vectorFor, chosen] = await Promise.all([
+    carteVectors(db, rt, [nearId, ...touches.flatMap((t) => t.shown)], ctx),
+    chosenFiches(db, rt, [nearId], ctx),
+  ]);
+  const anchorVector = vectorFor(nearId);
+  const anchor = chosen[0];
+  if (!anchorVector || !anchor) return null;
+  const point = carteEveningPoint(rt, gallery, touches, vectorFor);
+
+  const norm = Math.hypot(...anchorVector) || 1;
+  const pool = gallery.films
+      .filter((film) => film.id !== nearId)
+      .map((film) => carte.index.get(film.id))
+      .filter((row): row is number => row !== undefined)
+      .map((row) => ({row, near: carteModel.proximityTo(carte, row,
+          anchorVector, norm)}))
+      .sort((a, b) => b.near - a.near || a.row - b.row)
+      .slice(0, CARTE_NEAR_POOL)
+      .map((entry) => entry.row);
+  const nearRows = carteEvening.drawScreen(carte, pool, point,
+      STARTERS_PER_PAGE, CARTE_EVENING,
+      engine.seededRandom(`${uid}:${eveningId ?? ''}:near:${nearId}`));
+  const nearIds = nearRows.map((row) => carte.films[row].id);
+
+  const filtered = carteCandidateRows(rt, {
+    situation,
+    excluded: new Set([...gallery.seen, nearId]),
+    exposure: new Map(),
+    now: Date.now(),
+    anchor,
+    tweak: null,
+    seenMakers: carteSeenMakers(rt, gallery),
+    count: 5,
+  });
+  const candidates = carteCandidates(rt, filtered, [anchor]);
+  const base = carteEvening.expectedSlate(carte, candidates, point, 5,
+      CARTE_EVENING);
+  let change = 0;
+  if (nearRows.length >= 2) {
+    const shown = [...nearIds, nearId];
+    const answers = shown.map((id) => {
+      const touch: carteSession.Touch = id === nearId ?
+        {kind: 'same', shown, chosen: nearId} :
+        {kind: 'second', shown, chosen: id};
+      const next = carteEveningPoint(rt, gallery, [...touches, touch],
+          vectorFor);
+      const row = carte.index.get(id) as number;
+      const sheets = id === nearId ? [anchor] : [anchor, rt.fiches[row]];
+      return carteEvening.expectedSlate(carte,
+          id === nearId ? candidates : carteCandidates(rt, filtered, sheets),
+          next, 5, CARTE_EVENING);
+    });
+    const vectors = shown.map((id) => vectorFor(id) as Float64Array);
+    const probabilities = carteEvening.choiceProbabilities(point, vectors,
+        CARTE_EVENING).slice(0, -1);
+    change = carteEvening.expectedChange(base, answers, probabilities);
+  }
+  const asked = change >= CARTE_SCREEN_MIN_CHANGE;
+
+  // Une retouche n'est proposée que si elle change au moins trois films.
+  const tweaks = fiche.availableTweaks(anchor, new Date().getFullYear())
+      .filter((tweak) => {
+        const kept = carteCandidateRows(rt, {
+          situation,
+          excluded: new Set([...gallery.seen, nearId]),
+          exposure: new Map(),
+          now: Date.now(),
+          anchor,
+          tweak,
+          seenMakers: carteSeenMakers(rt, gallery),
+          count: 5,
+        });
+        if (kept.rows.length === filtered.rows.length) return false;
+        const slate = carteEvening.expectedSlate(carte,
+            carteCandidates(rt, kept, [anchor]), point, 5, CARTE_EVENING);
+        return slate.filter((row) => !base.includes(row)).length >=
+          CARTE_SCREEN_MIN_CHANGE;
+      });
+
+  const byId = new Map(gallery.films.map((film) => [film.id, film]));
+  const films = asked ? nearIds
+      .map((id) => byId.get(id))
+      .filter((film): film is StarterFilm => film !== undefined) : [];
+  return {
+    response: {
+      near: nearId,
+      films: films.map((film) => starterFilmJSON(film)),
+      tweaks,
+    },
+    journal: {
+      type: 'near',
+      anchorId: nearId,
+      served: films.map((film) => film.id),
+      tweaks,
+      engine: 'carte',
+      drawn: nearIds,
+      expectedChange: Math.round(change * 100) / 100,
+      skipped: !asked,
+    },
+  };
+}
+
+/**
+ * La proposition du jour par la carte : le goût durable, un tirage du jour,
+ * le premier film servable.
+ * @param {Firestore} db Firestore.
+ * @param {CarteRuntime} rt La carte.
+ * @param {string} uid Le compte.
+ * @param {CineMatchSituationPayload} situation La soirée.
+ * @param {string} day Le jour, à Paris.
+ * @param {TMDBContext} ctx Jeton et langue de la requête en cours.
+ * @return {Promise<?Object>} Le film et sa probabilité d'affichage.
+ */
+async function carteDaily(
+    db: Firestore, rt: CarteRuntime, uid: string,
+    situation: CineMatchSituationPayload, day: string, ctx: TMDBContext,
+): Promise<{candidate: EnrichedCandidate; propensity: number | null} | null> {
+  const userRef = db.collection('users').doc(uid);
+  const now = Date.now();
+  const cutoff = Timestamp.fromMillis(now - CARTE_REST_MS);
+  const [gallery, exposureSnap] = await Promise.all([
+    loadCarteGallery(userRef),
+    userRef.collection('cinematchExposure')
+        .where('lastShownAt', '>=', cutoff).get(),
+  ]);
+  const exposure = new Map<number, engine.ExposureRecord>();
+  for (const doc of exposureSnap.docs) {
+    const id = Number(doc.get('tmdbId') ?? doc.id);
+    if (!Number.isInteger(id)) continue;
+    const count = doc.get('shownCount');
+    exposure.set(id, {
+      shownCount: typeof count === 'number' ? count : 0,
+      lastShownAt: millisOf(doc.get('lastShownAt')),
+      chosenAt: millisOf(doc.get('chosenAt')),
+    });
+  }
+  const point = carteEveningPoint(rt, gallery, [], () => null);
+  const filtered = carteCandidateRows(rt, {
+    situation,
+    excluded: gallery.seen,
+    exposure,
+    now,
+    anchor: null,
+    tweak: null,
+    seenMakers: carteSeenMakers(rt, gallery),
+    count: 5,
+  });
+  const slate = carteEvening.drawSlate(rt.carte,
+      carteCandidates(rt, filtered, []), point, 5, CARTE_EVENING,
+      engine.seededRandom(`${uid}:${day}:daily`), CARTE_PROPENSITY_DRAWS);
+  const order = [...slate.rows,
+    ...slate.ranked.filter((row) => !slate.rows.includes(row))]
+      .map((row) => rt.carte.films[row].id);
+  const enriched = await servableCarteFilms(db, order, situation, 1, ctx);
+  const id = order.find((candidate) => enriched.has(candidate));
+  if (id === undefined) return null;
+  const row = rt.carte.index.get(id) as number;
+  return {
+    candidate: enriched.get(id) as EnrichedCandidate,
+    propensity: slate.propensity.get(row) ?? null,
+  };
+}

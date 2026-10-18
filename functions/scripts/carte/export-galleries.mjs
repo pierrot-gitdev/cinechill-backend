@@ -54,7 +54,7 @@ function eveningRow(doc) {
       copy.served = copy.served.map((item) =>
         typeof item === 'object' && item !== null ?
           {id: item.id, rank: item.rank, score: item.score, source: item.source,
-            propensity: item.propensity ?? null} :
+            team: item.team ?? null, propensity: item.propensity ?? null} :
           item);
     }
     return copy;

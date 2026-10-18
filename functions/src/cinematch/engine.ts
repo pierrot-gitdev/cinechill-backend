@@ -314,6 +314,23 @@ const GENRE_HORROR = 27;
 /** Les classifications écartées quand on regarde en famille. */
 const FAMILY_BLOCKED_CERTIFICATIONS = new Set(['16', '18']);
 
+/**
+ * Vrai si un film peut se regarder en famille : pas d'horreur, pas de
+ * classification 16 ou 18. Les classifications TV françaises s'écrivent
+ * parfois « -16 » : seuls les chiffres comptent. Pour un film (« U »,
+ * « 12 », « 16 »), rien ne change.
+ * @param {number[]} genreIds Genres TMDB.
+ * @param {?string} certification Classification.
+ * @return {boolean} Vrai si le film passe.
+ */
+export function familyAllows(
+    genreIds: number[], certification: string | null,
+): boolean {
+  if (genreIds.includes(GENRE_HORROR)) return false;
+  const digits = (certification ?? '').replace(/[^0-9]/g, '');
+  return !FAMILY_BLOCKED_CERTIFICATIONS.has(digits);
+}
+
 /* --------------------------------------------------------------------- *
  *  Similarités et poids appris
  * --------------------------------------------------------------------- */
@@ -529,13 +546,9 @@ export function applyFilters(
     if (!Number.isFinite(film.id) || film.id <= 0) return false;
     if (ctx.excludedIds.has(film.id)) return false;
     if (isResting(ctx.exposure.get(film.id), ctx.now)) return false;
-    if (situation.company === 'family') {
-      if (film.genreIds.includes(GENRE_HORROR)) return false;
-      // Les classifications TV françaises s'écrivent parfois « -16 » : seuls
-      // les chiffres comptent. Pour un film (« U », « 12 », « 16 »), rien
-      // ne change.
-      const certification = (film.certification ?? '').replace(/[^0-9]/g, '');
-      if (FAMILY_BLOCKED_CERTIFICATIONS.has(certification)) return false;
+    if (situation.company === 'family' &&
+        !familyAllows(film.genreIds, film.certification)) {
+      return false;
     }
     return true;
   });
