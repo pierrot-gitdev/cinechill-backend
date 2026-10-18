@@ -32,6 +32,7 @@ const M = require('../../lib/carte/model.js');
 const C = require('../../lib/carte/catalog.js');
 const F = require('../../lib/cinematch/fiche.js');
 const L = require('../../lib/carte/linalg.js');
+const E = require('../../lib/carte/evening.js');
 
 function arg(name, fallback = null) {
   const at = process.argv.indexOf(`--${name}`);
@@ -121,7 +122,11 @@ function easeScores(train, lambda) {
   };
 }
 
-const methods = ['popularité', 'fiche', ...EASE_LAMBDAS.map((l) => `EASE λ=${l}`), 'carte'];
+// Trois lectures de la carte : le produit y·x (la prédiction de la
+// factorisation), le cosinus, et la note du moteur du soir (cosinus et
+// réception, en deux temps, voir `evening.ts`), sans film choisi.
+const methods = ['popularité', 'fiche', ...EASE_LAMBDAS.map((l) => `EASE λ=${l}`), 'carte',
+  'carte cosinus', 'carte (soir)'];
 const tally = Object.fromEntries(methods.map((k) => [k, {hit: 0, total: 0, tiers: [[0, 0], [0, 0], [0, 0]]}]));
 
 for (let seed = 0; seed < SEEDS; seed++) {
@@ -172,6 +177,19 @@ for (let seed = 0; seed < SEEDS; seed++) {
     const carteScores = new Float64Array(n);
     for (let i = 0; i < n; i++) carteScores[i] = L.dot(built.vectors, placed.mean, built.k, i * built.k, 0);
     record('carte', carteScores);
+
+    const cosine = new Float64Array(n);
+    for (let i = 0; i < n; i++) cosine[i] = carteScores[i] / (M.norm(built, i) || 1);
+    record('carte cosinus', cosine);
+
+    const P = E.DEFAULT_EVENING_PARAMS;
+    const prior = E.eveningPrior(built, gallery, P);
+    const rows = films.map((f, i) => i).filter((i) => !exclude.has(i));
+    const c = E.prepareCandidates(built, rows, (row) => F.receptionOf(fiches[row]), null, null, P);
+    const notes = E.scoreCandidates(built, c, prior.mean, P);
+    const evening = new Float64Array(n).fill(-Infinity);
+    rows.forEach((row, j) => { evening[row] = notes[j]; });
+    record('carte (soir)', evening);
   }
 }
 
@@ -182,11 +200,16 @@ for (const name of methods) {
   console.log(name.padEnd(15) + pct(t.hit, t.total).padStart(11) +
     t.tiers.map(([h, tot]) => `${pct(h, tot)} (${tot})`.padStart(13)).join(''));
 }
+// Le seuil se lit sur la carte telle qu'elle sert : la note du moteur du
+// soir. Le produit brut y·x favorise les grandes sagas, dont les positions
+// sont trois à cinq fois plus longues (mesuré le 18 octobre : 10 % contre
+// 31 % pour la note du soir, sur nos galeries).
+const served = tally['carte (soir)'];
 const fiche = tally.fiche.hit / Math.max(1, tally.fiche.total);
-const carteR = tally.carte.hit / Math.max(1, tally.carte.total);
+const carteR = served.hit / Math.max(1, served.total);
 const lowF = tally.fiche.tiers[0][0] / Math.max(1, tally.fiche.tiers[0][1]);
-const lowC = tally.carte.tiers[0][0] / Math.max(1, tally.carte.tiers[0][1]);
-console.log(`\nSeuil : carte ≥ 1,2 × fiche (${(100 * carteR).toFixed(1)} % contre ${(120 * fiche).toFixed(1)} % demandés) ` +
+const lowC = served.tiers[0][0] / Math.max(1, served.tiers[0][1]);
+console.log(`\nSeuil (carte, note du soir) : carte ≥ 1,2 × fiche (${(100 * carteR).toFixed(1)} % contre ${(120 * fiche).toFixed(1)} % demandés) ` +
   `et pas de perte sur les peu connus (${(100 * lowC).toFixed(1)} % contre ${(100 * lowF).toFixed(1)} %) : ` +
   (carteR >= 1.2 * fiche && lowC >= lowF ? 'atteint.' : 'non atteint.'));
 console.log(`${tally.carte.total / SEEDS} coups de cœur cachés par tirage : ` +
