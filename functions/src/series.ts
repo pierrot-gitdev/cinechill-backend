@@ -54,18 +54,9 @@ export function normalizeTvGenres(raw: unknown): number[] {
 }
 
 /**
- * L'identifiant d'une saison en bibliothèque.
- * @param {number} tvId Identifiant TMDB de la série.
- * @param {number} season Numéro de la saison.
- * @return {string} `tv-{tvId}-s{season}`.
- */
-export function seasonEntryId(tvId: number, season: number): string {
-  return `tv-${tvId}-s${season}`;
-}
-
-/**
- * Lit un identifiant de saison. Refuse tout le reste, y compris `tv-1399`
- * seul : on ne range jamais une série entière.
+ * Lit un identifiant de saison en bibliothèque, `tv-{tvId}-s{season}` (l'app
+ * le compose). Refuse tout le reste, y compris `tv-1399` seul : on ne range
+ * jamais une série entière.
  * @param {unknown} raw Identifiant reçu.
  * @return {?{tvId: number, season: number}} Série et saison, ou null.
  */
