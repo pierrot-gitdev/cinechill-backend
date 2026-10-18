@@ -49,14 +49,10 @@ casse aussi `valid-jsdoc`, qui ne sait pas lire un `@return` multiligne.
 
 ## Les commits
 
-Mêmes règles que le dépôt iOS, et pour la même raison : un message de commit ne
-se relit jamais au bon moment, le *pourquoi* va dans les commentaires du code.
-
-- **Une seule ligne, pas de corps.**
-- Français, verbe en tête au présent : « Ajoute », « Ferme », « Monte ».
-- 70 caractères au plus, pas de préfixe (`feat:`, `fix:`), pas d'emoji.
-- Un commit par changement réel. Un sujet d'une ligne ne peut pas couvrir
-  honnêtement deux sujets : séparer plutôt qu'allonger.
+Mêmes règles que le dépôt iOS (voir son `CLAUDE.md`) : un commit par session
+de travail, titre en anglais avec son type (`feat:`, `fix:`, `refactor:`,
+`chore:`, `docs:`), puis une liste à puces en anglais de ce qui a été fait
+quand le commit couvre plusieurs choses. On ne découpe plus sujet par sujet.
 
 ## Le déploiement
 
