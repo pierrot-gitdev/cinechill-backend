@@ -1524,13 +1524,16 @@ export const setFilmVerdict = onRequest(
           res.status(400).json({error: 'invalid_media_type'});
           return;
         }
+        const db = getAdmin().firestore();
+        const userRef = db.collection('users').doc(uid);
+        // « Pas regardé » ne touche pas la galerie, mais il dit quelque chose
+        // de la soirée : le film lancé n'a pas tenu jusqu'au soir.
+        await journalFilmVerdict(userRef, item.tmdbId, verdict);
         if (verdict === 'notWatched') {
           res.status(200).json({ok: true});
           return;
         }
 
-        const db = getAdmin().firestore();
-        const userRef = db.collection('users').doc(uid);
         const galleryRef = userRef.collection('gallery').doc(item.id);
         const watchlistRef = userRef.collection('watchlist').doc(item.id);
 
@@ -4865,6 +4868,7 @@ export const recordSessionOutcome = onRequest(
         const format = cineMatchFormatOf(body.format);
         const store = cineMatchStoreFor(format);
         const userRef = getAdmin().firestore().collection('users').doc(uid);
+        const eveningId = eveningIdOf(body.eveningId);
         const historySnap = await userRef.collection(store.history)
             .orderBy('createdAt', 'desc').limit(20).get();
 
@@ -4913,15 +4917,22 @@ export const recordSessionOutcome = onRequest(
                 .find((f) => Number(f.id) === tmdbId) : undefined;
 
           const launchedAt = Timestamp.now();
-          await doc.ref.set({
-            launched: {
-              tmdbId,
-              title: film?.title ?? null,
-              rank: film?.rank ?? null,
-              axes: film?.axes ?? null,
-              at: launchedAt,
-            },
-          }, {merge: true});
+          await Promise.all([
+            doc.ref.set({
+              launched: {
+                tmdbId,
+                title: film?.title ?? null,
+                rank: film?.rank ?? null,
+                axes: film?.axes ?? null,
+                at: launchedAt,
+              },
+            }, {merge: true}),
+            // `launchedIds` sert à retrouver la soirée le lendemain, quand
+            // l'avis arrive par la notification, sans identifiant de soirée.
+            journalEvening(userRef, format, eveningId,
+                {type: 'launch', id: tmdbId, rank: film?.rank ?? null},
+                {launchedIds: FieldValue.arrayUnion(tmdbId)}),
+          ]);
           // Le journal d'exposition de CinéMatch : un film choisi n'est
           // jamais mis au repos pour avoir été montré souvent. C'est ce
           // qui distingue « montré et ignoré » de « montré et lancé ».
@@ -4992,12 +5003,16 @@ export const recordSessionOutcome = onRequest(
             res.status(404).json({error: 'session_not_found'});
             return;
           }
-          await doc.ref.set({
-            passes: FieldValue.arrayUnion({
-              tmdbId,
-              at: Timestamp.now(),
-            }),
-          }, {merge: true});
+          await Promise.all([
+            doc.ref.set({
+              passes: FieldValue.arrayUnion({
+                tmdbId,
+                at: Timestamp.now(),
+              }),
+            }, {merge: true}),
+            journalEvening(userRef, format, eveningId,
+                {type: 'pass', id: tmdbId}),
+          ]);
           res.status(200).json({ok: true});
           return;
         }
@@ -12443,6 +12458,8 @@ interface CineMatchStore {
   exposure: string;
   prefs: string;
   history: string;
+  /** Le journal des soirées, écran par écran (voir `journalEvening`). */
+  evenings: string;
   daily: string;
 }
 
@@ -12466,13 +12483,126 @@ function cineMatchStoreFor(format: CineMatchFormat): CineMatchStore {
     exposure: 'cinematchSeriesExposure',
     prefs: 'seriesPrefs',
     history: 'seriesHistory',
+    evenings: 'seriesEvenings',
     daily: 'dailySeries',
   } : {
     exposure: 'cinematchExposure',
     prefs: 'filmPrefs',
     history: 'recommendationHistory',
+    evenings: 'cinematchEvenings',
     daily: 'daily',
   };
+}
+
+/* --------------------------------------------------------------------- *
+ *  Le journal des soirées
+ * --------------------------------------------------------------------- */
+
+/**
+ * Une soirée CinéMatch, de l'écran des styles à l'avis du lendemain.
+ *
+ * Pourquoi : jusqu'au 18 octobre 2026, le moteur ne gardait que les cinq
+ * proposés. Les écrans de départ, ce qu'ils montraient et ce qu'on y a
+ * touché étaient perdus, si bien qu'aucun réglage ne pouvait s'apprendre sur
+ * ce que les gens font vraiment, et qu'aucune version du moteur ne pouvait
+ * se mesurer contre une autre. Ce qui n'est pas noté ce soir est perdu pour
+ * toujours.
+ *
+ * L'app tire un identifiant par soirée et l'envoie avec chaque appel. Une
+ * soirée est un document ; chaque écran y ajoute un événement : ce qui a été
+ * servi, dans l'ordre, et ce que la requête dit du geste précédent (le film
+ * de départ, le second film, la retouche, une page suivante de films de
+ * départ qui vaut « Aucun de ceux-là »).
+ */
+const EVENING_ID_PATTERN = /^[A-Za-z0-9]{8,64}$/;
+
+/**
+ * L'identifiant de soirée envoyé par l'app, ou null.
+ * @param {unknown} raw Valeur brute.
+ * @return {?string} Identifiant valide.
+ */
+function eveningIdOf(raw: unknown): string | null {
+  return typeof raw === 'string' && EVENING_ID_PATTERN.test(raw) ? raw : null;
+}
+
+/**
+ * Ajoute un événement au journal d'une soirée. Ne lève jamais : un journal
+ * qui échoue ne doit pas coûter sa réponse à la personne.
+ * @param {DocumentReference} userRef Le compte.
+ * @param {CineMatchFormat} format Films ou séries.
+ * @param {?string} eveningId La soirée, ou null (rien n'est écrit).
+ * @param {Record<string, unknown>} event L'événement, avec son `type`.
+ * @param {Record<string, unknown>} fields Champs de la soirée à fusionner.
+ * @return {Promise<void>}
+ */
+async function journalEvening(
+    userRef: DocumentReference,
+    format: CineMatchFormat,
+    eveningId: string | null,
+    event: Record<string, unknown> & {type: string},
+    fields: Record<string, unknown> = {},
+): Promise<void> {
+  if (!eveningId) return;
+  try {
+    const now = Timestamp.now();
+    await userRef.collection(cineMatchStoreFor(format).evenings)
+        .doc(eveningId)
+        .set({
+          format,
+          updatedAt: now,
+          events: FieldValue.arrayUnion({...event, at: now}),
+          ...fields,
+        }, {merge: true});
+  } catch (error) {
+    logger.warn('journalEvening failed', {error, type: event.type});
+  }
+}
+
+/**
+ * Rattache l'avis du lendemain à la soirée où le film a été lancé, et à la
+ * séance des cinq qui l'avait proposé. Sans ce lien, l'avis restait une
+ * donnée de galerie et ne disait rien de la soirée qui l'avait produit.
+ * @param {DocumentReference} userRef Le compte.
+ * @param {number} tmdbId Le film.
+ * @param {string} verdict L'avis (`loved`, `liked`, `disliked`, `notWatched`).
+ * @return {Promise<void>}
+ */
+async function journalFilmVerdict(
+    userRef: DocumentReference,
+    tmdbId: number,
+    verdict: string,
+): Promise<void> {
+  try {
+    const store = cineMatchStoreFor('film');
+    const [evenings, history] = await Promise.all([
+      userRef.collection(store.evenings)
+          .where('launchedIds', 'array-contains', tmdbId).get(),
+      userRef.collection(store.history)
+          .orderBy('createdAt', 'desc').limit(30).get(),
+    ]);
+    const now = Timestamp.now();
+    const latest = evenings.docs.sort((a, b) =>
+      (millisOf(b.get('updatedAt')) ?? 0) -
+      (millisOf(a.get('updatedAt')) ?? 0))[0];
+    const writes: Promise<unknown>[] = [];
+    if (latest) {
+      writes.push(latest.ref.set({
+        updatedAt: now,
+        events: FieldValue.arrayUnion(
+            {type: 'verdict', id: tmdbId, verdict, at: now}),
+        verdicts: {[String(tmdbId)]: verdict},
+      }, {merge: true}));
+    }
+    const session = history.docs.find(
+        (doc) => Number(doc.get('launched')?.tmdbId) === tmdbId);
+    if (session) {
+      writes.push(session.ref.set(
+          {filmVerdict: {verdict, at: now}}, {merge: true}));
+    }
+    await Promise.all(writes);
+  } catch (error) {
+    logger.warn('journalFilmVerdict failed', {error});
+  }
 }
 
 /** La situation telle que le client l'envoie. */
@@ -13891,6 +14021,7 @@ export const getCineMatchDaily = onRequest(
         const format = cineMatchFormatOf(body.format);
         const store = cineMatchStoreFor(format);
         const today = parisDay(new Date());
+        const eveningId = eveningIdOf(body.eveningId);
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
@@ -13899,6 +14030,10 @@ export const getCineMatchDaily = onRequest(
         const storedFilm = stored.get('film');
         if (stored.get('date') === today &&
             typeof storedFilm === 'object' && storedFilm !== null) {
+          await journalEvening(userRef, format, eveningId, {
+            type: 'daily', situation, served: [Number(stored.get('tmdbId'))],
+            cached: true,
+          });
           res.status(200).json({film: storedFilm, date: today});
           return;
         }
@@ -13926,6 +14061,9 @@ export const getCineMatchDaily = onRequest(
           }
           const film = cineMatchSeriesJSON(meta);
           await Promise.all([
+            journalEvening(userRef, format, eveningId, {
+              type: 'daily', situation, served: [meta.id], cached: false,
+            }),
             dailyRef.set({date: today, tmdbId: meta.id, film}),
             userRef.collection(store.history).add({
               createdAt: Timestamp.now(),
@@ -13956,6 +14094,9 @@ export const getCineMatchDaily = onRequest(
         const film = cineMatchFiveFilmJSON(candidate);
         const now = Timestamp.now();
         await Promise.all([
+          journalEvening(userRef, format, eveningId, {
+            type: 'daily', situation, served: [candidate.id], cached: false,
+          }),
           dailyRef.set({date: today, tmdbId: candidate.id, film}),
           userRef.collection('recommendationHistory').add({
             createdAt: now,
@@ -14015,9 +14156,10 @@ export const recordCineMatchExposure = onRequest(
         }
 
         const db = getAdmin().firestore();
-        const exposureRef = db.collection('users').doc(uid)
-            .collection(cineMatchStoreFor(cineMatchFormatOf(body.format))
-                .exposure);
+        const format = cineMatchFormatOf(body.format);
+        const userRef = db.collection('users').doc(uid);
+        const exposureRef = userRef
+            .collection(cineMatchStoreFor(format).exposure);
         const now = Timestamp.now();
         const batch = db.batch();
         for (const tmdbId of ids) {
@@ -14030,7 +14172,11 @@ export const recordCineMatchExposure = onRequest(
             };
           batch.set(exposureRef.doc(String(tmdbId)), data, {merge: true});
         }
-        await batch.commit();
+        await Promise.all([
+          batch.commit(),
+          journalEvening(userRef, format, eveningIdOf(body.eveningId),
+              {type: 'shown', kind, ids}),
+        ]);
         res.status(200).json({ok: true});
       } catch (error) {
         logger.error('recordCineMatchExposure failed', {error});
@@ -14462,6 +14608,7 @@ export const getCineMatchStarters = onRequest(
         const nearRaw = Number(body.nearId);
         const nearId = Number.isInteger(nearRaw) && nearRaw > 0 ?
           nearRaw : null;
+        const eveningId = eveningIdOf(body.eveningId);
 
         const db = getAdmin().firestore();
         const userRef = db.collection('users').doc(uid);
@@ -14470,8 +14617,14 @@ export const getCineMatchStarters = onRequest(
         const day = parisDay(new Date());
 
         if (nearId !== null) {
-          res.status(200).json(
-              await nearStarters(db, format, nearId, films, ctx));
+          const near = await nearStarters(db, format, nearId, films, ctx);
+          await journalEvening(userRef, format, eveningId, {
+            type: 'near',
+            anchorId: nearId,
+            served: (near.films as {id: number}[]).map((film) => film.id),
+            tweaks: near.tweaks,
+          });
+          res.status(200).json(near);
           return;
         }
 
@@ -14493,6 +14646,9 @@ export const getCineMatchStarters = onRequest(
               })
               .sort((a, b) => b.json.count - a.json.count || a.order - b.order)
               .map((entry) => entry.json);
+          await journalEvening(userRef, format, eveningId, {
+            type: 'styles', served: styles.map((entry) => entry.key),
+          });
           res.status(200).json({styles});
           return;
         }
@@ -14551,6 +14707,17 @@ export const getCineMatchStarters = onRequest(
             .filter((film): film is StarterFilm => film !== undefined);
         const filler = await knownFilmsOfStyle(style, format, new Set(ids),
             STARTERS_PER_PAGE - shown.length, ctx);
+        // Une page demandée avec des films déjà montrés, c'est « Pas
+        // ceux-là » : aucun des six précédents ne convenait.
+        await journalEvening(userRef, format, eveningId, {
+          type: 'starters',
+          style,
+          page: current,
+          served: [...shown.map((film) => film.id),
+            ...filler.map((film) => film.id)],
+          afterShown: shownIds.size,
+          restarted,
+        });
         res.status(200).json({
           style,
           page: current,
@@ -15288,6 +15455,20 @@ export const getCineMatchPicks = onRequest(
         const answers = {
           situation, anchorId, secondId, tweak, style, engine: 'fiche',
         };
+        const eveningId = eveningIdOf(body.eveningId);
+        const picksEvent = (
+            sessionId: string, served: Record<string, unknown>[],
+            widened: unknown,
+        ): Record<string, unknown> & {type: string} => ({
+          type: replace ? 'replace' : 'picks',
+          ...answers,
+          sessionId,
+          served,
+          widened: widened ?? null,
+          ...(replace ? {
+            seenIds: replace.seenIds, refusedIds: replace.refusedIds ?? [],
+          } : {}),
+        });
 
         const db = getAdmin().firestore();
         const ctx = tmdb(req, res);
@@ -15307,14 +15488,17 @@ export const getCineMatchPicks = onRequest(
             }
             return;
           }
+          const servedFilms = picksHistoryFilms(picks, result.sources,
+              (id) => result.enriched.get(id)?.name ?? null);
           const sessionId = await writeFiveHistory(
               userRef.collection(cineMatchStoreFor('series').history),
               replace,
               picks.map((pick) => pick.fiche.id),
-              picksHistoryFilms(picks, result.sources,
-                  (id) => result.enriched.get(id)?.name ?? null),
+              servedFilms,
               answers,
           );
+          await journalEvening(userRef, 'series', eveningId,
+              picksEvent(sessionId, servedFilms, result.widened));
           res.status(200).json({
             films: picks.map((pick) => cineMatchSeriesJSON(
                 result.enriched.get(pick.fiche.id) as TvMeta)),
@@ -15337,14 +15521,17 @@ export const getCineMatchPicks = onRequest(
           }
           return;
         }
+        const servedFilms = picksHistoryFilms(picks, result.sources,
+            (id) => result.enriched.get(id)?.title ?? null);
         const sessionId = await writeFiveHistory(
             userRef.collection('recommendationHistory'),
             replace,
             picks.map((pick) => pick.fiche.id),
-            picksHistoryFilms(picks, result.sources,
-                (id) => result.enriched.get(id)?.title ?? null),
+            servedFilms,
             answers,
         );
+        await journalEvening(userRef, 'film', eveningId,
+            picksEvent(sessionId, servedFilms, result.widened));
         // Sur émulateur seulement : le classement complet, pour régler.
         const debug = process.env.FUNCTIONS_EMULATOR === 'true' &&
           body.debug === true ?
